@@ -310,6 +310,9 @@ type WorkloadInfo struct {
 	HPATargetsCPU  bool              `json:"hpaTargetsCPU,omitempty"` // request changes shift HPA math
 	// HPAOwner marks HPAs driven by another controller ("keda").
 	HPAOwner string `json:"hpaOwner,omitempty"`
+	// Mode is the workload's kilter.dev/mode annotation: "" (inherit),
+	// "off" (hands off entirely), "recommend" (no automation), "apply".
+	Mode string `json:"mode,omitempty"`
 }
 
 // Insight is a detection-layer finding: a predicted or observed condition
@@ -341,6 +344,11 @@ type ClusterSnapshot struct {
 	Usage     []Usage        `json:"usage,omitempty"`
 	// K8s server info — feature gates like InPlacePodVerticalScaling depend on it.
 	ServerVersion string `json:"serverVersion,omitempty"`
+	// NamespaceModes carries kilter.dev/mode namespace annotations.
+	NamespaceModes map[string]string `json:"namespaceModes,omitempty"`
+	// Frozen mirrors the kilter.dev/freeze=true annotation on the kube-system
+	// namespace: the cluster-wide kill switch for all Kilter automation.
+	Frozen bool `json:"frozen,omitempty"`
 }
 
 // NodesByName indexes nodes.

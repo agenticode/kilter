@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/agenticode/kilter/pkg/binpack"
+	"github.com/agenticode/kilter/pkg/guard"
 	"github.com/agenticode/kilter/pkg/model"
 	"github.com/agenticode/kilter/pkg/pricing"
 	"github.com/agenticode/kilter/pkg/recommend"
@@ -39,6 +40,9 @@ type Config struct {
 	// (Karpenter) out of consolidation; Kilter's rightsizing shrinks their
 	// pods and the owning autoscaler consolidates. Default true (via New*).
 	RespectManagedNodes bool
+	// DefaultMode is the effective kilter.dev/mode when neither workload nor
+	// namespace sets one: off | recommend | apply. Default apply.
+	DefaultMode string
 }
 
 // DefaultConfig returns production defaults.
@@ -50,6 +54,7 @@ func DefaultConfig() Config {
 		ApplyRecommendations: true,
 		MinClusterHeadroom:   0.10,
 		RespectManagedNodes:  true,
+		DefaultMode:          guard.ModeApply,
 	}
 }
 
@@ -159,10 +164,27 @@ func Build(snap *model.ClusterSnapshot, recs []recommend.Recommendation, catalog
 	copy(pods, snap.Pods)
 	seq := 1
 
+	// Guardrails: workloads opted out of automation pin their pods (never
+	// evicted for consolidation) and receive no action steps.
+	modeOf := func(ref model.WorkloadRef) string {
+		return guard.ModeFor(snap, ref, cfg.DefaultMode)
+	}
+	guarded := 0
+	for i := range pods {
+		if m := modeOf(pods[i].Workload); m != guard.ModeApply {
+			pods[i].DoNotEvict = true
+			guarded++
+		}
+	}
+	if guarded > 0 {
+		p.Notes = append(p.Notes, fmt.Sprintf(
+			"%d pod(s) protected by kilter.dev/mode guardrails (off/recommend)", guarded))
+	}
+
 	if cfg.ApplyRecommendations {
 		accepted := map[model.ContainerKey]recommend.Recommendation{}
 		for _, r := range recs {
-			if r.Confidence >= cfg.MinConfidence {
+			if r.Confidence >= cfg.MinConfidence && modeOf(r.Key.Workload) == guard.ModeApply {
 				accepted[r.Key] = r
 			}
 		}

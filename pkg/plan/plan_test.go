@@ -343,3 +343,36 @@ func TestKarpenterNodesRespected(t *testing.T) {
 		t.Fatalf("override should consolidate karp-1: %+v", p2.Removals)
 	}
 }
+
+func TestGuardrailModesRespected(t *testing.T) {
+	nodes := []model.NodeSpec{m5xlarge("node-a"), m5xlarge("node-b")}
+	pods := []model.PodSpec{
+		runningPod("a1", "node-a", "wa", 2400, 3072),
+		runningPod("b1", "node-b", "wb", 400, 1024), // node-b would be consolidated
+	}
+	recs := []recommend.Recommendation{rec("wb", 400, 1024, 100, 256, 0.9)}
+
+	// Workload-level off: no resize step, pod pins its node.
+	snap := snapshot(nodes, pods)
+	snap.Workloads = []model.WorkloadInfo{{
+		Ref: model.WorkloadRef{Kind: model.KindDeployment, Namespace: "default", Name: "wb"}, Mode: "off",
+	}}
+	p, _ := Build(snap, recs, pricing.Embedded(), DefaultConfig())
+	if len(p.Rightsizing) != 0 || len(p.Removals) != 0 {
+		t.Fatalf("mode=off must block resize and pin node: %+v %+v", p.Rightsizing, p.Removals)
+	}
+
+	// Namespace-level recommend: same protection via inheritance.
+	snap2 := snapshot(nodes, pods)
+	snap2.NamespaceModes = map[string]string{"default": "recommend"}
+	p2, _ := Build(snap2, recs, pricing.Embedded(), DefaultConfig())
+	if len(p2.Rightsizing) != 0 || len(p2.Removals) != 0 {
+		t.Fatalf("namespace recommend must inherit: %+v", p2.Steps)
+	}
+
+	// Default apply: automation proceeds.
+	p3, _ := Build(snapshot(nodes, pods), recs, pricing.Embedded(), DefaultConfig())
+	if len(p3.Rightsizing) != 1 || len(p3.Removals) != 1 {
+		t.Fatalf("default apply should act: rs=%d rm=%d", len(p3.Rightsizing), len(p3.Removals))
+	}
+}

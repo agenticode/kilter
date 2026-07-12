@@ -26,6 +26,8 @@ const (
 	AnnoHourlyCost  = "kilter.dev/hourly-cost"
 	AnnoDoNotEvict  = "kilter.dev/do-not-evict"
 	AnnoCASafeEvict = "cluster-autoscaler.kubernetes.io/safe-to-evict"
+	AnnoMode        = "kilter.dev/mode"   // off | recommend | apply
+	AnnoFreeze      = "kilter.dev/freeze" // "true" on kube-system = kill switch
 )
 
 // Collector gathers ClusterSnapshots from one cluster.
@@ -99,6 +101,22 @@ func (c *Collector) Snapshot(ctx context.Context) (*model.ClusterSnapshot, error
 
 	c.collectWorkloads(ctx, snap)
 	c.collectPDBs(ctx, snap, podList.Items)
+
+	// Namespace-level policy annotations + the cluster freeze switch.
+	if nsList, err := c.Client.CoreV1().Namespaces().List(ctx, metav1.ListOptions{}); err == nil {
+		for i := range nsList.Items {
+			ns := &nsList.Items[i]
+			if m := ns.Annotations[AnnoMode]; m != "" {
+				if snap.NamespaceModes == nil {
+					snap.NamespaceModes = map[string]string{}
+				}
+				snap.NamespaceModes[ns.Name] = m
+			}
+			if ns.Name == "kube-system" && ns.Annotations[AnnoFreeze] == "true" {
+				snap.Frozen = true
+			}
+		}
+	}
 
 	if v, err := c.Client.Discovery().ServerVersion(); err == nil && v != nil {
 		snap.ServerVersion = v.GitVersion
@@ -175,8 +193,8 @@ func (c *Collector) collectWorkloads(ctx context.Context, snap *model.ClusterSna
 			hpas[key] = info
 		}
 	}
-	attach := func(ref model.WorkloadRef, replicas, ready int32, lbls map[string]string) {
-		w := model.WorkloadInfo{Ref: ref, Replicas: replicas, Ready: ready, Labels: lbls}
+	attach := func(ref model.WorkloadRef, replicas, ready int32, lbls, annos map[string]string) {
+		w := model.WorkloadInfo{Ref: ref, Replicas: replicas, Ready: ready, Labels: lbls, Mode: annos[AnnoMode]}
 		if h, ok := hpas[string(ref.Kind)+"/"+ref.Namespace+"/"+ref.Name]; ok {
 			w.HasHPA = true
 			w.HPAMinReplicas, w.HPAMaxReplicas, w.HPATargetsCPU = h.min, h.max, h.targetsCPU
@@ -192,7 +210,7 @@ func (c *Collector) collectWorkloads(ctx context.Context, snap *model.ClusterSna
 				reps = *d.Spec.Replicas
 			}
 			attach(model.WorkloadRef{Kind: model.KindDeployment, Namespace: d.Namespace, Name: d.Name},
-				reps, d.Status.ReadyReplicas, d.Labels)
+				reps, d.Status.ReadyReplicas, d.Labels, d.Annotations)
 		}
 	}
 	if l, err := c.Client.AppsV1().StatefulSets(c.Namespace).List(ctx, metav1.ListOptions{}); err == nil {
@@ -203,14 +221,14 @@ func (c *Collector) collectWorkloads(ctx context.Context, snap *model.ClusterSna
 				reps = *s.Spec.Replicas
 			}
 			attach(model.WorkloadRef{Kind: model.KindStatefulSet, Namespace: s.Namespace, Name: s.Name},
-				reps, s.Status.ReadyReplicas, s.Labels)
+				reps, s.Status.ReadyReplicas, s.Labels, s.Annotations)
 		}
 	}
 	if l, err := c.Client.AppsV1().DaemonSets(c.Namespace).List(ctx, metav1.ListOptions{}); err == nil {
 		for i := range l.Items {
 			d := &l.Items[i]
 			attach(model.WorkloadRef{Kind: model.KindDaemonSet, Namespace: d.Namespace, Name: d.Name},
-				d.Status.DesiredNumberScheduled, d.Status.NumberReady, d.Labels)
+				d.Status.DesiredNumberScheduled, d.Status.NumberReady, d.Labels, d.Annotations)
 		}
 	}
 }
