@@ -154,14 +154,19 @@ PENDING=$(KC get pods --field-selector=status.phase=Pending --no-headers 2>/dev/
 PASS "all workloads Running after consolidation, nothing Pending"
 
 echo "==> 6) audit ledger records the execution"
-LEDGER=$(curl -sf -H "Authorization: Bearer $TOKEN" "http://localhost:$BRAIN_PORT/api/v1/clusters/e2e/ledger")
-echo "$LEDGER" | python3 -c '
+# The timeline grows one point per agent push (5s); give it a few beats.
+for i in $(seq 1 12); do
+  LEDGER=$(curl -sf -H "Authorization: Bearer $TOKEN" "http://localhost:$BRAIN_PORT/api/v1/clusters/e2e/ledger")
+  if echo "$LEDGER" | python3 -c '
 import json,sys
 d = json.load(sys.stdin)
 assert len(d["entries"]) >= 1, "no ledger entries"
 e = d["entries"][0]
 assert e["mode"] == "apply" and e["done"] >= 1, e
 assert e["fingerprint"], "entry must carry the plan fingerprint"
-assert len(d["costTimeline"]) >= 2, "cost timeline missing"
-' || FAIL "ledger assertions"
+assert len(d["costTimeline"]) >= 2, "cost timeline still filling"
+' 2>/dev/null; then break; fi
+  sleep 5
+  [[ $i == 12 ]] && FAIL "ledger assertions (last: $(echo "$LEDGER" | head -c 300))"
+done
 PASS "ledger: executed plan recorded with fingerprint + measured cost timeline"
