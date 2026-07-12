@@ -147,6 +147,41 @@ func (c *Client) GetInsights(ctx context.Context, cluster string) ([]model.Insig
 	return out.Insights, nil
 }
 
+// ReportExecution records an executed plan in the cluster's audit ledger.
+func (c *Client) ReportExecution(ctx context.Context, cluster string, e LedgerEntry) error {
+	raw, err := json.Marshal(e)
+	if err != nil {
+		return err
+	}
+	return c.do(ctx, http.MethodPost, "/api/v1/clusters/"+url.PathEscape(cluster)+"/reports", raw, false, nil)
+}
+
+// GetLedger fetches the audit ledger + cost timeline.
+func (c *Client) GetLedger(ctx context.Context, cluster string) (*LedgerReport, error) {
+	var out LedgerReport
+	if err := c.do(ctx, http.MethodGet, "/api/v1/clusters/"+url.PathEscape(cluster)+"/ledger", nil, false, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// Approve marks a plan fingerprint as approved for execution.
+func (c *Client) Approve(ctx context.Context, cluster, fingerprint string) error {
+	raw, _ := json.Marshal(map[string]string{"fingerprint": fingerprint})
+	return c.do(ctx, http.MethodPost, "/api/v1/clusters/"+url.PathEscape(cluster)+"/approvals", raw, false, nil)
+}
+
+// GetApprovals lists currently valid approvals.
+func (c *Client) GetApprovals(ctx context.Context, cluster string) ([]Approval, error) {
+	var out struct {
+		Approvals []Approval `json:"approvals"`
+	}
+	if err := c.do(ctx, http.MethodGet, "/api/v1/clusters/"+url.PathEscape(cluster)+"/approvals", nil, false, &out); err != nil {
+		return nil, err
+	}
+	return out.Approvals, nil
+}
+
 // Healthy probes the brain's health endpoint.
 func (c *Client) Healthy(ctx context.Context) bool {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/healthz", nil)

@@ -35,6 +35,9 @@ Commands:
   plan        Fetch and print the current plan from a brain
   insights    Predictive findings: OOM risk, saturation, capacity exhaustion
   pricing     Sync live cloud prices into a catalog (sync-aws)
+  ledger      Audit trail: executed plans + measured cost curve (verifiable savings)
+  approve     Approve a plan fingerprint for --require-approval controllers
+  undo        Revert the most recent applied plan (resizes + cordons)
   simulate    Replay a snapshot file through the decision engine
   version     Print version
 
@@ -64,6 +67,12 @@ func main() {
 		err = runInsights(args)
 	case "pricing":
 		err = runPricing(args)
+	case "ledger":
+		err = runLedger(args)
+	case "approve", "approvals":
+		err = runApprove(args)
+	case "undo":
+		err = runUndo(args)
 	case "simulate":
 		err = runSimulate(args)
 	case "version", "--version", "-v":

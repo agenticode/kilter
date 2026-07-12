@@ -376,3 +376,20 @@ func TestGuardrailModesRespected(t *testing.T) {
 		t.Fatalf("default apply should act: rs=%d rm=%d", len(p3.Rightsizing), len(p3.Removals))
 	}
 }
+
+func TestBuildDoesNotMutateSnapshot(t *testing.T) {
+	snap := snapshot(
+		[]model.NodeSpec{m5xlarge("node-a"), m5xlarge("node-b")},
+		[]model.PodSpec{runningPod("a1", "node-a", "wa", 3000, 4096)},
+	)
+	recs := []recommend.Recommendation{rec("wa", 3000, 4096, 300, 512, 0.9)}
+	before := snap.Pods[0].Containers[0].Requests
+	p1, _ := Build(snap, recs, pricing.Embedded(), DefaultConfig())
+	if snap.Pods[0].Containers[0].Requests != before {
+		t.Fatalf("Build mutated the input snapshot: %+v", snap.Pods[0].Containers[0].Requests)
+	}
+	p2, _ := Build(snap, recs, pricing.Embedded(), DefaultConfig())
+	if p1.Fingerprint != p2.Fingerprint {
+		t.Fatalf("rebuild must be identical: %s vs %s", p1.Fingerprint, p2.Fingerprint)
+	}
+}

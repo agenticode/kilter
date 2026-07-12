@@ -9,6 +9,8 @@
 package plan
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"sort"
 	"time"
@@ -127,6 +129,9 @@ type Plan struct {
 
 	Risk  string   `json:"risk"`
 	Notes []string `json:"notes,omitempty"`
+	// Fingerprint deterministically identifies the plan's *content* (steps,
+	// targets, sizes) independent of timestamps — the unit of human approval.
+	Fingerprint string `json:"fingerprint,omitempty"`
 }
 
 // Empty reports whether the plan contains no actionable steps.
@@ -190,13 +195,21 @@ func Build(snap *model.ClusterSnapshot, recs []recommend.Recommendation, catalog
 		}
 		for i := range pods {
 			pod := &pods[i]
+			cloned := false
 			for j := range pod.Containers {
-				c := &pod.Containers[j]
-				key := model.ContainerKey{Workload: pod.Workload, Container: c.Name}
+				key := model.ContainerKey{Workload: pod.Workload, Container: pod.Containers[j].Name}
 				r, ok := accepted[key]
 				if !ok {
 					continue
 				}
+				// The pods slice is a shallow copy: Containers still aliases
+				// the caller's snapshot. Clone before the virtual resize or
+				// we'd corrupt the brain's stored state.
+				if !cloned {
+					pod.Containers = append([]model.ContainerSpec(nil), pod.Containers...)
+					cloned = true
+				}
+				c := &pod.Containers[j]
 				p.ReclaimedRequests = p.ReclaimedRequests.Add(c.Requests.Sub(r.TargetRequest))
 				c.Requests = r.TargetRequest
 				if r.TargetLimit.MilliCPU > 0 || r.TargetLimit.MemoryBytes > 0 {
@@ -346,6 +359,7 @@ func Build(snap *model.ClusterSnapshot, recs []recommend.Recommendation, catalog
 	if p.Empty() {
 		p.Notes = append(p.Notes, "cluster is already in kilter: no beneficial changes found")
 	}
+	p.Fingerprint = fingerprint(p.Steps)
 	return p, nil
 }
 
@@ -511,6 +525,18 @@ func isControlPlane(n *model.NodeSpec) bool {
 	_, cp := n.Labels["node-role.kubernetes.io/control-plane"]
 	_, master := n.Labels["node-role.kubernetes.io/master"]
 	return cp || master
+}
+
+// fingerprint hashes the actionable content of the steps. Two plans that
+// would do the same things share a fingerprint even if built minutes apart.
+func fingerprint(steps []Step) string {
+	h := sha256.New()
+	for _, s := range steps {
+		fmt.Fprintf(h, "%s|%s|%s|%s|%s|%d/%d|%d/%d\n",
+			s.Type, s.Workload.String(), s.Container, s.Node, s.Pod,
+			s.ToReq.MilliCPU, s.ToReq.MemoryBytes, s.ToLim.MilliCPU, s.ToLim.MemoryBytes)
+	}
+	return hex.EncodeToString(h.Sum(nil))[:16]
 }
 
 func planRisk(p *Plan) string {

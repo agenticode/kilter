@@ -11,6 +11,7 @@ import (
 	"github.com/agenticode/kilter/pkg/actuate"
 	"github.com/agenticode/kilter/pkg/api"
 	"github.com/agenticode/kilter/pkg/collect"
+	"github.com/agenticode/kilter/pkg/guard"
 	"github.com/agenticode/kilter/pkg/model"
 	"github.com/agenticode/kilter/pkg/plan"
 	"github.com/agenticode/kilter/pkg/provider"
@@ -29,6 +30,8 @@ func runController(args []string) error {
 	inPlace := fs.Bool("in-place-resize", true, "attempt in-place pod resize (K8s ≥1.33)")
 	providerName := fs.String("provider", envOr("KILTER_PROVIDER", "none"), "node lifecycle provider: none|karpenter|webhook|eks")
 	providerCfg := fs.String("provider-config", os.Getenv("KILTER_PROVIDER_CONFIG"), "provider config: eks=cluster name, webhook=endpoint URL")
+	windowsSpec := fs.String("change-windows", os.Getenv("KILTER_CHANGE_WINDOWS"), "node-surgery windows, e.g. 'Mon-Fri 22:00-06:00' (empty = always)")
+	requireApproval := fs.Bool("require-approval", false, "execute only plans approved via kilter approve")
 	kubeconfig := fs.String("kubeconfig", "", "kubeconfig path (default: in-cluster)")
 	fs.Parse(args)
 
@@ -58,6 +61,10 @@ func runController(args []string) error {
 	if err != nil {
 		return err
 	}
+	windows, err := guard.ParseWindows(*windowsSpec)
+	if err != nil {
+		return err
+	}
 	col := &collect.Collector{Client: client, Metrics: metrics, ClusterID: *clusterID}
 	regress := safety.NewRegressionDetector(30*time.Minute, 24*time.Hour)
 	cooldown := safety.NewCooldowns(time.Hour)
@@ -72,8 +79,12 @@ func runController(args []string) error {
 
 	ticker := time.NewTicker(*interval)
 	defer ticker.Stop()
+	rc := reconcileConfig{
+		clusterID: *clusterID, minSavings: *minConfidence,
+		windows: windows, requireApproval: *requireApproval, mode: *mode,
+	}
 	for {
-		reconcile(ctx, log, brain, act, col, regress, cooldown, applied, *clusterID, *minConfidence)
+		reconcile(ctx, log, brain, act, col, regress, cooldown, applied, rc)
 		select {
 		case <-ctx.Done():
 			log.Info("controller stopping")
@@ -83,14 +94,30 @@ func runController(args []string) error {
 	}
 }
 
+type reconcileConfig struct {
+	clusterID       string
+	minSavings      float64
+	windows         []guard.Window
+	requireApproval bool
+	mode            string
+}
+
 func reconcile(ctx context.Context, log *slog.Logger, brain *api.Client, act *actuate.Actuator,
 	col *collect.Collector, regress *safety.RegressionDetector, cooldown *safety.Cooldowns,
-	applied map[model.WorkloadRef]plan.Step, clusterID string, minSavings float64) {
+	applied map[model.WorkloadRef]plan.Step, rc reconcileConfig) {
+	clusterID, minSavings := rc.clusterID, rc.minSavings
 
 	// 1. Regression watch: collect fresh state and revert anything that broke.
 	snap, err := col.Snapshot(ctx)
 	if err != nil {
 		log.Error("collect failed", "err", err)
+		return
+	}
+
+	// 0. Kill switch: kilter.dev/freeze blocks ALL automation, including
+	// emergency drains — the operator said hands off.
+	if snap.Frozen {
+		log.Warn("cluster frozen (kilter.dev/freeze on kube-system) — all automation paused")
 		return
 	}
 	for _, reg := range regress.Check(snap, time.Now()) {
@@ -114,6 +141,13 @@ func reconcile(ctx context.Context, log *slog.Logger, brain *api.Client, act *ac
 			"done", rep.Done, "failed", rep.Failed)
 	}
 
+	// 1c. Circuit breaker: a struggling cluster is observed, never optimized.
+	// (Emergency spot drains above still ran: those machines die regardless.)
+	if open, reasons := guard.Breaker(snap, guard.BreakerConfig{}); open {
+		log.Warn("circuit breaker open — plan execution paused", "reasons", strings.Join(reasons, "; "))
+		return
+	}
+
 	// 2. Pull the current plan.
 	p, err := brain.GetPlan(ctx, clusterID)
 	if err != nil {
@@ -130,6 +164,33 @@ func reconcile(ctx context.Context, log *slog.Logger, brain *api.Client, act *ac
 		return
 	}
 
+	// 2b. Approval gate: in --require-approval, plans execute only after a
+	// human ran `kilter approve` on this exact fingerprint.
+	if rc.requireApproval && rc.mode == string(actuate.ModeApply) {
+		approvals, err := brain.GetApprovals(ctx, clusterID)
+		if err != nil {
+			log.Error("approval check failed", "err", err)
+			return
+		}
+		ok := false
+		for _, a := range approvals {
+			if a.Fingerprint == p.Fingerprint {
+				ok = true
+			}
+		}
+		if !ok {
+			log.Info("plan awaiting approval",
+				"fingerprint", p.Fingerprint,
+				"approve_with", "kilter approve --cluster "+clusterID+" "+p.Fingerprint,
+				"savings_month_usd", p.SavingsMonthlyUSD)
+			return
+		}
+	}
+
+	// 2c. Change windows: node surgery only inside the operator's windows;
+	// resizes are non-disruptive (in-place / rolling) and may run anytime.
+	inWindow := guard.InWindow(rc.windows, time.Now())
+
 	// 3. Filter steps through cooldowns and quarantine.
 	var steps []plan.Step
 	for _, s := range p.Steps {
@@ -143,6 +204,10 @@ func reconcile(ctx context.Context, log *slog.Logger, brain *api.Client, act *ac
 				continue
 			}
 		case plan.StepCordonNode:
+			if !inWindow {
+				log.Info("outside change window — deferring node surgery", "node", s.Node)
+				continue
+			}
 			if !cooldown.Allow("node/"+s.Node, time.Now()) {
 				// Skip this node's whole removal sequence.
 				continue
@@ -157,11 +222,21 @@ func reconcile(ctx context.Context, log *slog.Logger, brain *api.Client, act *ac
 	exec := *p
 	exec.Steps = steps
 
-	// 4. Execute and record baselines for the regression watch.
+	// 4. Execute, record baselines, and file the audit ledger entry.
 	rep := act.ExecutePlan(ctx, &exec)
 	log.Info("plan executed", "done", rep.Done, "failed", rep.Failed,
 		"skipped", rep.Skipped, "aborted", rep.Aborted,
 		"savings_month_usd", p.SavingsMonthlyUSD)
+	entry := api.LedgerEntry{
+		At: time.Now().UTC(), Mode: rc.mode,
+		Fingerprint: p.Fingerprint, Risk: p.Risk,
+		CostBeforeHourlyUSD: p.CurrentHourlyUSD, ProjectedHourlyUSD: p.ProjectedHourlyUSD,
+		ProjectedMonthlySavings: p.SavingsMonthlyUSD,
+		Steps:                   rep.Steps, Done: rep.Done, Failed: rep.Failed, Aborted: rep.Aborted,
+	}
+	if err := brain.ReportExecution(ctx, clusterID, entry); err != nil {
+		log.Error("ledger report failed", "err", err)
+	}
 	for _, st := range rep.Steps {
 		if st.Status == "done" && st.Step.Type == plan.StepResizeWorkload {
 			applied[st.Step.Workload] = st.Step

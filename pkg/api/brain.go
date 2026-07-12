@@ -84,6 +84,8 @@ type Brain struct {
 	lastSnap  map[string]*model.ClusterSnapshot
 	snapCount map[string]int
 	demand    map[string]*demandTracker
+	ledgers   map[string]*ledgerState
+	approvals map[string]*approvalState
 
 	forecaster *forecast.RemoteForecaster // nil = built-in models only
 
@@ -134,6 +136,8 @@ func NewBrain(cfg BrainConfig, catalog *pricing.Catalog, st *store.Store) (*Brai
 		lastSnap:  map[string]*model.ClusterSnapshot{},
 		snapCount: map[string]int{},
 		demand:    map[string]*demandTracker{},
+		ledgers:   map[string]*ledgerState{},
+		approvals: map[string]*approvalState{},
 		m:         newBrainMetrics(),
 	}
 	if b.cfg.ForecasterURL != "" {
@@ -218,6 +222,7 @@ func (b *Brain) Ingest(snap *model.ClusterSnapshot) error {
 	}
 
 	cost := b.catalog.SnapshotCost(snap)
+	b.ledgerFor(snap.ClusterID).addCost(snap.Timestamp, cost.HourlyUSD)
 	b.m.snapshots.WithLabelValues(snap.ClusterID).Inc()
 	b.m.containers.WithLabelValues(snap.ClusterID).Set(float64(r.StateCount()))
 	b.m.costHourly.WithLabelValues(snap.ClusterID).Set(cost.HourlyUSD)
@@ -368,6 +373,7 @@ func (b *Brain) Handler() http.Handler {
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"insights": ins})
 	}))
+	b.registerTrustRoutes(mux)
 	mux.HandleFunc("GET /api/v1/clusters/{id}/cost", b.auth(func(w http.ResponseWriter, r *http.Request) {
 		snap := b.snapshotFor(r.PathValue("id"))
 		if snap == nil {
@@ -432,6 +438,17 @@ func (b *Brain) handleIngest(w http.ResponseWriter, r *http.Request) {
 type readCloser struct{ *gzip.Reader }
 
 func (readCloser) Close() error { return nil }
+
+// decodeBody parses a bounded JSON request body, writing the error response
+// itself on failure (callers just return).
+func decodeBody(w http.ResponseWriter, r *http.Request, maxBytes int64, out any) error {
+	body := http.MaxBytesReader(w, r.Body, maxBytes)
+	if err := json.NewDecoder(body).Decode(out); err != nil {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("decode body: %w", err))
+		return err
+	}
+	return nil
+}
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
