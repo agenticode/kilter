@@ -1,0 +1,11 @@
+apiVersion: v2
+name: kilter
+description: >-
+  Kilter keeps Kubernetes clusters in kilter — self-hosted cost optimization:
+  usage learning, rightsizing, safe bin-packing consolidation.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://github.com/agenticode/kilter
+sources: [https://github.com/agenticode/kilter]
+keywords: [cost, optimization, autoscaling, rightsizing, finops]

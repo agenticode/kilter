@@ -1,0 +1,37 @@
+{{- if .Values.agent.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-agent
+  labels:
+    {{- include "kilter.labels" . | nindent 4 }}
+    app.kubernetes.io/component: agent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: agent
+  template:
+    metadata:
+      labels:
+        {{- include "kilter.labels" . | nindent 8 }}
+        app.kubernetes.io/component: agent
+    spec:
+      serviceAccountName: {{ .Release.Name }}-agent
+      containers:
+        - name: agent
+          image: {{ include "kilter.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - agent
+            - --brain-url={{ include "kilter.brainURL" . }}
+            - --interval={{ .Values.agent.interval }}
+          env:
+            - name: KILTER_CLUSTER_ID
+              value: {{ .Values.clusterID | quote }}
+            - name: KILTER_TOKEN
+              valueFrom: {secretKeyRef: {name: {{ .Release.Name }}-token, key: token}}
+          resources: {{- toYaml .Values.agent.resources | nindent 12 }}
+          securityContext: {{- include "kilter.securityContext" . | nindent 12 }}
+{{- end }}

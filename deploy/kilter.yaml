@@ -1,0 +1,223 @@
+# Kilter — plain-YAML install (see charts/kilter for the Helm route).
+# Brain (central) + agent (collector) + controller (dry-run by default).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kilter
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: kilter-token
+  namespace: kilter
+type: Opaque
+stringData:
+  token: change-me-to-a-long-random-string
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kilter-agent
+  namespace: kilter
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kilter-agent
+rules:
+  - apiGroups: [""]
+    resources: [nodes, pods, namespaces]
+    verbs: [get, list]
+  - apiGroups: [apps]
+    resources: [deployments, statefulsets, daemonsets, replicasets]
+    verbs: [get, list]
+  - apiGroups: [batch]
+    resources: [jobs, cronjobs]
+    verbs: [get, list]
+  - apiGroups: [autoscaling]
+    resources: [horizontalpodautoscalers]
+    verbs: [get, list]
+  - apiGroups: [policy]
+    resources: [poddisruptionbudgets]
+    verbs: [get, list]
+  - apiGroups: [metrics.k8s.io]
+    resources: [pods, nodes]
+    verbs: [get, list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kilter-agent
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: kilter-agent}
+subjects: [{kind: ServiceAccount, name: kilter-agent, namespace: kilter}]
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kilter-controller
+  namespace: kilter
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kilter-controller
+rules:
+  # Everything the agent reads (the controller re-collects for regression watch)…
+  - apiGroups: [""]
+    resources: [nodes, pods, namespaces]
+    verbs: [get, list]
+  - apiGroups: [apps]
+    resources: [deployments, statefulsets, daemonsets, replicasets]
+    verbs: [get, list]
+  - apiGroups: [batch]
+    resources: [jobs, cronjobs]
+    verbs: [get, list]
+  - apiGroups: [autoscaling]
+    resources: [horizontalpodautoscalers]
+    verbs: [get, list]
+  - apiGroups: [policy]
+    resources: [poddisruptionbudgets]
+    verbs: [get, list]
+  - apiGroups: [metrics.k8s.io]
+    resources: [pods, nodes]
+    verbs: [get, list]
+  # …plus the mutations plans need:
+  - apiGroups: [apps]
+    resources: [deployments, statefulsets]
+    verbs: [patch]
+  - apiGroups: [""]
+    resources: [pods/eviction]
+    verbs: [create]
+  - apiGroups: [""]
+    resources: [pods/resize]
+    verbs: [patch]
+  - apiGroups: [""]
+    resources: [nodes]
+    verbs: [patch, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kilter-controller
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: kilter-controller}
+subjects: [{kind: ServiceAccount, name: kilter-controller, namespace: kilter}]
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: kilter-brain-data
+  namespace: kilter
+spec:
+  accessModes: [ReadWriteOnce]
+  resources: {requests: {storage: 2Gi}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kilter-brain
+  namespace: kilter
+  labels: {app.kubernetes.io/name: kilter, app.kubernetes.io/component: brain}
+spec:
+  replicas: 1
+  strategy: {type: Recreate} # bbolt is single-writer
+  selector: {matchLabels: {app.kubernetes.io/name: kilter, app.kubernetes.io/component: brain}}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: kilter, app.kubernetes.io/component: brain}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8180"
+    spec:
+      containers:
+        - name: brain
+          image: ghcr.io/agenticode/kilter:latest
+          args: [brain, --listen=:8180, --db=/data/kilter.db]
+          env:
+            - name: KILTER_TOKEN
+              valueFrom: {secretKeyRef: {name: kilter-token, key: token}}
+          ports: [{containerPort: 8180, name: http}]
+          readinessProbe: {httpGet: {path: /healthz, port: 8180}}
+          livenessProbe: {httpGet: {path: /healthz, port: 8180}, initialDelaySeconds: 10}
+          volumeMounts: [{name: data, mountPath: /data}]
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {memory: 1Gi}
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+      volumes:
+        - name: data
+          persistentVolumeClaim: {claimName: kilter-brain-data}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kilter-brain
+  namespace: kilter
+spec:
+  selector: {app.kubernetes.io/name: kilter, app.kubernetes.io/component: brain}
+  ports: [{name: http, port: 8180, targetPort: 8180}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kilter-agent
+  namespace: kilter
+  labels: {app.kubernetes.io/name: kilter, app.kubernetes.io/component: agent}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app.kubernetes.io/name: kilter, app.kubernetes.io/component: agent}}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: kilter, app.kubernetes.io/component: agent}
+    spec:
+      serviceAccountName: kilter-agent
+      containers:
+        - name: agent
+          image: ghcr.io/agenticode/kilter:latest
+          args: [agent, --brain-url=http://kilter-brain:8180, --interval=60s]
+          env:
+            - name: KILTER_CLUSTER_ID
+              value: "default"
+            - name: KILTER_TOKEN
+              valueFrom: {secretKeyRef: {name: kilter-token, key: token}}
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {memory: 256Mi}
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kilter-controller
+  namespace: kilter
+  labels: {app.kubernetes.io/name: kilter, app.kubernetes.io/component: controller}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app.kubernetes.io/name: kilter, app.kubernetes.io/component: controller}}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: kilter, app.kubernetes.io/component: controller}
+    spec:
+      serviceAccountName: kilter-controller
+      containers:
+        - name: controller
+          image: ghcr.io/agenticode/kilter:latest
+          # Flip --mode=apply once you trust the dry-run logs.
+          args: [controller, --brain-url=http://kilter-brain:8180, --mode=dry-run, --interval=5m]
+          env:
+            - name: KILTER_CLUSTER_ID
+              value: "default"
+            - name: KILTER_TOKEN
+              valueFrom: {secretKeyRef: {name: kilter-token, key: token}}
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {memory: 256Mi}
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}

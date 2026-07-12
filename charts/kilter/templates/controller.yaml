@@ -1,0 +1,40 @@
+{{- if .Values.controller.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-controller
+  labels:
+    {{- include "kilter.labels" . | nindent 4 }}
+    app.kubernetes.io/component: controller
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: controller
+  template:
+    metadata:
+      labels:
+        {{- include "kilter.labels" . | nindent 8 }}
+        app.kubernetes.io/component: controller
+    spec:
+      serviceAccountName: {{ .Release.Name }}-controller
+      containers:
+        - name: controller
+          image: {{ include "kilter.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - controller
+            - --brain-url={{ include "kilter.brainURL" . }}
+            - --mode={{ .Values.controller.mode }}
+            - --interval={{ .Values.controller.interval }}
+            - --max-evictions-per-hour={{ .Values.controller.maxEvictionsPerHour }}
+            - --in-place-resize={{ .Values.controller.inPlaceResize }}
+          env:
+            - name: KILTER_CLUSTER_ID
+              value: {{ .Values.clusterID | quote }}
+            - name: KILTER_TOKEN
+              valueFrom: {secretKeyRef: {name: {{ .Release.Name }}-token, key: token}}
+          resources: {{- toYaml .Values.controller.resources | nindent 12 }}
+          securityContext: {{- include "kilter.securityContext" . | nindent 12 }}
+{{- end }}

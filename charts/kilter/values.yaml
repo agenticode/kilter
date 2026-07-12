@@ -1,0 +1,44 @@
+image:
+  repository: ghcr.io/agenticode/kilter
+  tag: "" # defaults to appVersion
+  pullPolicy: IfNotPresent
+
+# Cluster name reported to the brain (multi-cluster setups give each its own).
+clusterID: default
+
+# Bearer token protecting the brain API. Set it or a random one is generated
+# on install (and kept across upgrades via lookup).
+token: ""
+
+brain:
+  enabled: true
+  listen: ":8180"
+  # Persistent learning state (bbolt). Disable for ephemeral trials.
+  persistence:
+    enabled: true
+    size: 2Gi
+    storageClassName: ""
+  resources:
+    requests: {cpu: 100m, memory: 128Mi}
+    limits: {memory: 1Gi}
+  # Point agents/controllers at an external brain instead of the in-cluster
+  # one by setting brain.enabled=false and externalURL.
+  externalURL: ""
+
+agent:
+  enabled: true
+  interval: 60s
+  resources:
+    requests: {cpu: 50m, memory: 64Mi}
+    limits: {memory: 256Mi}
+
+controller:
+  enabled: true
+  # dry-run logs every step it would take; flip to apply when ready.
+  mode: dry-run
+  interval: 5m
+  maxEvictionsPerHour: 20
+  inPlaceResize: true
+  resources:
+    requests: {cpu: 50m, memory: 64Mi}
+    limits: {memory: 256Mi}

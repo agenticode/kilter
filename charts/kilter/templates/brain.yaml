@@ -1,0 +1,78 @@
+{{- if .Values.brain.enabled }}
+{{- if .Values.brain.persistence.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ .Release.Name }}-brain-data
+  labels: {{- include "kilter.labels" . | nindent 4 }}
+spec:
+  accessModes: [ReadWriteOnce]
+  {{- with .Values.brain.persistence.storageClassName }}
+  storageClassName: {{ . }}
+  {{- end }}
+  resources: {requests: {storage: {{ .Values.brain.persistence.size }}}}
+---
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-brain
+  labels:
+    {{- include "kilter.labels" . | nindent 4 }}
+    app.kubernetes.io/component: brain
+spec:
+  replicas: 1
+  strategy: {type: Recreate} # bbolt is single-writer
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: brain
+  template:
+    metadata:
+      labels:
+        {{- include "kilter.labels" . | nindent 8 }}
+        app.kubernetes.io/component: brain
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8180"
+    spec:
+      containers:
+        - name: brain
+          image: {{ include "kilter.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - brain
+            - --listen={{ .Values.brain.listen }}
+            {{- if .Values.brain.persistence.enabled }}
+            - --db=/data/kilter.db
+            {{- else }}
+            - --db=
+            {{- end }}
+          env:
+            - name: KILTER_TOKEN
+              valueFrom: {secretKeyRef: {name: {{ .Release.Name }}-token, key: token}}
+          ports: [{containerPort: 8180, name: http}]
+          readinessProbe: {httpGet: {path: /healthz, port: 8180}}
+          livenessProbe: {httpGet: {path: /healthz, port: 8180}, initialDelaySeconds: 10}
+          {{- if .Values.brain.persistence.enabled }}
+          volumeMounts: [{name: data, mountPath: /data}]
+          {{- end }}
+          resources: {{- toYaml .Values.brain.resources | nindent 12 }}
+          securityContext: {{- include "kilter.securityContext" . | nindent 12 }}
+      {{- if .Values.brain.persistence.enabled }}
+      volumes:
+        - name: data
+          persistentVolumeClaim: {claimName: {{ .Release.Name }}-brain-data}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-brain
+  labels: {{- include "kilter.labels" . | nindent 4 }}
+spec:
+  selector:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: brain
+  ports: [{name: http, port: 8180, targetPort: 8180}]
+{{- end }}
