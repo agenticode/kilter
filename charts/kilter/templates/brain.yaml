@@ -48,6 +48,9 @@ spec:
             {{- else }}
             - --db=
             {{- end }}
+            {{- with .Values.brain.forecasterURL }}
+            - --forecaster-url={{ . }}
+            {{- end }}
           env:
             - name: KILTER_TOKEN
               valueFrom: {secretKeyRef: {name: {{ .Release.Name }}-token, key: token}}

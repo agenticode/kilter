@@ -24,6 +24,9 @@ brain:
   # Point agents/controllers at an external brain instead of the in-cluster
   # one by setting brain.enabled=false and externalURL.
   externalURL: ""
+  # Optional external time-series model server (Chronos/TimesFM wrapper) for
+  # capacity forecasts; built-in models remain default and fallback.
+  forecasterURL: ""
 
 agent:
   enabled: true
