@@ -74,20 +74,20 @@ System stability rules: no new dependency in the decision path; cloud calls only
 actuation path with timeouts + idempotency; every feature lands with unit tests and an
 e2e scenario before the next starts.
 
-- [ ] **P1 pkg/provider — node lifecycle** (closes the biggest CAST AI gap)
+- [x] **P1 pkg/provider — node lifecycle** (closes the biggest CAST AI gap)
       Interface: Discover() node groups, ScaleTo(group,n), TerminateNode(node).
       Implementations: `eks` (ASG TerminateInstanceInAutoScalingGroup w/ decrement +
       SetDesiredCapacity via aws-sdk-go-v2), `webhook` (generic HTTP contract for
       on-prem/any-cloud), `karpenter` (documented no-op: node deletion already
       terminates the instance via NodeClaim finalizer). Actuator calls provider after
       node-object deletion; failure = step failure (never silent). Mock-based tests.
-- [ ] **P2 Spot automation**
+- [x] **P2 Spot automation**
       Workload spot-safety scoring (replicas, PDB slack, class, local storage,
       do-not-evict) → `spot-opportunity` insights with $ deltas; PlanNodes
       mixed-lifecycle packing (spot-safe pods onto spot shapes, rest on-demand);
       controller reacts to spot interruption signals (NTH taints / node conditions)
       with an emergency drain path that bypasses cooldowns but not PDBs.
-- [ ] **P3 Live pricing** — `kilter pricing sync-aws`: on-demand via Pricing API
+- [x] **P3 Live pricing** — `kilter pricing sync-aws`: on-demand via Pricing API
       GetProducts + spot via DescribeSpotPriceHistory → writes a catalog JSON the
       brain/analyze load with --catalog. Credentials optional feature; embedded
       catalog remains the fallback.

@@ -34,6 +34,7 @@ Commands:
   controller  Execute brain plans (dry-run by default)
   plan        Fetch and print the current plan from a brain
   insights    Predictive findings: OOM risk, saturation, capacity exhaustion
+  pricing     Sync live cloud prices into a catalog (sync-aws)
   simulate    Replay a snapshot file through the decision engine
   version     Print version
 
@@ -61,6 +62,8 @@ func main() {
 		err = runPlanCmd(args)
 	case "insights":
 		err = runInsights(args)
+	case "pricing":
+		err = runPricing(args)
 	case "simulate":
 		err = runSimulate(args)
 	case "version", "--version", "-v":

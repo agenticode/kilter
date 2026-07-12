@@ -5,6 +5,8 @@ go 1.26.4
 require (
 	github.com/aws/aws-sdk-go-v2/config v1.32.29
 	github.com/aws/aws-sdk-go-v2/service/autoscaling v1.69.0
+	github.com/aws/aws-sdk-go-v2/service/ec2 v1.316.0
+	github.com/aws/aws-sdk-go-v2/service/pricing v1.43.0
 	github.com/aws/smithy-go v1.27.3
 	github.com/prometheus/client_golang v1.23.2
 	go.etcd.io/bbolt v1.5.0
