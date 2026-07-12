@@ -55,6 +55,17 @@ to be stable under high load (big-tech SRE grade), shipped as a single static bi
 - [x] Create remote repo (agenticode/kilter) and push once, at the end — pushed, CI green on first run (test/helm/e2e/docker)
 - [x] Final self-score ≥ 95/100 with rubric in this file
 
+## Iteration 2 (2026-07-12) — AIOps alignment & ecosystem coexistence
+- [x] pkg/patterns — online workload classifier (steady/diurnal/bursty/batch/growing), interpretable features, class migration verified
+- [x] Class-adaptive sizing policies + predictive memory growth sizing; sticky classes across brain restarts
+- [x] Detection layer: oom-risk (with ETA), cpu-saturation, growth-trend, capacity-exhaustion (24h demand forecast vs allocatable)
+- [x] /insights API + `kilter insights` CLI
+- [x] Pluggable pre-trained forecaster (`--forecaster-url`, Chronos/TimesFM HTTP contract) with built-in fallback — tested incl. model-server failure
+- [x] Trace-derived cold-start priors (Google Borg / Alibaba, cited)
+- [x] Karpenter coexistence: managed nodes deferred (RespectManagedNodes), rightsizing feeds Karpenter's consolidation
+- [x] KEDA detection: ScaledObject-owned HPAs recognized and explained
+- [x] Helm chart forecasterURL, docs/forecasting.md, README AIOps sections
+
 ## Differentiators vs CAST AI (ROI-justified killer features)
 1. **Fully self-hosted / air-gapped** — no SaaS dependency; the "central brain" is yours.
 2. **Zero-install analyze** — one binary + kubeconfig = instant savings report (adoption wedge).
