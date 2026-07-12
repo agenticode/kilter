@@ -237,6 +237,11 @@ type PDB struct {
 	DisruptionsAllowed int32             `json:"disruptionsAllowed"`
 	CurrentHealthy     int32             `json:"currentHealthy"`
 	DesiredHealthy     int32             `json:"desiredHealthy"`
+	// CoveredPodUIDs is the exact pod set the PDB selected at collection time.
+	// Collectors fill it using full Kubernetes selector semantics (including
+	// matchExpressions, which Selector cannot express). When present it takes
+	// precedence over Selector.
+	CoveredPodUIDs []string `json:"coveredPodUIDs,omitempty"`
 }
 
 // Matches reports whether the PDB selector matches the given labels.
@@ -250,6 +255,23 @@ func (p *PDB) Matches(labels map[string]string) bool {
 		}
 	}
 	return true
+}
+
+// Covers reports whether the PDB applies to the pod, preferring exact
+// collection-time coverage over label matching.
+func (p *PDB) Covers(pod *PodSpec) bool {
+	if pod.Namespace != p.Namespace {
+		return false
+	}
+	if len(p.CoveredPodUIDs) > 0 {
+		for _, uid := range p.CoveredPodUIDs {
+			if uid == pod.UID {
+				return true
+			}
+		}
+		return false
+	}
+	return p.Matches(pod.Labels)
 }
 
 // WorkloadInfo aggregates a controller and its replica intent.

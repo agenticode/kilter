@@ -71,7 +71,7 @@ func NewPDBGuard(pdbs []model.PDB) *PDBGuard {
 func (g *PDBGuard) matching(p *model.PodSpec) []int {
 	var out []int
 	for i := range g.pdbs {
-		if g.pdbs[i].Namespace == p.Namespace && g.pdbs[i].Matches(p.Labels) {
+		if g.pdbs[i].Covers(p) {
 			out = append(out, i)
 		}
 	}
