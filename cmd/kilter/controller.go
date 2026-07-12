@@ -105,6 +105,15 @@ func reconcile(ctx context.Context, log *slog.Logger, brain *api.Client, act *ac
 		delete(applied, reg.Ref)
 	}
 
+	// 1b. Spot interruptions: fast-track drains for dying nodes. Cooldowns
+	// don't apply (the machine is going away regardless); PDBs still do.
+	for _, node := range plan.InterruptedSpotNodes(snap) {
+		log.Warn("spot interruption — emergency drain", "node", node)
+		rep := act.ExecutePlan(ctx, plan.EmergencyDrainPlan(snap, node))
+		log.Info("emergency drain executed", "node", node,
+			"done", rep.Done, "failed", rep.Failed)
+	}
+
 	// 2. Pull the current plan.
 	p, err := brain.GetPlan(ctx, clusterID)
 	if err != nil {

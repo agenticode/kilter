@@ -300,7 +300,17 @@ func printReport(snap *model.ClusterSnapshot, recs []recommend.Recommendation, p
 			usd(p.GreenfieldHourlyUSD*pricing.HoursPerMonth),
 			s.dim("— cheapest possible repack of current workloads"))
 	}
-	fmt.Println()
+	spot := plan.BuildSpotReport(snap, catalog, 2)
+	if spot.EstMonthlySavingsUSD >= 10 {
+		safe := 0
+		for _, w := range spot.Workloads {
+			if w.Safe {
+				safe++
+			}
+		}
+		fmt.Printf("  %s %d workload(s) are spot-safe → est. %s/month at typical %s spot discount\n\n",
+			s.bold("SPOT OPPORTUNITY:"), safe, s.green(usd(spot.EstMonthlySavingsUSD)), pct(spot.DiscountApplied))
+	}
 	if watched == 0 {
 		fmt.Printf("  %s\n\n", s.dim("tip: add --watch 30m to sample usage over time and unlock rightsizing\n  recommendations with confidence scores."))
 	}

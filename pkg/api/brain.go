@@ -280,6 +280,20 @@ func (b *Brain) Insights(ctx context.Context, cluster string) ([]model.Insight, 
 	dt := b.demand[cluster]
 	b.mu.RUnlock()
 	out = append(out, capacityInsights(ctx, dt, b.forecaster, snap)...)
+	if rep := plan.BuildSpotReport(snap, b.catalog, 2); rep.EstMonthlySavingsUSD >= 10 {
+		safe := 0
+		for _, w := range rep.Workloads {
+			if w.Safe {
+				safe++
+			}
+		}
+		out = append(out, model.Insight{
+			Kind: "spot-opportunity", Severity: "info",
+			Message: fmt.Sprintf("%d spot-safe workload(s) running on on-demand capacity — moving them could save ~$%.0f/month (%.0f%% typical spot discount)",
+				safe, rep.EstMonthlySavingsUSD, rep.DiscountApplied*100),
+			At: snap.Timestamp,
+		})
+	}
 	return out, nil
 }
 
