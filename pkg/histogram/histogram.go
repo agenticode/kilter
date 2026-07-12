@@ -59,9 +59,12 @@ func (o Options) findBucket(value float64) int {
 	if i >= o.NumBuckets {
 		return o.NumBuckets - 1
 	}
-	// Guard against float edge: ensure value >= start(i); the closed form can
-	// land one bucket high at exact boundaries.
-	if o.bucketStart(i) > value {
+	// Float-precision guard: at exact boundaries the closed form can land one
+	// bucket off in either direction. The error is always < 1 bucket, so a
+	// single-step correction restores the invariant start(i) <= v < start(i+1).
+	if i+1 < o.NumBuckets && value >= o.bucketStart(i+1) {
+		i++
+	} else if o.bucketStart(i) > value {
 		i--
 	}
 	return i
