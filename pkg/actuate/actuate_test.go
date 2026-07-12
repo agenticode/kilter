@@ -235,6 +235,30 @@ func TestWaitNodeEmptyIgnoresDaemonSets(t *testing.T) {
 	}
 }
 
+func TestEvictFailureDoesNotAbortDrain(t *testing.T) {
+	// One pod's eviction fails (no reactor → eviction 'succeeds' silently)…
+	// use budget exhaustion to force a failure mid-plan instead.
+	client := k8sfake.NewClientset(
+		nodeObj("n1"),
+		podOnNode("prod", "a", "n1"), podOnNode("prod", "b", "n1"), podOnNode("prod", "c", "n1"),
+	)
+	evictionDeletesPod(client)
+	a, _ := New(client, Config{Mode: ModeApply, MaxEvictionsPerHour: 2})
+	p := &plan.Plan{Steps: []plan.Step{
+		{Seq: 1, Type: plan.StepCordonNode, Node: "n1"},
+		{Seq: 2, Type: plan.StepEvictPod, Pod: "prod/a", Node: "n1"},
+		{Seq: 3, Type: plan.StepEvictPod, Pod: "prod/b", Node: "n1"},
+		{Seq: 4, Type: plan.StepEvictPod, Pod: "prod/c", Node: "n1"}, // budget exhausted → fails
+	}}
+	rep := a.ExecutePlan(context.Background(), p)
+	if rep.Aborted {
+		t.Fatal("evict failure must not abort the remaining plan")
+	}
+	if rep.Failed != 1 || rep.Done != 3 {
+		t.Fatalf("report: %+v", rep)
+	}
+}
+
 func TestResizeFailureDoesNotAbortPlan(t *testing.T) {
 	client := k8sfake.NewClientset(nodeObj("n1")) // deployment missing → resize fails
 	a, _ := New(client, Config{Mode: ModeApply})

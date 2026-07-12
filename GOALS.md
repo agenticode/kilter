@@ -110,6 +110,17 @@ with the product behavior proven right. Coverage vs CAST AI reassessed: ~90%
 (remaining: GKE/AKS providers, provision-before-drain surge on non-Karpenter clusters,
 automated spot migration, GCP/Azure pricing sync, enterprise console features).
 
+## Iteration 4 (2026-07-12) — the trust package (beyond-parity killer features)
+Targeting the four fears that keep CAST AI users from trusting any optimizer:
+- [x] Guardrails: kilter.dev/mode (off|recommend|apply) per workload/namespace; protected pods pin nodes and get no steps
+- [x] Change windows (Mon-Fri 22:00-06:00 style) confining node surgery; freeze switch on kube-system
+- [x] Circuit breaker: NotReady/Pending surges pause automation (emergency drains exempt, freeze absolute)
+- [x] Audit ledger: executed plans recorded with claimed vs measured cost + timeline; realized savings with stated formula; `kilter ledger`
+- [x] Approval gate: deterministic plan fingerprints, `--require-approval`, `kilter approve` (24h TTL, write-token only)
+- [x] `kilter undo`: reverts resizes/cordons from ledger From-values; honest about irreversible steps
+- [x] Fingerprint test exposed+fixed a shallow-copy bug corrupting the brain's stored snapshot on every plan build
+- [x] UI ledger section + realized-savings card; e2e asserts ledger recording; helm values (changeWindows/requireApproval)
+
 ## Differentiators vs CAST AI (ROI-justified killer features)
 1. **Fully self-hosted / air-gapped** — no SaaS dependency; the "central brain" is yours.
 2. **Zero-install analyze** — one binary + kubeconfig = instant savings report (adoption wedge).

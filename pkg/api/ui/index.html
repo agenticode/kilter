@@ -49,10 +49,12 @@
     <div class="card"><div class="label">Plan savings</div><div class="value green" id="c-save">—</div><div class="sub" id="c-savepct"></div></div>
     <div class="card"><div class="label">Recommendations</div><div class="value" id="c-recs">—</div><div class="sub">rightsizing candidates</div></div>
     <div class="card"><div class="label">Insights</div><div class="value" id="c-ins">—</div><div class="sub" id="c-insworst"></div></div>
+    <div class="card"><div class="label">Realized savings</div><div class="value green" id="c-real">—</div><div class="sub" id="c-realmethod">measured, not claimed</div></div>
   </div>
   <h2>Insights</h2><div id="insights"></div>
   <h2>Rightsizing recommendations</h2><div id="recs"></div>
   <h2>Current plan</h2><div id="plan"></div>
+  <h2>Audit ledger</h2><div id="ledger"></div>
 </main>
 <script>
 "use strict";
@@ -90,11 +92,12 @@ async function load() {
     await loadClusters();
     const cl = $("cluster").value;
     if (!cl) { $("err").textContent = "no clusters have reported yet — is an agent running?"; $("err").style.display = "block"; return; }
-    const [cost, plan, recs, ins] = await Promise.all([
+    const [cost, plan, recs, ins, ledger] = await Promise.all([
       api(`/api/v1/clusters/${encodeURIComponent(cl)}/cost`),
       api(`/api/v1/clusters/${encodeURIComponent(cl)}/plan`),
       api(`/api/v1/clusters/${encodeURIComponent(cl)}/recommendations`),
       api(`/api/v1/clusters/${encodeURIComponent(cl)}/insights`),
+      api(`/api/v1/clusters/${encodeURIComponent(cl)}/ledger`),
     ]);
     $("c-hour").textContent = "$" + cost.hourlyUSD.toFixed(3) + "/h";
     $("c-month").textContent = usd(cost.monthlyUSD) + "/month · " + cost.nodes.length + " nodes";
@@ -127,6 +130,15 @@ async function load() {
         steps.map(s => [s.seq, esc(s.type),
           esc(s.type === "resize-workload" ? s.workload.namespace + "/" + s.workload.name : (s.pod || s.node || "")),
           esc(s.detail), esc(s.risk)]));
+    $("c-real").textContent = ledger.realizedMonthlyUSD ? usd(ledger.realizedMonthlyUSD) + "/mo" : "—";
+    if (ledger.method) $("c-realmethod").title = ledger.method;
+    const entries = ledger.entries || [];
+    $("ledger").innerHTML = table(["When","Mode","Plan","Steps","Cost before","Projected","Claimed/mo"],
+      entries.map(e => [
+        new Date(e.at).toLocaleString(), esc(e.mode), `<code>${esc(e.fingerprint)}</code>`,
+        e.done + " ok" + (e.failed ? ` <span class="sev-critical">${e.failed} failed</span>` : ""),
+        "$" + e.costBeforeHourlyUSD.toFixed(3) + "/h", "$" + e.projectedHourlyUSD.toFixed(3) + "/h",
+        `<span class="green">${usd(e.projectedMonthlySavings)}</span>`]));
   } catch (e) {
     $("err").textContent = e.message + " — check the API token";
     $("err").style.display = "block";

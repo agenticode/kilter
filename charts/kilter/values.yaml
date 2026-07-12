@@ -46,6 +46,10 @@ controller:
   interval: 5m
   maxEvictionsPerHour: 20
   inPlaceResize: true
+  # Node-surgery windows, e.g. "Mon-Fri 22:00-06:00" (empty = always).
+  changeWindows: ""
+  # Execute only plans approved via `kilter approve` (plan fingerprints).
+  requireApproval: false
   resources:
     requests: {cpu: 50m, memory: 64Mi}
     limits: {memory: 256Mi}

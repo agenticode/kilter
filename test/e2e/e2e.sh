@@ -121,7 +121,7 @@ echo "==> 4) controller --mode=apply (spot interruption + consolidation in one r
 KC taint node "$CLUSTER-worker3" aws-node-termination-handler/spot-itn=true:NoSchedule --overwrite >/dev/null
 NODES_BEFORE=$(KC get nodes --no-headers | wc -l | tr -d ' ')
 ./bin/kilter controller --brain-url="http://localhost:$BRAIN_PORT" --token=$TOKEN \
-  --cluster-id=e2e --mode=apply --interval=10m --kubeconfig "$KUBECONFIG_FILE" &
+  --cluster-id=e2e --mode=apply --interval=45s --kubeconfig "$KUBECONFIG_FILE" &
 CTRL_PID=$!
 echo "==> 4a) spot-tainted worker3 must be cordoned and drained"
 for i in $(seq 1 60); do
@@ -152,3 +152,16 @@ KC rollout status deployment worker --timeout=180s >/dev/null
 PENDING=$(KC get pods --field-selector=status.phase=Pending --no-headers 2>/dev/null | wc -l | tr -d ' ')
 [[ "$PENDING" == "0" ]] || FAIL "$PENDING pods stuck Pending after consolidation"
 PASS "all workloads Running after consolidation, nothing Pending"
+
+echo "==> 6) audit ledger records the execution"
+LEDGER=$(curl -sf -H "Authorization: Bearer $TOKEN" "http://localhost:$BRAIN_PORT/api/v1/clusters/e2e/ledger")
+echo "$LEDGER" | python3 -c '
+import json,sys
+d = json.load(sys.stdin)
+assert len(d["entries"]) >= 1, "no ledger entries"
+e = d["entries"][0]
+assert e["mode"] == "apply" and e["done"] >= 1, e
+assert e["fingerprint"], "entry must carry the plan fingerprint"
+assert len(d["costTimeline"]) >= 2, "cost timeline missing"
+' || FAIL "ledger assertions"
+PASS "ledger: executed plan recorded with fingerprint + measured cost timeline"

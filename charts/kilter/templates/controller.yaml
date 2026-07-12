@@ -34,6 +34,12 @@ spec:
             - --provider={{ .Values.controller.provider }}
             - --provider-config={{ .Values.controller.providerConfig }}
             {{- end }}
+            {{- with .Values.controller.changeWindows }}
+            - --change-windows={{ . }}
+            {{- end }}
+            {{- if .Values.controller.requireApproval }}
+            - --require-approval
+            {{- end }}
           env:
             - name: KILTER_CLUSTER_ID
               value: {{ .Values.clusterID | quote }}

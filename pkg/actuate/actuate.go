@@ -121,9 +121,11 @@ type Report struct {
 	Aborted bool `json:"aborted,omitempty"`
 }
 
-// ExecutePlan runs the plan's steps in order. A failed node-removal step
-// aborts the remaining steps of that plan (never leave a half-drained node
-// and keep going); failed resizes are recorded and skipped past.
+// ExecutePlan runs the plan's steps in order. Failed evictions and resizes
+// are recorded and skipped past — partial drain progress beats an aborted
+// drain, and the next reconcile retries what remains. Only cordon/delete
+// failures abort the plan: WaitNodeEmpty independently guarantees a node is
+// never deleted while pods that failed to evict still run on it.
 func (a *Actuator) ExecutePlan(ctx context.Context, p *plan.Plan) *Report {
 	rep := &Report{Mode: a.cfg.Mode, Started: time.Now().UTC()}
 	defer func() { rep.Finished = time.Now().UTC() }()
@@ -142,8 +144,8 @@ func (a *Actuator) ExecutePlan(ctx context.Context, p *plan.Plan) *Report {
 			rep.Skipped++
 		case "failed":
 			rep.Failed++
-			if s.Type != plan.StepResizeWorkload {
-				// Node-surgery failure: stop the whole plan.
+			if s.Type != plan.StepResizeWorkload && s.Type != plan.StepEvictPod {
+				// Cordon/delete failure: stop the whole plan.
 				rep.Aborted = true
 			}
 		}

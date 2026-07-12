@@ -46,6 +46,9 @@ as a single Apache-2.0 binary you run yourself:
 | 🏷️ **Live pricing** | `kilter pricing sync-aws` builds catalogs from the AWS Pricing API + current spot prices. Embedded baseline works offline. |
 | 🖥️ **Built-in dashboard** | The brain serves a zero-dependency web UI at `/ui`: cost, savings, insights, recommendations, plans. Read-only tokens for viewers. |
 | 🎮 **GPU-aware** | Extended resources (nvidia.com/gpu, …) gate every simulated placement — GPU nodes are never drained without replacement capacity. |
+| 🚦 **Guardrails & approvals** | `kilter.dev/mode` annotations (off/recommend/apply) per workload or namespace, change windows, a one-annotation freeze switch, and `--require-approval` with plan fingerprints — humans stay in charge. |
+| 🧾 **Verifiable savings ledger** | Every executed plan is recorded with claimed vs *measured* cost, formula included. `kilter undo` reverts the latest applied plan. No marketing math. |
+| ⛔ **Circuit breaker** | NotReady/Pending surges pause all automation — a struggling cluster is observed, never optimized into an outage. |
 | 📊 **Prometheus-native** | Cost, savings and learning metrics exposed; Grafana dashboard included. |
 
 ## Quick start
@@ -122,6 +125,9 @@ The full decision engine is pure Go with zero Kubernetes dependencies —
 unit-tested in milliseconds, fuzzable, and reused verbatim by `analyze`,
 `simulate`, the brain, and the e2e suite. See [ARCHITECTURE.md](ARCHITECTURE.md).
 
+Read [docs/trust.md](docs/trust.md) for the full trust package: guardrails,
+change windows, circuit breaker, approvals, the verifiable ledger, and undo.
+
 ## Safety model
 
 Kilter treats disruption as a budget, not a side effect:
@@ -166,6 +172,9 @@ Decision latency on an M4 laptop (see `make bench`):
 | Automatic regression revert | ✅ | ❌ | ❌ | ❌ | ❌ |
 | Predictive OOM / capacity insights | ✅ | partial | ❌ | ❌ | ❌ |
 | Pluggable foundation-model forecasts | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Verifiable (measured) savings ledger | ✅ | ❌ self-reported | partial | ❌ | ❌ |
+| Human approval gate + undo | ✅ | partial | ❌ | ❌ | ❌ |
+| Annotation guardrails + freeze switch | ✅ | partial | ❌ | partial | ✅ |
 | Price | Apache-2.0 | % of savings | free/paid | free | free |
 
 \* Karpenter consolidates nodes it provisioned; Kilter works on any cluster,
