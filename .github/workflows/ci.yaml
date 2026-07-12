@@ -20,7 +20,11 @@ jobs:
       - name: go vet
         run: go vet ./...
       - name: unit tests (race)
-        run: go test -race -count=1 ./...
+        # -short skips the scale soaks: the race detector's 10-20x slowdown
+        # would turn latency budgets into runner-speed lotteries.
+        run: go test -race -short -count=1 ./...
+      - name: scale soak tests (no race, real latency budgets)
+        run: go test -count=1 -run 'TestPlanBuild5k|TestRecommenderIngest' ./test/scale/
       - name: benchmarks (sanity)
         run: go test -bench=. -benchtime=1x -run=NONE ./pkg/binpack/ ./pkg/histogram/
       - name: build all platforms
