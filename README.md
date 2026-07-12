@@ -38,6 +38,9 @@ as a single Apache-2.0 binary you run yourself:
 | 🛡️ **Safety envelope** | Dry-run by default. PDB reservations, eviction budgets, cooldowns, cluster headroom floor, and automatic revert when a change causes OOM/crashloop. |
 | 🔁 **In-place resize** | On Kubernetes ≥1.33, resizes land on running pods without restarts. |
 | 🧪 **Deterministic simulator** | `kilter simulate` replays any recorded snapshot through the exact production decision path. Review the plan in CI before it ever runs. |
+| 🤖 **Self-learning AIOps loop** | Online pattern classifier (steady/diurnal/bursty/batch/growing) adapts sizing policy per workload — and re-adapts when behavior changes. Every decision states its evidence. |
+| 🔮 **Predictive insights** | `kilter insights`: OOM-risk ETAs, CPU saturation, 24h capacity-exhaustion forecasts. Plug pre-trained foundation models (Chronos, TimesFM) via `--forecaster-url`; built-ins are the fallback. |
+| 🤝 **Karpenter & KEDA native** | Karpenter-managed nodes are left to Karpenter — Kilter's rightsizing feeds its consolidation. KEDA-driven HPAs are detected and respected. |
 | 📊 **Prometheus-native** | Cost, savings and learning metrics exposed; Grafana dashboard included. |
 
 ## Quick start
@@ -98,7 +101,10 @@ $ kilter simulate --snapshot cluster.json        # exact same decision engine, z
 1. **Agent** snapshots topology (nodes, pods, workloads, PDBs, HPAs) and usage
    (`metrics.k8s.io`) every minute and pushes to the brain.
 2. **Brain** feeds usage into exponentially-decaying histograms per container —
-   24h half-life, so it tracks workload evolution without forgetting spikes.
+   24h half-life, so it tracks workload evolution without forgetting spikes —
+   and classifies each workload's behavior online (steady / diurnal / bursty /
+   batch / growing), adapting percentile and headroom per class (see
+   [docs/forecasting.md](docs/forecasting.md)).
    From those it derives **requests** (CPU p95 × headroom; memory peak with
    OOM-bumped floors) and builds a **plan**: resize steps first, then node
    consolidation proven safe by the built-in scheduling simulator, with the
@@ -149,6 +155,8 @@ Decision latency on an M4 laptop (see `make bench`):
 | Multi-cluster central brain | ✅ | ✅ | 💰 paid | ❌ | ❌ |
 | Offline decision replay | ✅ | ❌ | ❌ | ❌ | ❌ |
 | Automatic regression revert | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Predictive OOM / capacity insights | ✅ | partial | ❌ | ❌ | ❌ |
+| Pluggable foundation-model forecasts | ✅ | ❌ | ❌ | ❌ | ❌ |
 | Price | Apache-2.0 | % of savings | free/paid | free | free |
 
 \* Karpenter consolidates nodes it provisioned; Kilter works on any cluster,
@@ -201,7 +209,7 @@ Kilter is young and moving fast. Shipped: everything above. Next:
 - Spot interruption handling + spot-friendliness scoring per workload
 - Live pricing feeds (AWS Pricing API, GCP Catalog)
 - Web UI on the brain
-- Forecast-driven pre-scaling (the Holt-Winters engine is already in-tree)
+- Forecast-driven pre-scaling actions (the capacity forecasts already exist as insights)
 
 Issues and PRs welcome. Read [ARCHITECTURE.md](ARCHITECTURE.md) first; the
 decision engine is deliberately dependency-free and a joy to test.
