@@ -157,6 +157,9 @@ func (cs *ClusterState) RemoveNode(name string) ([]*model.PodSpec, error) {
 }
 
 func (cs *ClusterState) adjustTopo(p *model.PodSpec, node *model.NodeSpec, delta int) {
+	if len(p.AntiAffinityKeys) == 0 && len(p.TopologySpread) == 0 {
+		return // hot path: unconstrained pods need no topology bookkeeping
+	}
 	wl := p.Workload.String()
 	keys := map[string]bool{}
 	for _, k := range p.AntiAffinityKeys {

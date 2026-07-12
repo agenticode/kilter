@@ -38,10 +38,16 @@ func (o PlanOptions) withDefaults() PlanOptions {
 		o.MaxPodsPerNode = DefaultMaxPodsPerNode
 	}
 	if o.MaxNodes <= 0 {
-		o.MaxNodes = 1000
+		o.MaxNodes = 5000
 	}
 	return o
 }
+
+// effEpsilon: trials within 1% packing efficiency are treated as equal, and
+// the tie breaks toward the node that consolidates more (bigger packed value).
+// Without this, scale-free value-per-dollar lets small shapes win by float
+// noise and plans balloon into many under-sized nodes.
+const effEpsilon = 0.01
 
 // PlannedNode is one node in a plan with its assigned pods.
 type PlannedNode struct {
@@ -117,6 +123,22 @@ func trialFill(it pricing.InstanceType, seq int, sortedPods []*model.PodSpec, op
 		}
 	}
 
+	// Early-exit floor: once free capacity drops below the smallest remaining
+	// request in either dimension, nothing else can fit.
+	minCPU, minMem := int64(1<<62), int64(1<<62)
+	for _, p := range sortedPods {
+		if p == nil {
+			continue
+		}
+		req := p.Requests()
+		if req.MilliCPU < minCPU {
+			minCPU = req.MilliCPU
+		}
+		if req.MemoryBytes < minMem {
+			minMem = req.MemoryBytes
+		}
+	}
+
 	for i, p := range sortedPods {
 		if p == nil {
 			continue
@@ -125,6 +147,9 @@ func trialFill(it pricing.InstanceType, seq int, sortedPods []*model.PodSpec, op
 			cs.forcePlace(p, ns)
 			packedIdx = append(packedIdx, i)
 			used = used.Add(p.Requests())
+			if ns.Free.MilliCPU < minCPU || ns.Free.MemoryBytes < minMem {
+				break
+			}
 		}
 	}
 	return packedIdx, used, node
@@ -165,64 +190,102 @@ func PlanNodes(pods []*model.PodSpec, candidates []pricing.InstanceType, opts Pl
 	})
 	left := len(remaining)
 
+	type trial struct {
+		it     pricing.InstanceType
+		packed []int
+		used   model.Resources
+		node   model.NodeSpec
+		value  float64
+		eff    float64
+		price  float64
+	}
+	runTrial := func(it pricing.InstanceType, seq int) *trial {
+		packed, used, node := trialFill(it, seq, remaining, opts)
+		if len(packed) == 0 {
+			return nil
+		}
+		price := it.Price(opts.Spot)
+		value := 0.0
+		for _, idx := range packed {
+			value += podValueUSD(remaining[idx])
+		}
+		return &trial{it: it, packed: packed, used: used, node: node, value: value, eff: value / price, price: price}
+	}
+	better := func(a, b *trial) bool { // is a better than b?
+		if b == nil {
+			return a != nil
+		}
+		if a == nil {
+			return false
+		}
+		if a.eff > b.eff*(1+effEpsilon) {
+			return true
+		}
+		if b.eff > a.eff*(1+effEpsilon) {
+			return false
+		}
+		if a.value != b.value {
+			return a.value > b.value // near-tie: consolidate onto bigger shapes
+		}
+		if a.price != b.price {
+			return a.price < b.price
+		}
+		return a.it.Name < b.it.Name
+	}
+	commit := func(tr *trial) {
+		pn := PlannedNode{
+			Name:        tr.node.Name,
+			Type:        tr.it,
+			Spot:        opts.Spot,
+			Used:        tr.used,
+			Allocatable: tr.node.Allocatable,
+			HourlyUSD:   tr.price,
+		}
+		for _, idx := range tr.packed {
+			pn.PodUIDs = append(pn.PodUIDs, remaining[idx].UID)
+			remaining[idx] = nil
+			left--
+		}
+		plan.Nodes = append(plan.Nodes, pn)
+		plan.TotalHourlyUSD += tr.price
+	}
+
 	seq := 0
 	for left > 0 && len(plan.Nodes) < opts.MaxNodes {
-		type trial struct {
-			it     pricing.InstanceType
-			packed []int
-			used   model.Resources
-			node   model.NodeSpec
-			eff    float64
-			price  float64
-		}
 		var best *trial
 		for _, it := range candidates {
-			packed, used, node := trialFill(it, seq, remaining, opts)
-			if len(packed) == 0 {
-				continue
-			}
-			price := it.Price(opts.Spot)
-			value := 0.0
-			for _, idx := range packed {
-				value += podValueUSD(remaining[idx])
-			}
-			tr := &trial{it: it, packed: packed, used: used, node: node, eff: value / price, price: price}
-			if best == nil || tr.eff > best.eff ||
-				(tr.eff == best.eff && (tr.price < best.price ||
-					(tr.price == best.price && tr.it.Name < best.it.Name))) {
+			if tr := runTrial(it, seq); better(tr, best) {
 				best = tr
 			}
 		}
 		if best == nil {
 			break // nothing packs anywhere → remaining are unschedulable
 		}
-
-		pn := PlannedNode{
-			Name:        best.node.Name,
-			Type:        best.it,
-			Spot:        opts.Spot,
-			Used:        best.used,
-			Allocatable: best.node.Allocatable,
-			HourlyUSD:   best.price,
-		}
-		for _, idx := range best.packed {
-			pn.PodUIDs = append(pn.PodUIDs, remaining[idx].UID)
-			remaining[idx] = nil
-			left--
-		}
-		plan.Nodes = append(plan.Nodes, pn)
-		plan.TotalHourlyUSD += best.price
+		commit(best)
 		seq++
 
-		// Compact the remaining slice periodically to keep trials fast.
-		if left > 0 && left*2 < cap(remaining) {
-			compact := remaining[:0]
+		// Streak-fill: keep opening nodes of the winning type while they pack
+		// nearly as well as the round winner. This collapses homogeneous
+		// demand into O(1) candidate sweeps instead of one sweep per node.
+		baseline := best.value
+		for left > 0 && len(plan.Nodes) < opts.MaxNodes {
+			tr := runTrial(best.it, seq)
+			if tr == nil || tr.value < baseline*0.90 {
+				break
+			}
+			commit(tr)
+			seq++
+		}
+
+		// Compact the remaining slice to keep later trials fast.
+		if left > 0 {
+			compacted := remaining[:0]
 			for _, p := range remaining {
 				if p != nil {
-					compact = append(compact, p)
+					compacted = append(compacted, p)
 				}
 			}
-			remaining = compact
+			remaining = compacted
 		}
 	}
 
