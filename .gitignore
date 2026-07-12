@@ -1,0 +1,9 @@
+/bin/
+/dist/
+*.test
+*.out
+coverage.*
+/tools/
+.DS_Store
+*.db
+/testdata/tmp/
