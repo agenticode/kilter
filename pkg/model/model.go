@@ -216,6 +216,11 @@ type NodeSpec struct {
 	Provider     string  `json:"provider,omitempty"` // aws | gcp | azure | custom
 	Spot         bool    `json:"spot,omitempty"`
 	HourlyCost   float64 `json:"hourlyCost,omitempty"` // resolved cost, USD/h
+
+	// ManagedBy marks nodes whose lifecycle belongs to another autoscaler
+	// ("karpenter"). Kilter defers node surgery on such nodes by default and
+	// lets its rightsizing feed that autoscaler's consolidation instead.
+	ManagedBy string `json:"managedBy,omitempty"`
 }
 
 // Usage is a point-in-time measured usage sample for a container.
@@ -284,6 +289,25 @@ type WorkloadInfo struct {
 	HPAMinReplicas int32             `json:"hpaMinReplicas,omitempty"`
 	HPAMaxReplicas int32             `json:"hpaMaxReplicas,omitempty"`
 	HPATargetsCPU  bool              `json:"hpaTargetsCPU,omitempty"` // request changes shift HPA math
+	// HPAOwner marks HPAs driven by another controller ("keda").
+	HPAOwner string `json:"hpaOwner,omitempty"`
+}
+
+// Insight is a detection-layer finding: a predicted or observed condition
+// worth human or automated attention. Insights are how Kilter closes the
+// AIOps loop between telemetry and action — every one carries its evidence.
+type Insight struct {
+	Kind     string `json:"kind"`     // oom-risk | cpu-saturation | capacity-exhaustion | ...
+	Severity string `json:"severity"` // info | warning | critical
+
+	Workload  WorkloadRef `json:"workload,omitempty"`
+	Container string      `json:"container,omitempty"`
+	Node      string      `json:"node,omitempty"`
+
+	Message string `json:"message"`
+	// HorizonHours estimates time-to-impact for predictive insights (0 = now).
+	HorizonHours float64   `json:"horizonHours,omitempty"`
+	At           time.Time `json:"at"`
 }
 
 // ClusterSnapshot is the unit shipped from agent to brain: complete topology

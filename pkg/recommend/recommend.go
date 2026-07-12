@@ -21,6 +21,7 @@ import (
 	"github.com/agenticode/kilter/pkg/forecast"
 	"github.com/agenticode/kilter/pkg/histogram"
 	"github.com/agenticode/kilter/pkg/model"
+	"github.com/agenticode/kilter/pkg/patterns"
 )
 
 // Config tunes the recommendation policy.
@@ -74,6 +75,11 @@ type containerState struct {
 	cpu    *histogram.Histogram
 	mem    *histogram.Histogram
 	spikes *forecast.SpikeDetector
+	cpuDet *patterns.Detector
+	memDet *patterns.Detector
+	// restoredClass keeps the pre-restart behavior class active until the
+	// fresh detector has enough samples to classify on its own.
+	restoredClass patterns.Class
 
 	firstSample time.Time
 	lastSample  time.Time
@@ -100,6 +106,7 @@ type Recommendation struct {
 	WindowHours    float64            `json:"windowHours"`
 	OOMCount       int                `json:"oomCount"`
 	CPUSkipped     bool               `json:"cpuSkipped,omitempty"` // HPA-on-CPU guard
+	Class          patterns.Class     `json:"class,omitempty"`      // learned behavior class
 	Reason         string             `json:"reason"`
 }
 
@@ -130,6 +137,8 @@ func newState() *containerState {
 		cpu:         histogram.MustNew(histogram.DefaultCPUOptions()),
 		mem:         histogram.MustNew(histogram.DefaultMemoryOptions()),
 		spikes:      sd,
+		cpuDet:      &patterns.Detector{},
+		memDet:      &patterns.Detector{},
 		podRestarts: map[string]int32{},
 	}
 }
@@ -185,6 +194,8 @@ func (r *Recommender) ObserveSnapshot(snap *model.ClusterSnapshot) {
 		st.cpu.AddSample(float64(u.MilliCPU), w, u.Timestamp)
 		st.mem.AddSample(float64(u.MemoryBytes), w, u.Timestamp)
 		st.spikes.Observe(float64(u.MilliCPU))
+		st.cpuDet.Add(u.Timestamp, float64(u.MilliCPU))
+		st.memDet.Add(u.Timestamp, float64(u.MemoryBytes))
 		st.samples++
 		if st.firstSample.IsZero() || u.Timestamp.Before(st.firstSample) {
 			st.firstSample = u.Timestamp
@@ -205,12 +216,13 @@ func (r *Recommender) ObserveSnapshot(snap *model.ClusterSnapshot) {
 	}
 }
 
-// hpaCPUWorkloads indexes workloads whose HPA targets CPU utilization.
-func hpaCPUWorkloads(snap *model.ClusterSnapshot) map[model.WorkloadRef]bool {
-	m := map[model.WorkloadRef]bool{}
+// hpaCPUWorkloads indexes workloads whose HPA targets CPU utilization,
+// mapping to the HPA's owner ("keda" or "" for plain HPA).
+func hpaCPUWorkloads(snap *model.ClusterSnapshot) map[model.WorkloadRef]string {
+	m := map[model.WorkloadRef]string{}
 	for _, w := range snap.Workloads {
 		if w.HasHPA && w.HPATargetsCPU {
-			m[w.Ref] = true
+			m[w.Ref] = w.HPAOwner
 		}
 	}
 	return m
@@ -256,7 +268,8 @@ func (r *Recommender) Recommendations(snap *model.ClusterSnapshot) []Recommendat
 			continue
 		}
 
-		rec := r.recommendOne(key, st, cur.req, cur.lim, hpaCPU[key.Workload], window)
+		hpaOwner, hpaOnCPU := hpaCPU[key.Workload]
+		rec := r.recommendOne(key, st, cur.req, cur.lim, hpaOnCPU, hpaOwner, window)
 		if rec != nil {
 			out = append(out, *rec)
 		}
@@ -265,16 +278,32 @@ func (r *Recommender) Recommendations(snap *model.ClusterSnapshot) []Recommendat
 }
 
 func (r *Recommender) recommendOne(key model.ContainerKey, st *containerState,
-	curReq, curLim model.Resources, hpaOnCPU bool, window time.Duration) *Recommendation {
+	curReq, curLim model.Resources, hpaOnCPU bool, hpaOwner string, window time.Duration) *Recommendation {
 
-	targetCPU := int64(math.Ceil(st.cpu.Percentile(r.cfg.CPUPercentile) * r.cfg.CPUHeadroom))
+	// Adaptive policy: the learned behavior class tunes percentile/headroom
+	// on top of the operator's base config.
+	class, feats := st.cpuDet.Analyze()
+	if class == patterns.ClassUnknown && st.restoredClass != "" {
+		class = st.restoredClass // sticky across restarts until relearned
+	}
+	pol := patterns.PolicyFor(class, r.cfg.CPUPercentile, r.cfg.CPUHeadroom, r.cfg.MemoryHeadroom)
+
+	targetCPU := int64(math.Ceil(st.cpu.Percentile(pol.CPUPercentile) * pol.CPUHeadroom))
 	if targetCPU < r.cfg.MinMilliCPU {
 		targetCPU = r.cfg.MinMilliCPU
 	}
 
-	memP := st.mem.Percentile(r.cfg.MemoryPercentile) * r.cfg.MemoryHeadroom
+	memP := st.mem.Percentile(r.cfg.MemoryPercentile) * pol.MemoryHeadroom
 	memPeak := st.mem.Max()
 	targetMem := int64(math.Ceil(math.Max(memP, memPeak)))
+	// Predictive sizing for up-trending memory: cover the next day of growth
+	// so the workload does not walk into its own ceiling.
+	if _, mf := st.memDet.Analyze(); mf.TrendPerDay > 0.05 {
+		projected := int64(memPeak * (1 + math.Min(mf.TrendPerDay, 1.0)))
+		if projected > targetMem {
+			targetMem = projected
+		}
+	}
 	if targetMem < r.cfg.MinMemoryBytes {
 		targetMem = r.cfg.MinMemoryBytes
 	}
@@ -313,18 +342,24 @@ func (r *Recommender) recommendOne(key model.ContainerKey, st *containerState,
 	}
 
 	conf := r.confidence(st, window)
-	reason := fmt.Sprintf("cpu p%.0f=%dm mem p%.0f=%dMi peak=%dMi",
-		r.cfg.CPUPercentile*100, int64(st.cpu.Percentile(r.cfg.CPUPercentile)),
+	reason := fmt.Sprintf("class=%s (%s); cpu p%.0f=%dm mem p%.0f=%dMi peak=%dMi",
+		class, feats,
+		pol.CPUPercentile*100, int64(st.cpu.Percentile(pol.CPUPercentile)),
 		r.cfg.MemoryPercentile*100, int64(st.mem.Percentile(r.cfg.MemoryPercentile))>>20, int64(st.mem.Max())>>20)
 	if st.oomCount > 0 {
 		reason += fmt.Sprintf("; %d OOM(s), floor=%dMi", st.oomCount, st.oomFloorBytes>>20)
 	}
 	if cpuSkipped {
-		reason += "; cpu untouched (HPA scales on CPU)"
+		if hpaOwner != "" {
+			reason += fmt.Sprintf("; cpu untouched (%s-managed HPA scales on CPU)", hpaOwner)
+		} else {
+			reason += "; cpu untouched (HPA scales on CPU)"
+		}
 	}
 
 	return &Recommendation{
 		Key:            key,
+		Class:          class,
 		CurrentRequest: curReq,
 		TargetRequest:  target,
 		CurrentLimit:   curLim,
@@ -387,6 +422,7 @@ type CheckpointState struct {
 	Samples     int                  `json:"samples"`
 	OOMCount    int                  `json:"oomCount"`
 	OOMFloor    int64                `json:"oomFloor"`
+	Class       patterns.Class       `json:"class,omitempty"`
 }
 
 // Checkpoint exports all learned state.
@@ -395,10 +431,15 @@ func (r *Recommender) Checkpoint() []CheckpointState {
 	defer r.mu.Unlock()
 	out := make([]CheckpointState, 0, len(r.states))
 	for key, st := range r.states {
+		class, _ := st.cpuDet.Analyze()
+		if class == patterns.ClassUnknown && st.restoredClass != "" {
+			class = st.restoredClass
+		}
 		out = append(out, CheckpointState{
 			Key: key, CPU: st.cpu.Checkpoint(), Memory: st.mem.Checkpoint(),
 			FirstSample: st.firstSample, LastSample: st.lastSample,
 			Samples: st.samples, OOMCount: st.oomCount, OOMFloor: st.oomFloorBytes,
+			Class: class,
 		})
 	}
 	return out
@@ -422,6 +463,9 @@ func (r *Recommender) Restore(states []CheckpointState) (restored int) {
 		st.cpu, st.mem = cpu, mem
 		st.firstSample, st.lastSample = cs.FirstSample, cs.LastSample
 		st.samples, st.oomCount, st.oomFloorBytes = cs.Samples, cs.OOMCount, cs.OOMFloor
+		if cs.Class != "" && cs.Class != patterns.ClassUnknown {
+			st.restoredClass = cs.Class
+		}
 		r.states[cs.Key] = st
 		restored++
 	}

@@ -146,9 +146,10 @@ func TestHPAOnCPUKeepsCPURequest(t *testing.T) {
 func TestRightSizedWorkloadSuppressed(t *testing.T) {
 	r := newRec(t)
 	ref := deployRef("tuned")
-	// Usage ~870m against 1000m request → p95*1.15 ≈ 1000m → delta < 10%.
+	// Steady class tightens headroom: usage ~850m → target ≈ 901m/376Mi,
+	// within 10% of the current 950m/400Mi → suppressed.
 	snap := mkSnap(ref,
-		model.Resources{MilliCPU: 1050, MemoryBytes: 400 << 20},
+		model.Resources{MilliCPU: 950, MemoryBytes: 400 << 20},
 		model.Resources{}, 24,
 		func(i int) int64 { return 850 },
 		func(i int) int64 { return 310 << 20 },
