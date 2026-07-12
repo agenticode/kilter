@@ -150,6 +150,7 @@ func (c *Collector) collectWorkloads(ctx context.Context, snap *model.ClusterSna
 	type hpaInfo struct {
 		min, max   int32
 		targetsCPU bool
+		owner      string
 	}
 	hpas := map[string]hpaInfo{} // Kind/ns/name
 	if hpaList, err := c.Client.AutoscalingV2().HorizontalPodAutoscalers(c.Namespace).List(ctx, metav1.ListOptions{}); err == nil {
@@ -158,6 +159,11 @@ func (c *Collector) collectWorkloads(ctx context.Context, snap *model.ClusterSna
 			info := hpaInfo{max: h.Spec.MaxReplicas}
 			if h.Spec.MinReplicas != nil {
 				info.min = *h.Spec.MinReplicas
+			}
+			for _, or := range h.OwnerReferences {
+				if or.Kind == "ScaledObject" {
+					info.owner = "keda" // KEDA drives this HPA
+				}
 			}
 			for _, m := range h.Spec.Metrics {
 				if m.Type == "Resource" && m.Resource != nil && m.Resource.Name == corev1.ResourceCPU {
@@ -173,6 +179,7 @@ func (c *Collector) collectWorkloads(ctx context.Context, snap *model.ClusterSna
 		if h, ok := hpas[string(ref.Kind)+"/"+ref.Namespace+"/"+ref.Name]; ok {
 			w.HasHPA = true
 			w.HPAMinReplicas, w.HPAMaxReplicas, w.HPATargetsCPU = h.min, h.max, h.targetsCPU
+			w.HPAOwner = h.owner
 		}
 		snap.Workloads = append(snap.Workloads, w)
 	}
@@ -274,6 +281,11 @@ func ConvertNode(n *corev1.Node) model.NodeSpec {
 	out.Region = get("topology.kubernetes.io/region", "failure-domain.beta.kubernetes.io/region")
 	out.Provider = providerFromID(n.Spec.ProviderID)
 	out.Spot = isSpot(n.Labels)
+	if _, ok := n.Labels["karpenter.sh/nodepool"]; ok {
+		out.ManagedBy = "karpenter"
+	} else if _, ok := n.Labels["karpenter.sh/provisioner-name"]; ok {
+		out.ManagedBy = "karpenter" // pre-v1 karpenter label
+	}
 	if v, ok := n.Annotations[AnnoHourlyCost]; ok {
 		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {
 			out.HourlyCost = f

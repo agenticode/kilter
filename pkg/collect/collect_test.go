@@ -382,3 +382,19 @@ func TestSnapshotSurvivesMissingMetrics(t *testing.T) {
 		t.Fatalf("default cluster id: %q", snap.ClusterID)
 	}
 }
+
+func TestKarpenterNodeDetection(t *testing.T) {
+	n := testNode()
+	n.Labels["karpenter.sh/nodepool"] = "general"
+	if got := ConvertNode(n); got.ManagedBy != "karpenter" {
+		t.Fatalf("ManagedBy = %q", got.ManagedBy)
+	}
+	legacy := testNode()
+	legacy.Labels["karpenter.sh/provisioner-name"] = "default"
+	if got := ConvertNode(legacy); got.ManagedBy != "karpenter" {
+		t.Fatalf("legacy label: ManagedBy = %q", got.ManagedBy)
+	}
+	if got := ConvertNode(testNode()); got.ManagedBy != "" {
+		t.Fatalf("plain node: ManagedBy = %q", got.ManagedBy)
+	}
+}

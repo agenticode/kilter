@@ -14,6 +14,7 @@ func runBrain(args []string) error {
 	dbPath := fs.String("db", envOr("KILTER_DB", "kilter.db"), "bbolt database path ('' = memory only)")
 	token := fs.String("token", os.Getenv("KILTER_TOKEN"), "require this bearer token on /api routes")
 	catalogPath := fs.String("catalog", "", "custom pricing catalog JSON (default: embedded baseline)")
+	forecasterURL := fs.String("forecaster-url", os.Getenv("KILTER_FORECASTER_URL"), "external time-series model server (Chronos/TimesFM wrapper); built-in models are default+fallback")
 	fs.Parse(args)
 
 	catalog, err := loadCatalog(*catalogPath)
@@ -28,7 +29,7 @@ func runBrain(args []string) error {
 		}
 		defer st.Close()
 	}
-	brain, err := api.NewBrain(api.BrainConfig{Token: *token}, catalog, st)
+	brain, err := api.NewBrain(api.BrainConfig{Token: *token, ForecasterURL: *forecasterURL}, catalog, st)
 	if err != nil {
 		return err
 	}

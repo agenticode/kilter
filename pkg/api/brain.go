@@ -18,6 +18,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
+	"github.com/agenticode/kilter/pkg/forecast"
 	"github.com/agenticode/kilter/pkg/model"
 	"github.com/agenticode/kilter/pkg/plan"
 	"github.com/agenticode/kilter/pkg/pricing"
@@ -36,9 +37,13 @@ type BrainConfig struct {
 	// CheckpointEvery persists recommender state every N snapshots per
 	// cluster. Default 10.
 	CheckpointEvery int
-	Recommend       recommend.Config
-	Plan            plan.Config
-	Logger          *slog.Logger
+	// ForecasterURL points at an external time-series model server (e.g. a
+	// Chronos/TimesFM wrapper) used for capacity forecasts. Optional; the
+	// built-in statistical models are the default and the fallback.
+	ForecasterURL string
+	Recommend     recommend.Config
+	Plan          plan.Config
+	Logger        *slog.Logger
 }
 
 func (c BrainConfig) withDefaults() BrainConfig {
@@ -71,6 +76,9 @@ type Brain struct {
 	recs      map[string]*recommend.Recommender // per cluster
 	lastSnap  map[string]*model.ClusterSnapshot
 	snapCount map[string]int
+	demand    map[string]*demandTracker
+
+	forecaster *forecast.RemoteForecaster // nil = built-in models only
 
 	m brainMetrics
 }
@@ -118,7 +126,15 @@ func NewBrain(cfg BrainConfig, catalog *pricing.Catalog, st *store.Store) (*Brai
 		recs:      map[string]*recommend.Recommender{},
 		lastSnap:  map[string]*model.ClusterSnapshot{},
 		snapCount: map[string]int{},
+		demand:    map[string]*demandTracker{},
 		m:         newBrainMetrics(),
+	}
+	if b.cfg.ForecasterURL != "" {
+		rf, err := forecast.NewRemoteForecaster(b.cfg.ForecasterURL)
+		if err != nil {
+			return nil, err
+		}
+		b.forecaster = rf
 	}
 	if st != nil {
 		clusters, err := st.Clusters()
@@ -175,7 +191,13 @@ func (b *Brain) Ingest(snap *model.ClusterSnapshot) error {
 	b.lastSnap[snap.ClusterID] = snap
 	b.snapCount[snap.ClusterID]++
 	count := b.snapCount[snap.ClusterID]
+	dt := b.demand[snap.ClusterID]
+	if dt == nil {
+		dt = newDemandTracker()
+		b.demand[snap.ClusterID] = dt
+	}
 	b.mu.Unlock()
+	dt.observe(snap)
 
 	if b.st != nil {
 		if err := b.st.SaveSnapshot(snap); err != nil {
@@ -241,6 +263,26 @@ func (b *Brain) Plan(cluster string) (*plan.Plan, error) {
 	return p, nil
 }
 
+// Insights returns the detection layer's current findings for a cluster:
+// workload-level predictions from the recommender plus cluster-level
+// capacity-exhaustion forecasts.
+func (b *Brain) Insights(ctx context.Context, cluster string) ([]model.Insight, error) {
+	snap := b.snapshotFor(cluster)
+	if snap == nil {
+		return nil, fmt.Errorf("unknown cluster %q", cluster)
+	}
+	r, err := b.recommenderFor(cluster)
+	if err != nil {
+		return nil, err
+	}
+	out := r.Insights(snap)
+	b.mu.RLock()
+	dt := b.demand[cluster]
+	b.mu.RUnlock()
+	out = append(out, capacityInsights(ctx, dt, b.forecaster, snap)...)
+	return out, nil
+}
+
 // Clusters lists known cluster ids.
 func (b *Brain) Clusters() []string {
 	b.mu.RLock()
@@ -282,6 +324,14 @@ func (b *Brain) Handler() http.Handler {
 			return
 		}
 		writeJSON(w, http.StatusOK, p)
+	}))
+	mux.HandleFunc("GET /api/v1/clusters/{id}/insights", b.auth(func(w http.ResponseWriter, r *http.Request) {
+		ins, err := b.Insights(r.Context(), r.PathValue("id"))
+		if err != nil {
+			writeErr(w, http.StatusNotFound, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"insights": ins})
 	}))
 	mux.HandleFunc("GET /api/v1/clusters/{id}/cost", b.auth(func(w http.ResponseWriter, r *http.Request) {
 		snap := b.snapshotFor(r.PathValue("id"))

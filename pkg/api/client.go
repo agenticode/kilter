@@ -136,6 +136,17 @@ func (c *Client) GetRecommendations(ctx context.Context, cluster string) ([]reco
 	return out.Recommendations, nil
 }
 
+// GetInsights fetches the detection layer's findings for the cluster.
+func (c *Client) GetInsights(ctx context.Context, cluster string) ([]model.Insight, error) {
+	var out struct {
+		Insights []model.Insight `json:"insights"`
+	}
+	if err := c.do(ctx, http.MethodGet, "/api/v1/clusters/"+url.PathEscape(cluster)+"/insights", nil, false, &out); err != nil {
+		return nil, err
+	}
+	return out.Insights, nil
+}
+
 // Healthy probes the brain's health endpoint.
 func (c *Client) Healthy(ctx context.Context) bool {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/healthz", nil)

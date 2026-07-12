@@ -311,3 +311,35 @@ func TestPlanDeterminism(t *testing.T) {
 		t.Fatal("step counts differ")
 	}
 }
+
+func TestKarpenterNodesRespected(t *testing.T) {
+	karp := m5xlarge("karp-1")
+	karp.ManagedBy = "karpenter"
+	snap := snapshot(
+		[]model.NodeSpec{m5xlarge("node-a"), karp},
+		[]model.PodSpec{
+			runningPod("a1", "node-a", "wa", 2000, 3072),
+			runningPod("k1", "karp-1", "wk", 200, 512), // 5% utilized — prime candidate
+		},
+	)
+	p, _ := Build(snap, nil, pricing.Embedded(), DefaultConfig())
+	if len(p.Removals) != 0 {
+		t.Fatalf("karpenter node must not be consolidated by default: %+v", p.Removals)
+	}
+	noteFound := false
+	for _, n := range p.Notes {
+		if len(n) > 0 && (n[0] == '1') {
+			noteFound = true
+		}
+	}
+	if !noteFound {
+		t.Fatalf("plan should note the deferred karpenter node: %v", p.Notes)
+	}
+	// Override allows consolidation.
+	cfg := DefaultConfig()
+	cfg.RespectManagedNodes = false
+	p2, _ := Build(snap, nil, pricing.Embedded(), cfg)
+	if len(p2.Removals) != 1 || p2.Removals[0].Node != "karp-1" {
+		t.Fatalf("override should consolidate karp-1: %+v", p2.Removals)
+	}
+}

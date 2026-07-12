@@ -5,6 +5,7 @@
 //	kilter brain       central decision service (API + learning + plans)
 //	kilter controller  executes brain plans under the safety envelope
 //	kilter plan        fetch & print the current plan from a brain
+//	kilter insights    predictive findings (OOM risk, saturation, capacity)
 //	kilter simulate    replay a recorded snapshot through the decision engine
 //	kilter version     build information
 package main
@@ -32,6 +33,7 @@ Commands:
   brain       Run the central decision service
   controller  Execute brain plans (dry-run by default)
   plan        Fetch and print the current plan from a brain
+  insights    Predictive findings: OOM risk, saturation, capacity exhaustion
   simulate    Replay a snapshot file through the decision engine
   version     Print version
 
@@ -57,6 +59,8 @@ func main() {
 		err = runController(args)
 	case "plan":
 		err = runPlanCmd(args)
+	case "insights":
+		err = runInsights(args)
 	case "simulate":
 		err = runSimulate(args)
 	case "version", "--version", "-v":

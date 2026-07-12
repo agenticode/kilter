@@ -35,6 +35,10 @@ type Config struct {
 	// MinClusterHeadroom: after consolidation the remaining nodes must keep
 	// at least this fraction of allocatable free, per dimension. Default 0.10.
 	MinClusterHeadroom float64
+	// RespectManagedNodes leaves nodes owned by another autoscaler
+	// (Karpenter) out of consolidation; Kilter's rightsizing shrinks their
+	// pods and the owning autoscaler consolidates. Default true (via New*).
+	RespectManagedNodes bool
 }
 
 // DefaultConfig returns production defaults.
@@ -45,6 +49,7 @@ func DefaultConfig() Config {
 		MaxNodeRemovals:      3,
 		ApplyRecommendations: true,
 		MinClusterHeadroom:   0.10,
+		RespectManagedNodes:  true,
 	}
 }
 
@@ -241,6 +246,9 @@ func Build(snap *model.ClusterSnapshot, recs []recommend.Recommendation, catalog
 			if !n.Ready || n.Unschedulable || isControlPlane(n) {
 				continue
 			}
+			if cfg.RespectManagedNodes && n.ManagedBy != "" {
+				continue // the owning autoscaler consolidates; our resizes feed it
+			}
 			util := utilization(nodes, pods, n.Name)
 			if util >= cfg.MinNodeUtilization {
 				continue
@@ -301,6 +309,18 @@ func Build(snap *model.ClusterSnapshot, recs []recommend.Recommendation, catalog
 	// Greenfield floor: repack every workload pod (post-resize) from scratch.
 	p.GreenfieldHourlyUSD = greenfieldFloor(snap, pods, catalog)
 
+	if cfg.RespectManagedNodes {
+		managed := 0
+		for i := range snap.Nodes {
+			if snap.Nodes[i].ManagedBy != "" {
+				managed++
+			}
+		}
+		if managed > 0 {
+			p.Notes = append(p.Notes, fmt.Sprintf(
+				"%d node(s) are managed by karpenter: left to its consolidation (kilter's rightsizing feeds it); set RespectManagedNodes=false to override", managed))
+		}
+	}
 	p.Risk = planRisk(p)
 	if p.Empty() {
 		p.Notes = append(p.Notes, "cluster is already in kilter: no beneficial changes found")
