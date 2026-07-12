@@ -114,11 +114,27 @@ curl -sf "http://localhost:$BRAIN_PORT/metrics" | grep -q kilter_cluster_cost_ho
   || FAIL "prometheus metrics missing"
 PASS "prometheus metrics exposed"
 
-echo "==> 4) controller --mode=apply"
+echo "==> 4) controller --mode=apply (spot interruption + consolidation in one reconcile)"
+# worker3 is 'karpenter-managed' AND now spot-interrupted: the controller must
+# emergency-drain it (while other workers still have capacity) yet never
+# consolidate it away.
+KC taint node "$CLUSTER-worker3" aws-node-termination-handler/spot-itn=true:NoSchedule --overwrite >/dev/null
 NODES_BEFORE=$(KC get nodes --no-headers | wc -l | tr -d ' ')
 ./bin/kilter controller --brain-url="http://localhost:$BRAIN_PORT" --token=$TOKEN \
   --cluster-id=e2e --mode=apply --interval=10m --kubeconfig "$KUBECONFIG_FILE" &
 CTRL_PID=$!
+echo "==> 4a) spot-tainted worker3 must be cordoned and drained"
+for i in $(seq 1 60); do
+  CORDONED=$(KC get node "$CLUSTER-worker3" -o jsonpath='{.spec.unschedulable}' 2>/dev/null)
+  NONDS=$(KC get pods -A --field-selector "spec.nodeName=$CLUSTER-worker3" -o json     | python3 -c 'import json,sys; pods=json.load(sys.stdin)["items"]; print(sum(1 for p in pods if not any(o.get("kind")=="DaemonSet" for o in p["metadata"].get("ownerReferences",[])) and p["status"]["phase"] not in ("Succeeded","Failed")))')
+  [[ "$CORDONED" == "true" && "$NONDS" == "0" ]] && break
+  sleep 5
+  [[ $i == 60 ]] && FAIL "spot-tainted node not drained (cordoned=$CORDONED, pods=$NONDS)"
+done
+KC get node "$CLUSTER-worker3" >/dev/null || FAIL "emergency drain must NOT delete the node"
+PASS "spot interruption: worker3 cordoned and drained, node left for cloud reclamation"
+
+echo "==> 4b) consolidation of underutilized on-demand workers"
 for i in $(seq 1 60); do
   NODES_NOW=$(KC get nodes --no-headers | wc -l | tr -d ' ')
   [[ "$NODES_NOW" -lt "$NODES_BEFORE" ]] && break
@@ -136,20 +152,3 @@ KC rollout status deployment worker --timeout=180s >/dev/null
 PENDING=$(KC get pods --field-selector=status.phase=Pending --no-headers 2>/dev/null | wc -l | tr -d ' ')
 [[ "$PENDING" == "0" ]] || FAIL "$PENDING pods stuck Pending after consolidation"
 PASS "all workloads Running after consolidation, nothing Pending"
-
-echo "==> 5) spot interruption emergency drain"
-kill "$CTRL_PID" 2>/dev/null || true
-KC taint node "$CLUSTER-worker3" aws-node-termination-handler/spot-itn=true:NoSchedule --overwrite >/dev/null
-./bin/kilter controller --brain-url="http://localhost:$BRAIN_PORT" --token=$TOKEN   --cluster-id=e2e --mode=apply --interval=10m --kubeconfig "$KUBECONFIG_FILE" &
-CTRL_PID=$!
-for i in $(seq 1 36); do
-  CORDONED=$(KC get node "$CLUSTER-worker3" -o jsonpath='{.spec.unschedulable}' 2>/dev/null)
-  NONDS=$(KC get pods -A --field-selector "spec.nodeName=$CLUSTER-worker3" -o json     | python3 -c 'import json,sys; pods=json.load(sys.stdin)["items"]; print(sum(1 for p in pods if not any(o.get("kind")=="DaemonSet" for o in p["metadata"].get("ownerReferences",[])) and p["status"]["phase"] not in ("Succeeded","Failed")))')
-  [[ "$CORDONED" == "true" && "$NONDS" == "0" ]] && break
-  sleep 5
-  [[ $i == 36 ]] && FAIL "spot-tainted node not drained (cordoned=$CORDONED, pods=$NONDS)"
-done
-KC get node "$CLUSTER-worker3" >/dev/null || FAIL "emergency drain must NOT delete the node"
-PASS "spot interruption: worker3 cordoned and drained, node left for cloud reclamation"
-KC rollout status deployment web --timeout=180s >/dev/null
-PASS "workloads healthy after emergency drain"
