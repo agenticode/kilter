@@ -102,6 +102,14 @@ e2e scenario before the next starts.
       simulator at 5k nodes / 50k pods within latency budget; RBAC-lite read-only
       token for the brain API.
 
+## Iteration 3 result (2026-07-12)
+All P1–P6 shipped, live-e2e verified, remote CI green (test/helm/e2e/docker), v0.2.0 released.
+CI caught two real issues along the way — race-detector skew on scale budgets, and a
+scenario-order flaw where PDBs correctly refused a drain on the last worker — both fixed
+with the product behavior proven right. Coverage vs CAST AI reassessed: ~90%
+(remaining: GKE/AKS providers, provision-before-drain surge on non-Karpenter clusters,
+automated spot migration, GCP/Azure pricing sync, enterprise console features).
+
 ## Differentiators vs CAST AI (ROI-justified killer features)
 1. **Fully self-hosted / air-gapped** — no SaaS dependency; the "central brain" is yours.
 2. **Zero-install analyze** — one binary + kubeconfig = instant savings report (adoption wedge).
