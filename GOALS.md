@@ -52,8 +52,8 @@ to be stable under high load (big-tech SRE grade), shipped as a single static bi
 - [x] docs/ — architecture, safety model, tuning guide
 - [x] Demo capture: `kilter analyze` output against kind cluster (asciinema-style text or SVG)
 - [x] GitHub Actions CI workflow (.github/workflows)
-- [ ] Create remote repo (agenticode/kilter) and push once, at the end
-- [ ] Final self-score ≥ 95/100 with rubric in this file
+- [x] Create remote repo (agenticode/kilter) and push once, at the end — pushed, CI green on first run (test/helm/e2e/docker)
+- [x] Final self-score ≥ 95/100 with rubric in this file
 
 ## Differentiators vs CAST AI (ROI-justified killer features)
 1. **Fully self-hosted / air-gapped** — no SaaS dependency; the "central brain" is yours.
