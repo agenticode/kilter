@@ -7,6 +7,7 @@ package api
 import (
 	"compress/gzip"
 	"context"
+	"embed"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,6 +26,9 @@ import (
 	"github.com/agenticode/kilter/pkg/recommend"
 	"github.com/agenticode/kilter/pkg/store"
 )
+
+//go:embed ui/index.html
+var uiFS embed.FS
 
 // BrainConfig tunes the central decision service.
 type BrainConfig struct {
@@ -318,6 +322,20 @@ func (b *Brain) Handler() http.Handler {
 		w.Write([]byte("ok"))
 	})
 	mux.Handle("GET /metrics", promhttp.HandlerFor(b.m.registry, promhttp.HandlerOpts{}))
+	mux.HandleFunc("GET /ui", func(w http.ResponseWriter, _ *http.Request) {
+		// The page itself is public; every data call it makes goes through
+		// the token-guarded API.
+		raw, err := uiFS.ReadFile("ui/index.html")
+		if err != nil {
+			http.Error(w, "ui unavailable", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write(raw)
+	})
+	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/ui", http.StatusFound)
+	})
 
 	mux.HandleFunc("POST /api/v1/snapshots", b.auth(b.handleIngest))
 	mux.HandleFunc("GET /api/v1/clusters", b.auth(func(w http.ResponseWriter, r *http.Request) {

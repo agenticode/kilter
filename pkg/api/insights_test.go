@@ -165,3 +165,27 @@ func TestRemoteForecasterValidation(t *testing.T) {
 		t.Fatal("bad forecaster url must be rejected")
 	}
 }
+
+func TestUIServed(t *testing.T) {
+	b, _ := newBrain(t, "with-token", false)
+	srv := httptest.NewServer(b.Handler())
+	defer srv.Close()
+	resp, err := http.Get(srv.URL + "/ui")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("/ui → %d", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "text/html; charset=utf-8" {
+		t.Fatalf("content-type %q", ct)
+	}
+	// Root redirects to the UI.
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	r2, _ := client.Get(srv.URL + "/")
+	r2.Body.Close()
+	if r2.StatusCode != http.StatusFound || r2.Header.Get("Location") != "/ui" {
+		t.Fatalf("root: %d → %q", r2.StatusCode, r2.Header.Get("Location"))
+	}
+}
