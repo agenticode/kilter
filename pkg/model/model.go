@@ -179,6 +179,20 @@ func (p *PodSpec) Requests() Resources {
 	return sum
 }
 
+// ExtendedRequests sums non-core resource requests across containers.
+func (p *PodSpec) ExtendedRequests() map[string]int64 {
+	var out map[string]int64
+	for _, c := range p.Containers {
+		for k, v := range c.Extended {
+			if out == nil {
+				out = map[string]int64{}
+			}
+			out[k] += v
+		}
+	}
+	return out
+}
+
 // Limits sums container limits (0 means unlimited for that dimension).
 func (p *PodSpec) Limits() Resources {
 	var sum Resources
@@ -190,24 +204,29 @@ func (p *PodSpec) Limits() Resources {
 
 // ContainerSpec is one container's declared sizing.
 type ContainerSpec struct {
-	Name           string    `json:"name"`
-	Requests       Resources `json:"requests"`
-	Limits         Resources `json:"limits"`
-	RestartCount   int32     `json:"restartCount,omitempty"`
-	LastOOMKilled  bool      `json:"lastOOMKilled,omitempty"`
-	LastTerminated string    `json:"lastTerminated,omitempty"` // reason of last termination
+	Name     string    `json:"name"`
+	Requests Resources `json:"requests"`
+	Limits   Resources `json:"limits"`
+	// Extended holds non-core resource requests (nvidia.com/gpu, …) that
+	// gate scheduling but are not optimized by Kilter.
+	Extended       map[string]int64 `json:"extended,omitempty"`
+	RestartCount   int32            `json:"restartCount,omitempty"`
+	LastOOMKilled  bool             `json:"lastOOMKilled,omitempty"`
+	LastTerminated string           `json:"lastTerminated,omitempty"` // reason of last termination
 }
 
 // NodeSpec captures a node's capacity and scheduling surface.
 type NodeSpec struct {
-	Name          string            `json:"name"`
-	Labels        map[string]string `json:"labels,omitempty"`
-	Taints        []Taint           `json:"taints,omitempty"`
-	Capacity      Resources         `json:"capacity"`
-	Allocatable   Resources         `json:"allocatable"`
-	Ready         bool              `json:"ready"`
-	Unschedulable bool              `json:"unschedulable,omitempty"`
-	CreatedAt     time.Time         `json:"createdAt,omitempty"`
+	Name        string            `json:"name"`
+	Labels      map[string]string `json:"labels,omitempty"`
+	Taints      []Taint           `json:"taints,omitempty"`
+	Capacity    Resources         `json:"capacity"`
+	Allocatable Resources         `json:"allocatable"`
+	// ExtendedAllocatable holds allocatable non-core resources (GPUs, …).
+	ExtendedAllocatable map[string]int64 `json:"extendedAllocatable,omitempty"`
+	Ready               bool             `json:"ready"`
+	Unschedulable       bool             `json:"unschedulable,omitempty"`
+	CreatedAt           time.Time        `json:"createdAt,omitempty"`
 
 	// Pricing identity — resolved by pkg/pricing.
 	InstanceType string  `json:"instanceType,omitempty"` // from node.kubernetes.io/instance-type

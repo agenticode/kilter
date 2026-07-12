@@ -27,6 +27,7 @@ const DefaultMaxPodsPerNode = 110
 type NodeState struct {
 	Spec     model.NodeSpec
 	Free     model.Resources
+	FreeExt  map[string]int64 // extended resources (GPUs, …)
 	PodCount int
 	MaxPods  int
 	pods     map[string]*model.PodSpec // by UID
@@ -84,6 +85,12 @@ func (cs *ClusterState) AddNode(spec model.NodeSpec) *NodeState {
 		MaxPods: cs.maxPods,
 		pods:    map[string]*model.PodSpec{},
 	}
+	if len(spec.ExtendedAllocatable) > 0 {
+		ns.FreeExt = map[string]int64{}
+		for k, v := range spec.ExtendedAllocatable {
+			ns.FreeExt[k] = v
+		}
+	}
 	cs.nodes = append(cs.nodes, ns)
 	cs.nodeIndex[spec.Name] = ns
 	sort.Slice(cs.nodes, func(i, j int) bool { return cs.nodes[i].Spec.Name < cs.nodes[j].Spec.Name })
@@ -103,6 +110,12 @@ func (cs *ClusterState) forcePlace(p *model.PodSpec, ns *NodeState) {
 	ns.pods[p.UID] = p
 	ns.PodCount++
 	ns.Free = ns.Free.Sub(p.Requests())
+	for k, v := range p.ExtendedRequests() {
+		if ns.FreeExt == nil {
+			ns.FreeExt = map[string]int64{}
+		}
+		ns.FreeExt[k] -= v
+	}
 	cs.adjustTopo(p, &ns.Spec, +1)
 }
 
@@ -130,6 +143,9 @@ func (cs *ClusterState) Remove(podUID, nodeName string) error {
 	delete(ns.pods, podUID)
 	ns.PodCount--
 	ns.Free = ns.Free.Add(p.Requests())
+	for k, v := range p.ExtendedRequests() {
+		ns.FreeExt[k] += v
+	}
 	cs.adjustTopo(p, &ns.Spec, -1)
 	return nil
 }
@@ -218,6 +234,11 @@ func (cs *ClusterState) fits(p *model.PodSpec, ns *NodeState) error {
 	}
 	if req := p.Requests(); !ns.Free.Fits(req) {
 		return fmt.Errorf("insufficient free resources: need %s, free %s", req, ns.Free)
+	}
+	for k, v := range p.ExtendedRequests() {
+		if ns.FreeExt[k] < v {
+			return fmt.Errorf("insufficient %s: need %d, free %d", k, v, ns.FreeExt[k])
+		}
 	}
 	for k, v := range p.NodeSelector {
 		if node.Labels[k] != v {

@@ -303,3 +303,42 @@ func BenchmarkDrainSimulation1kNodes(b *testing.B) {
 		}
 	}
 }
+
+func TestExtendedResourcesGateScheduling(t *testing.T) {
+	gpuNode := node("gpu-1", 16000, 64, nil)
+	gpuNode.ExtendedAllocatable = map[string]int64{"nvidia.com/gpu": 2}
+	cs := NewClusterState([]model.NodeSpec{gpuNode, node("cpu-1", 16000, 64, nil)}, nil)
+
+	gp := pod("g1", 1000, 2048, "trainer")
+	gp.Containers[0].Extended = map[string]int64{"nvidia.com/gpu": 1}
+	if err := cs.Fits(gp, "cpu-1"); err == nil {
+		t.Fatal("GPU pod must not fit a GPU-less node")
+	}
+	if err := cs.Fits(gp, "gpu-1"); err != nil {
+		t.Fatalf("GPU pod should fit gpu-1: %v", err)
+	}
+	cs.Place(gp, "gpu-1")
+	gp2 := pod("g2", 1000, 2048, "trainer2")
+	gp2.Containers[0].Extended = map[string]int64{"nvidia.com/gpu": 2}
+	if err := cs.Fits(gp2, "gpu-1"); err == nil {
+		t.Fatal("only 1 GPU free — 2-GPU pod must not fit")
+	}
+	// Removal returns capacity.
+	cs.Remove("g1", "gpu-1")
+	if err := cs.Fits(gp2, "gpu-1"); err != nil {
+		t.Fatalf("after removal both GPUs free: %v", err)
+	}
+}
+
+func TestGPUNodeDrainBlockedWithoutCapacity(t *testing.T) {
+	gpuNode := node("gpu-1", 16000, 64, nil)
+	gpuNode.ExtendedAllocatable = map[string]int64{"nvidia.com/gpu": 1}
+	gp := podOn("g1", "gpu-1", 500, 1024)
+	gp.Containers[0].Extended = map[string]int64{"nvidia.com/gpu": 1}
+	cs := NewClusterState([]model.NodeSpec{gpuNode, node("cpu-1", 16000, 64, nil)}, []model.PodSpec{*gp})
+	moved, _ := cs.RemoveNode("gpu-1")
+	_, failed := cs.Schedule(moved)
+	if len(failed) != 1 {
+		t.Fatal("GPU pod must be unschedulable without another GPU node")
+	}
+}

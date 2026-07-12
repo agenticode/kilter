@@ -398,3 +398,27 @@ func TestKarpenterNodeDetection(t *testing.T) {
 		t.Fatalf("plain node: ManagedBy = %q", got.ManagedBy)
 	}
 }
+
+func TestExtendedResourceCollection(t *testing.T) {
+	n := testNode()
+	n.Status.Allocatable["nvidia.com/gpu"] = resource.MustParse("4")
+	got := ConvertNode(n)
+	if got.ExtendedAllocatable["nvidia.com/gpu"] != 4 {
+		t.Fatalf("node extended: %+v", got.ExtendedAllocatable)
+	}
+	pod := webPod("gpu-pod", "web-6d4f5")
+	pod.Spec.Containers[0].Resources.Requests["nvidia.com/gpu"] = resource.MustParse("2")
+	p := ConvertPod(pod, nil, nil)
+	if p.Containers[0].Extended["nvidia.com/gpu"] != 2 {
+		t.Fatalf("pod extended: %+v", p.Containers[0].Extended)
+	}
+	if p.ExtendedRequests()["nvidia.com/gpu"] != 2 {
+		t.Fatal("aggregation broken")
+	}
+	// ephemeral-storage is not an extended resource.
+	pod2 := webPod("es-pod", "web-6d4f5")
+	pod2.Spec.Containers[0].Resources.Requests["ephemeral-storage"] = resource.MustParse("1Gi")
+	if len(ConvertPod(pod2, nil, nil).Containers[0].Extended) != 0 {
+		t.Fatal("ephemeral-storage must not be extended")
+	}
+}

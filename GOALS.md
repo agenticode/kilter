@@ -91,10 +91,10 @@ e2e scenario before the next starts.
       GetProducts + spot via DescribeSpotPriceHistory → writes a catalog JSON the
       brain/analyze load with --catalog. Credentials optional feature; embedded
       catalog remains the fallback.
-- [ ] **P4 Embedded web UI** — dashboard served by the brain at `/ui`: clusters,
+- [x] **P4 Embedded web UI** — dashboard served by the brain at `/ui`: clusters,
       cost/savings, insights, recommendations, plan preview. Vanilla JS + embedded
       static assets (no build system, CSP-friendly, works air-gapped).
-- [ ] **P5 GPU / extended resources** — model.PodSpec/NodeSpec gain extended-resource
+- [x] **P5 GPU / extended resources** — model.PodSpec/NodeSpec gain extended-resource
       maps (nvidia.com/gpu, …); binpack enforces feasibility (GPU pods never planned
       onto GPU-less nodes); consolidation treats GPU nodes conservatively.
 - [ ] **P6 e2e & scale hardening** — e2e scenarios: PDB-blocked drain stays blocked,

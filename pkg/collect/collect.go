@@ -9,6 +9,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -259,6 +260,14 @@ func ConvertNode(n *corev1.Node) model.NodeSpec {
 			MemoryBytes: n.Status.Allocatable.Memory().Value(),
 		},
 	}
+	for name, q := range n.Status.Allocatable {
+		if isExtendedResource(string(name)) && q.Value() > 0 {
+			if out.ExtendedAllocatable == nil {
+				out.ExtendedAllocatable = map[string]int64{}
+			}
+			out.ExtendedAllocatable[string(name)] = q.Value()
+		}
+	}
 	for _, cond := range n.Status.Conditions {
 		if cond.Type == corev1.NodeReady {
 			out.Ready = cond.Status == corev1.ConditionTrue
@@ -292,6 +301,16 @@ func ConvertNode(n *corev1.Node) model.NodeSpec {
 		}
 	}
 	return out
+}
+
+// isExtendedResource reports whether a resource name gates scheduling
+// beyond cpu/memory (GPUs, FPGAs, vendor devices).
+func isExtendedResource(name string) bool {
+	switch name {
+	case "cpu", "memory", "ephemeral-storage", "pods":
+		return false
+	}
+	return strings.Contains(name, "/") // vendor-namespaced (nvidia.com/gpu, …)
 }
 
 func providerFromID(id string) string {
@@ -350,6 +369,14 @@ func ConvertPod(p *corev1.Pod, rsOwner, jobOwner map[string]model.WorkloadRef) m
 				MilliCPU:    c.Resources.Limits.Cpu().MilliValue(),
 				MemoryBytes: c.Resources.Limits.Memory().Value(),
 			},
+		}
+		for name, q := range c.Resources.Requests {
+			if isExtendedResource(string(name)) && q.Value() > 0 {
+				if spec.Extended == nil {
+					spec.Extended = map[string]int64{}
+				}
+				spec.Extended[string(name)] = q.Value()
+			}
 		}
 		if cs, ok := statuses[c.Name]; ok {
 			spec.RestartCount = cs.RestartCount
