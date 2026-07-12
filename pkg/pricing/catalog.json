@@ -1,8 +1,8 @@
 {
   "comment": "Baseline on-demand hourly USD (us-east-1 / us-central1 / eastus class regions). Spot prices are typical observed averages, not guarantees. Override any of this with a custom catalog file or the kilter.dev/hourly-cost node annotation.",
   "instances": [
-    {"provider": "aws", "name": "t3.medium",   "family": "t3",  "arch": "amd64", "milliCPU": 2000,  "memoryBytes": 4294967296,   "hourlyUSD": 0.0416, "spotHourlyUSD": 0.0125},
-    {"provider": "aws", "name": "t3.large",    "family": "t3",  "arch": "amd64", "milliCPU": 2000,  "memoryBytes": 8589934592,   "hourlyUSD": 0.0832, "spotHourlyUSD": 0.025},
+    {"provider": "aws", "name": "t3.medium",   "family": "t3",  "arch": "amd64", "burstable": true, "milliCPU": 2000,  "memoryBytes": 4294967296,   "hourlyUSD": 0.0416, "spotHourlyUSD": 0.0125},
+    {"provider": "aws", "name": "t3.large",    "family": "t3",  "arch": "amd64", "burstable": true, "milliCPU": 2000,  "memoryBytes": 8589934592,   "hourlyUSD": 0.0832, "spotHourlyUSD": 0.025},
     {"provider": "aws", "name": "m5.large",    "family": "m5",  "arch": "amd64", "milliCPU": 2000,  "memoryBytes": 8589934592,   "hourlyUSD": 0.096,  "spotHourlyUSD": 0.035},
     {"provider": "aws", "name": "m5.xlarge",   "family": "m5",  "arch": "amd64", "milliCPU": 4000,  "memoryBytes": 17179869184,  "hourlyUSD": 0.192,  "spotHourlyUSD": 0.070},
     {"provider": "aws", "name": "m5.2xlarge",  "family": "m5",  "arch": "amd64", "milliCPU": 8000,  "memoryBytes": 34359738368,  "hourlyUSD": 0.384,  "spotHourlyUSD": 0.14},

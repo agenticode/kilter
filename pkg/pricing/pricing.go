@@ -40,6 +40,11 @@ type InstanceType struct {
 	MemoryBytes   int64   `json:"memoryBytes"`
 	HourlyUSD     float64 `json:"hourlyUSD"`
 	SpotHourlyUSD float64 `json:"spotHourlyUSD,omitempty"`
+	// Burstable marks shared/credit-based CPU (AWS t-family, GCP e2-micro/
+	// small/medium, Azure B-series). Planners exclude these for sustained
+	// workloads by default: their price assumes you do NOT use the vCPUs
+	// continuously.
+	Burstable bool `json:"burstable,omitempty"`
 }
 
 // Resources returns the schedulable shape of the instance.
