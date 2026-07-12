@@ -2,6 +2,7 @@ package actuate
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 
 	"github.com/agenticode/kilter/pkg/model"
 	"github.com/agenticode/kilter/pkg/plan"
+	"github.com/agenticode/kilter/pkg/provider"
 )
 
 func deployment(ns, name string) *appsv1.Deployment {
@@ -247,5 +249,46 @@ func TestResizeFailureDoesNotAbortPlan(t *testing.T) {
 	}
 	if rep.Failed != 1 || rep.Done != 1 {
 		t.Fatalf("report: %+v", rep)
+	}
+}
+
+// recordingProvider verifies the actuator hands terminations to the provider.
+type recordingProvider struct {
+	terminated []string
+	fail       bool
+}
+
+func (r *recordingProvider) Name() string { return "recording" }
+func (r *recordingProvider) Discover(context.Context) ([]provider.NodeGroup, map[string]string, error) {
+	return nil, nil, nil
+}
+func (r *recordingProvider) ScaleTo(context.Context, string, int) error { return nil }
+func (r *recordingProvider) TerminateNode(_ context.Context, node, providerID string) error {
+	if r.fail {
+		return fmt.Errorf("cloud says no")
+	}
+	r.terminated = append(r.terminated, node+"|"+providerID)
+	return nil
+}
+
+func TestDeleteNodeCallsProvider(t *testing.T) {
+	n := nodeObj("n1")
+	n.Spec.ProviderID = "aws:///us-east-1a/i-0abc"
+	client := k8sfake.NewClientset(n)
+	rec := &recordingProvider{}
+	a, _ := New(client, Config{Mode: ModeApply, Provider: rec})
+	if err := a.DeleteNode(context.Background(), "n1"); err != nil {
+		t.Fatal(err)
+	}
+	if len(rec.terminated) != 1 || rec.terminated[0] != "n1|aws:///us-east-1a/i-0abc" {
+		t.Fatalf("provider not invoked correctly: %v", rec.terminated)
+	}
+}
+
+func TestDeleteNodeProviderFailureFailsStep(t *testing.T) {
+	client := k8sfake.NewClientset(nodeObj("n1"))
+	a, _ := New(client, Config{Mode: ModeApply, Provider: &recordingProvider{fail: true}})
+	if err := a.DeleteNode(context.Background(), "n1"); err == nil {
+		t.Fatal("provider failure must fail the step loudly")
 	}
 }

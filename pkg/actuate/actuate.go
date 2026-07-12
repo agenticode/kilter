@@ -29,6 +29,7 @@ import (
 
 	"github.com/agenticode/kilter/pkg/model"
 	"github.com/agenticode/kilter/pkg/plan"
+	"github.com/agenticode/kilter/pkg/provider"
 	"github.com/agenticode/kilter/pkg/safety"
 )
 
@@ -52,7 +53,10 @@ type Config struct {
 	// InPlaceResize additionally patches running pods via the resize
 	// subresource (K8s ≥1.33) so resizes land without restarts.
 	InPlaceResize bool
-	Logger        *slog.Logger
+	// Provider terminates cloud instances after node deletion so freed
+	// capacity stops billing. Default: provider.None (no cloud calls).
+	Provider provider.Provider
+	Logger   *slog.Logger
 }
 
 func (c Config) withDefaults() Config {
@@ -67,6 +71,9 @@ func (c Config) withDefaults() Config {
 	}
 	if c.PollInterval <= 0 {
 		c.PollInterval = 5 * time.Second
+	}
+	if c.Provider == nil {
+		c.Provider = provider.None{}
 	}
 	if c.Logger == nil {
 		c.Logger = slog.Default()
@@ -375,13 +382,24 @@ func (a *Actuator) WaitNodeEmpty(ctx context.Context, node string) error {
 	}
 }
 
-// DeleteNode removes the Node object. On clouds with node-group autoscaling
-// the group reconciles capacity; on static clusters this is the operator's
-// signal to decommission the machine.
+// DeleteNode removes the Node object, then asks the provider to terminate
+// the backing instance so the freed capacity stops billing. Provider failure
+// is a step failure: capacity accounting must never be assumed.
 func (a *Actuator) DeleteNode(ctx context.Context, node string) error {
+	providerID := ""
+	if n, err := a.client.CoreV1().Nodes().Get(ctx, node, metav1.GetOptions{}); err == nil {
+		providerID = n.Spec.ProviderID
+	}
 	err := a.client.CoreV1().Nodes().Delete(ctx, node, metav1.DeleteOptions{})
 	if err != nil && !apierrors.IsNotFound(err) {
 		return fmt.Errorf("delete node %s: %w", node, err)
+	}
+	if a.cfg.Provider.Name() != "none" {
+		if err := a.cfg.Provider.TerminateNode(ctx, node, providerID); err != nil {
+			return fmt.Errorf("node %s deleted but instance termination failed (%s provider): %w",
+				node, a.cfg.Provider.Name(), err)
+		}
+		a.cfg.Logger.Info("instance terminated", "node", node, "provider", a.cfg.Provider.Name())
 	}
 	return nil
 }

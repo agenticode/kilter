@@ -66,6 +66,42 @@ to be stable under high load (big-tech SRE grade), shipped as a single static bi
 - [x] KEDA detection: ScaledObject-owned HPAs recognized and explained
 - [x] Helm chart forecasterURL, docs/forecasting.md, README AIOps sections
 
+## Iteration 3 — 100% coverage architecture (design + execution order)
+
+Design principles: every new integration is an *organ, not a heart* — optional,
+interface-backed, fallback-safe; the core stays a static binary that works air-gapped.
+System stability rules: no new dependency in the decision path; cloud calls only in the
+actuation path with timeouts + idempotency; every feature lands with unit tests and an
+e2e scenario before the next starts.
+
+- [ ] **P1 pkg/provider — node lifecycle** (closes the biggest CAST AI gap)
+      Interface: Discover() node groups, ScaleTo(group,n), TerminateNode(node).
+      Implementations: `eks` (ASG TerminateInstanceInAutoScalingGroup w/ decrement +
+      SetDesiredCapacity via aws-sdk-go-v2), `webhook` (generic HTTP contract for
+      on-prem/any-cloud), `karpenter` (documented no-op: node deletion already
+      terminates the instance via NodeClaim finalizer). Actuator calls provider after
+      node-object deletion; failure = step failure (never silent). Mock-based tests.
+- [ ] **P2 Spot automation**
+      Workload spot-safety scoring (replicas, PDB slack, class, local storage,
+      do-not-evict) → `spot-opportunity` insights with $ deltas; PlanNodes
+      mixed-lifecycle packing (spot-safe pods onto spot shapes, rest on-demand);
+      controller reacts to spot interruption signals (NTH taints / node conditions)
+      with an emergency drain path that bypasses cooldowns but not PDBs.
+- [ ] **P3 Live pricing** — `kilter pricing sync-aws`: on-demand via Pricing API
+      GetProducts + spot via DescribeSpotPriceHistory → writes a catalog JSON the
+      brain/analyze load with --catalog. Credentials optional feature; embedded
+      catalog remains the fallback.
+- [ ] **P4 Embedded web UI** — dashboard served by the brain at `/ui`: clusters,
+      cost/savings, insights, recommendations, plan preview. Vanilla JS + embedded
+      static assets (no build system, CSP-friendly, works air-gapped).
+- [ ] **P5 GPU / extended resources** — model.PodSpec/NodeSpec gain extended-resource
+      maps (nvidia.com/gpu, …); binpack enforces feasibility (GPU pods never planned
+      onto GPU-less nodes); consolidation treats GPU nodes conservatively.
+- [ ] **P6 e2e & scale hardening** — e2e scenarios: PDB-blocked drain stays blocked,
+      karpenter-labeled node untouched, spot-taint emergency drain; scale soak:
+      simulator at 5k nodes / 50k pods within latency budget; RBAC-lite read-only
+      token for the brain API.
+
 ## Differentiators vs CAST AI (ROI-justified killer features)
 1. **Fully self-hosted / air-gapped** — no SaaS dependency; the "central brain" is yours.
 2. **Zero-install analyze** — one binary + kubeconfig = instant savings report (adoption wedge).

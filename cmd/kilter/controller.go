@@ -13,6 +13,7 @@ import (
 	"github.com/agenticode/kilter/pkg/collect"
 	"github.com/agenticode/kilter/pkg/model"
 	"github.com/agenticode/kilter/pkg/plan"
+	"github.com/agenticode/kilter/pkg/provider"
 	"github.com/agenticode/kilter/pkg/safety"
 )
 
@@ -26,6 +27,8 @@ func runController(args []string) error {
 	maxEvictions := fs.Int("max-evictions-per-hour", 20, "sliding eviction budget")
 	minConfidence := fs.Float64("min-plan-savings", 1.0, "skip plans saving less than this many USD/month")
 	inPlace := fs.Bool("in-place-resize", true, "attempt in-place pod resize (K8s ≥1.33)")
+	providerName := fs.String("provider", envOr("KILTER_PROVIDER", "none"), "node lifecycle provider: none|karpenter|webhook|eks")
+	providerCfg := fs.String("provider-config", os.Getenv("KILTER_PROVIDER_CONFIG"), "provider config: eks=cluster name, webhook=endpoint URL")
 	kubeconfig := fs.String("kubeconfig", "", "kubeconfig path (default: in-cluster)")
 	fs.Parse(args)
 
@@ -40,10 +43,17 @@ func runController(args []string) error {
 	if err != nil {
 		return err
 	}
+	ctx0, cancel0 := signalContext()
+	prov, err := provider.New(ctx0, *providerName, *providerCfg)
+	cancel0()
+	if err != nil {
+		return err
+	}
 	act, err := actuate.New(client, actuate.Config{
 		Mode:                actuate.Mode(*mode),
 		MaxEvictionsPerHour: *maxEvictions,
 		InPlaceResize:       *inPlace,
+		Provider:            prov,
 	})
 	if err != nil {
 		return err
