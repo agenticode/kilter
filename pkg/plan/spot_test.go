@@ -123,3 +123,21 @@ func TestEmergencyDrainPlan(t *testing.T) {
 		t.Fatalf("evictions = %d, want 1", evicts)
 	}
 }
+
+func TestEmergencyDrainEvictsLocalStoragePods(t *testing.T) {
+	// emptyDir pods are normally pinned — but on a dying spot node their
+	// data is lost either way, so graceful eviction must win.
+	es := runningPod("es1", "dying", "cache", 100, 128)
+	es.HasLocalStorage = true
+	snap := snapshot([]model.NodeSpec{m5xlarge("dying"), m5xlarge("safe")}, []model.PodSpec{es})
+	p := EmergencyDrainPlan(snap, "dying")
+	evicted := false
+	for _, s := range p.Steps {
+		if s.Type == StepEvictPod && s.PodUID == "es1" {
+			evicted = true
+		}
+	}
+	if !evicted {
+		t.Fatal("local-storage pod must be evicted from an interrupted node")
+	}
+}

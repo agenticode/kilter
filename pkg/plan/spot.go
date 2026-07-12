@@ -173,14 +173,11 @@ func EmergencyDrainPlan(snap *model.ClusterSnapshot, node string) *Plan {
 	}
 	sort.Slice(pods, func(i, j int) bool { return pods[i].UID < pods[j].UID })
 	for _, pod := range pods {
-		if pod.Workload.Kind == model.KindDaemonSet {
-			continue
-		}
-		if ev := safety.CanEvict(pod); !ev.OK && !pod.DoNotEvict {
-			// Even normally-pinned pods are better restarted proactively than
-			// killed by the hypervisor — but explicit opt-outs stay respected.
-			continue
-		} else if pod.DoNotEvict {
+		// The machine is being reclaimed: everything on it dies shortly.
+		// A graceful eviction now beats a hypervisor kill in minutes — even
+		// for pods with local storage (that data is lost either way). Only
+		// DaemonSets (pointless) and explicit opt-outs are skipped.
+		if pod.Workload.Kind == model.KindDaemonSet || pod.DoNotEvict {
 			continue
 		}
 		p.Steps = append(p.Steps, Step{
