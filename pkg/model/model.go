@@ -161,6 +161,13 @@ type PodSpec struct {
 	QOSClass         string                     `json:"qosClass,omitempty"` // Guaranteed | Burstable | BestEffort
 	Phase            string                     `json:"phase,omitempty"`    // Running | Pending | ...
 	CreatedAt        time.Time                  `json:"createdAt,omitempty"`
+
+	// HasLocalStorage marks pods using node-local data (local PVs); draining
+	// such a pod loses state, so consolidation treats it as pinned.
+	HasLocalStorage bool `json:"hasLocalStorage,omitempty"`
+	// DoNotEvict mirrors the kilter.dev/do-not-evict pod annotation (also
+	// honored: cluster-autoscaler.kubernetes.io/safe-to-evict=false).
+	DoNotEvict bool `json:"doNotEvict,omitempty"`
 }
 
 // Requests sums container requests.
