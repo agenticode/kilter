@@ -12,16 +12,16 @@ to be stable under high load (big-tech SRE grade), shipped as a single static bi
 ## Phase 0 — Foundation
 - [x] Project name chosen: **Kilter** (no ecosystem collision)
 - [x] git init, go mod init github.com/agenticode/kilter
-- [ ] GOALS.md, ARCHITECTURE.md, LICENSE (Apache-2.0), .gitignore
-- [ ] CI-grade local test script (test.sh: fmt, vet, race tests, benchmarks)
+- [x] GOALS.md, ARCHITECTURE.md, LICENSE (Apache-2.0), .gitignore
+- [x] CI-grade local test script (test.sh: fmt, vet, race tests, benchmarks)
 
 ## Phase 1 — Core decision math (pure Go, zero k8s deps)
-- [ ] pkg/model — core domain types (ClusterSnapshot, Node, Pod, Workload, Resources, Pricing)
-- [ ] pkg/histogram — exponentially-decaying histogram (VPA-style) for percentile estimation
-- [ ] pkg/forecast — EWMA + Holt-Winters double/triple exponential smoothing, spike detection
-- [ ] pkg/recommend — workload rightsizing engine (CPU p95/p99, memory max + OOM-aware headroom, confidence)
-- [ ] pkg/pricing — instance catalogs (AWS/GCP/Azure embedded + custom JSON), spot discounts
-- [ ] pkg/binpack — constraint-aware bin-packing planner (taints, affinity, PDB, topology spread, DaemonSet overhead)
+- [x] pkg/model — core domain types (ClusterSnapshot, Node, Pod, Workload, Resources, Pricing)
+- [x] pkg/histogram — exponentially-decaying histogram (VPA-style) for percentile estimation
+- [x] pkg/forecast — EWMA + Holt-Winters double/triple exponential smoothing, spike detection
+- [x] pkg/recommend — workload rightsizing engine (CPU p95/p99, memory max + OOM-aware headroom, confidence)
+- [x] pkg/pricing — instance catalogs (AWS/GCP/Azure embedded + custom JSON), spot discounts
+- [x] pkg/binpack — constraint-aware bin-packing planner (taints, affinity, PDB, topology spread, DaemonSet overhead)
 - [ ] pkg/plan — rebalancing plan generator (node removals, migrations, savings estimate, risk score)
 
 ## Phase 2 — Kubernetes integration
