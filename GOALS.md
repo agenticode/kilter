@@ -97,7 +97,7 @@ e2e scenario before the next starts.
 - [x] **P5 GPU / extended resources** — model.PodSpec/NodeSpec gain extended-resource
       maps (nvidia.com/gpu, …); binpack enforces feasibility (GPU pods never planned
       onto GPU-less nodes); consolidation treats GPU nodes conservatively.
-- [ ] **P6 e2e & scale hardening** — e2e scenarios: PDB-blocked drain stays blocked,
+- [x] **P6 e2e & scale hardening** — e2e scenarios: PDB-blocked drain stays blocked,
       karpenter-labeled node untouched, spot-taint emergency drain; scale soak:
       simulator at 5k nodes / 50k pods within latency budget; RBAC-lite read-only
       token for the brain API.

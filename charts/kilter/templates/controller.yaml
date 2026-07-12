@@ -30,6 +30,10 @@ spec:
             - --interval={{ .Values.controller.interval }}
             - --max-evictions-per-hour={{ .Values.controller.maxEvictionsPerHour }}
             - --in-place-resize={{ .Values.controller.inPlaceResize }}
+            {{- if ne .Values.controller.provider "none" }}
+            - --provider={{ .Values.controller.provider }}
+            - --provider-config={{ .Values.controller.providerConfig }}
+            {{- end }}
           env:
             - name: KILTER_CLUSTER_ID
               value: {{ .Values.clusterID | quote }}

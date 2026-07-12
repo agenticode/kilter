@@ -35,6 +35,9 @@ type BrainConfig struct {
 	// Token, when set, is required as "Authorization: Bearer <token>" on all
 	// /api/ routes. /healthz and /metrics stay open.
 	Token string
+	// ReadToken optionally grants read-only access to GET routes (dashboards,
+	// auditors) without the mutating-ingest token.
+	ReadToken string
 	// MaxBodyBytes bounds snapshot uploads (after transport decompression we
 	// additionally bound the decoded stream). Default 64 MiB.
 	MaxBodyBytes int64
@@ -337,7 +340,7 @@ func (b *Brain) Handler() http.Handler {
 		http.Redirect(w, r, "/ui", http.StatusFound)
 	})
 
-	mux.HandleFunc("POST /api/v1/snapshots", b.auth(b.handleIngest))
+	mux.HandleFunc("POST /api/v1/snapshots", b.authWrite(b.handleIngest))
 	mux.HandleFunc("GET /api/v1/clusters", b.auth(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"clusters": b.Clusters()})
 	}))
@@ -376,10 +379,23 @@ func (b *Brain) Handler() http.Handler {
 	return mux
 }
 
+// auth guards read routes: the write token or the read token both pass.
 func (b *Brain) auth(next http.HandlerFunc) http.HandlerFunc {
+	return b.authz(next, false)
+}
+
+// authWrite guards mutating routes: only the write token passes.
+func (b *Brain) authWrite(next http.HandlerFunc) http.HandlerFunc {
+	return b.authz(next, true)
+}
+
+func (b *Brain) authz(next http.HandlerFunc, write bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if b.cfg.Token != "" {
-			if r.Header.Get("Authorization") != "Bearer "+b.cfg.Token {
+			got := r.Header.Get("Authorization")
+			ok := got == "Bearer "+b.cfg.Token ||
+				(!write && b.cfg.ReadToken != "" && got == "Bearer "+b.cfg.ReadToken)
+			if !ok {
 				writeErr(w, http.StatusUnauthorized, errors.New("invalid or missing token"))
 				return
 			}

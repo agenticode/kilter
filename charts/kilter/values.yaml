@@ -37,6 +37,10 @@ agent:
 
 controller:
   enabled: true
+  # Node lifecycle provider: none | karpenter | webhook | eks
+  provider: none
+  # eks → cluster name; webhook → endpoint URL
+  providerConfig: ""
   # dry-run logs every step it would take; flip to apply when ready.
   mode: dry-run
   interval: 5m

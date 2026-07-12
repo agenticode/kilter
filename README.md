@@ -41,6 +41,11 @@ as a single Apache-2.0 binary you run yourself:
 | 🤖 **Self-learning AIOps loop** | Online pattern classifier (steady/diurnal/bursty/batch/growing) adapts sizing policy per workload — and re-adapts when behavior changes. Every decision states its evidence. |
 | 🔮 **Predictive insights** | `kilter insights`: OOM-risk ETAs, CPU saturation, 24h capacity-exhaustion forecasts. Plug pre-trained foundation models (Chronos, TimesFM) via `--forecaster-url`; built-ins are the fallback. |
 | 🤝 **Karpenter & KEDA native** | Karpenter-managed nodes are left to Karpenter — Kilter's rightsizing feeds its consolidation. KEDA-driven HPAs are detected and respected. |
+| ☁️ **Node lifecycle providers** | `--provider eks` terminates drained instances via ASG APIs (decrement-aware); `webhook` for on-prem/any-cloud; `karpenter` semantics built in. Freed capacity actually stops billing. |
+| 💸 **Spot automation** | Spot-safety scoring per workload with $ estimates; emergency drains on interruption signals (NTH/Karpenter taints) — cooldowns bypassed, PDBs still enforced. |
+| 🏷️ **Live pricing** | `kilter pricing sync-aws` builds catalogs from the AWS Pricing API + current spot prices. Embedded baseline works offline. |
+| 🖥️ **Built-in dashboard** | The brain serves a zero-dependency web UI at `/ui`: cost, savings, insights, recommendations, plans. Read-only tokens for viewers. |
+| 🎮 **GPU-aware** | Extended resources (nvidia.com/gpu, …) gate every simulated placement — GPU nodes are never drained without replacement capacity. |
 | 📊 **Prometheus-native** | Cost, savings and learning metrics exposed; Grafana dashboard included. |
 
 ## Quick start
@@ -142,6 +147,8 @@ Decision latency on an M4 laptop (see `make bench`):
 |---|---|---|
 | Drain simulation (full constraint check) | 1,000 nodes / 10,000 pods | **~3 ms** |
 | Cheapest-node-set plan from scratch | 10,000 pods × 20 instance types | **~0.4 s** |
+| Full rebalance plan (soak test in CI) | 5,000 nodes / 45,000 pods | **~1.6 s** |
+| Recommender snapshot ingest | 45,000 usage samples | **~12 ms** |
 | Histogram sample ingest | per sample | **~100 ns** |
 
 ## Kilter vs. alternatives
@@ -149,6 +156,8 @@ Decision latency on an M4 laptop (see `make bench`):
 | Capability | Kilter | CAST AI | Kubecost/OpenCost | VPA | Karpenter |
 |---|---|---|---|---|---|
 | Self-hosted / air-gapped | ✅ | ❌ SaaS | ✅ | ✅ | ✅ |
+| Cloud node termination (stop billing) | ✅ EKS/webhook | ✅ | ❌ | ❌ | ✅ |
+| Spot safety scoring + interruption drains | ✅ | ✅ | ❌ | ❌ | partial |
 | Cost visibility | ✅ | ✅ | ✅ | ❌ | ❌ |
 | Rightsizing (learned) | ✅ | ✅ | 📊 report-only | ✅ | ❌ |
 | Node consolidation with scheduling proof | ✅ | ✅ | ❌ | ❌ | ✅* |
@@ -205,11 +214,11 @@ consolidates the cluster** and every workload stays Running.
 
 Kilter is young and moving fast. Shipped: everything above. Next:
 
-- Cloud node-group providers (EKS/GKE/AKS APIs) for provision-before-drain rebalancing
-- Spot interruption handling + spot-friendliness scoring per workload
-- Live pricing feeds (AWS Pricing API, GCP Catalog)
-- Web UI on the brain
+- GKE/AKS node-group providers (EKS + generic webhook shipped; the interface is three methods)
+- Provision-before-drain surge rebalancing on non-Karpenter clusters
+- GCP/Azure live pricing sync (AWS shipped)
 - Forecast-driven pre-scaling actions (the capacity forecasts already exist as insights)
+- Workload placement mutation for spot (scoring shipped; automated migration next)
 
 Issues and PRs welcome. Read [ARCHITECTURE.md](ARCHITECTURE.md) first; the
 decision engine is deliberately dependency-free and a joy to test.

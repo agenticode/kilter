@@ -213,60 +213,59 @@ func Build(snap *model.ClusterSnapshot, recs []recommend.Recommendation, catalog
 		util float64
 		cost float64
 	}
-	utilization := func(nodes []model.NodeSpec, pods []model.PodSpec, name string) float64 {
-		var used model.Resources
-		var alloc model.Resources
-		for i := range nodes {
-			if nodes[i].Name == name {
-				alloc = nodes[i].Allocatable
-			}
-		}
+	// One O(pods) pass per round; candidate scans then read O(1).
+	utilizationMap := func(nodes []model.NodeSpec, pods []model.PodSpec) map[string]float64 {
+		used := make(map[string]model.Resources, len(nodes))
 		for i := range pods {
-			if pods[i].NodeName == name {
-				used = used.Add(pods[i].Requests())
+			if n := pods[i].NodeName; n != "" {
+				used[n] = used[n].Add(pods[i].Requests())
 			}
 		}
-		if alloc.MilliCPU == 0 || alloc.MemoryBytes == 0 {
-			return 1
+		out := make(map[string]float64, len(nodes))
+		for i := range nodes {
+			alloc := nodes[i].Allocatable
+			if alloc.MilliCPU == 0 || alloc.MemoryBytes == 0 {
+				out[nodes[i].Name] = 1
+				continue
+			}
+			u := used[nodes[i].Name]
+			cpu := float64(u.MilliCPU) / float64(alloc.MilliCPU)
+			mem := float64(u.MemoryBytes) / float64(alloc.MemoryBytes)
+			if cpu > mem {
+				out[nodes[i].Name] = cpu
+			} else {
+				out[nodes[i].Name] = mem
+			}
 		}
-		cpu := float64(used.MilliCPU) / float64(alloc.MilliCPU)
-		mem := float64(used.MemoryBytes) / float64(alloc.MemoryBytes)
-		if cpu > mem {
-			return cpu
-		}
-		return mem
+		return out
 	}
 
 	removed := 0
 	for removed < cfg.MaxNodeRemovals {
 		// Rank current candidates each round on the evolving state.
+		utils := utilizationMap(nodes, pods)
+		blockedNodes := map[string]bool{}
+		for j := range pods {
+			if pods[j].NodeName == "" {
+				continue
+			}
+			if blocks, _ := safety.BlocksDrain(&pods[j]); blocks {
+				blockedNodes[pods[j].NodeName] = true
+			}
+		}
 		var cands []candidate
 		for i := range nodes {
 			n := &nodes[i]
-			if !n.Ready || n.Unschedulable || isControlPlane(n) {
+			if !n.Ready || n.Unschedulable || isControlPlane(n) || blockedNodes[n.Name] {
 				continue
 			}
 			if cfg.RespectManagedNodes && n.ManagedBy != "" {
 				continue // the owning autoscaler consolidates; our resizes feed it
 			}
-			util := utilization(nodes, pods, n.Name)
-			if util >= cfg.MinNodeUtilization {
+			if utils[n.Name] >= cfg.MinNodeUtilization {
 				continue
 			}
-			blocked := false
-			for j := range pods {
-				if pods[j].NodeName != n.Name {
-					continue
-				}
-				if blocks, _ := safety.BlocksDrain(&pods[j]); blocks {
-					blocked = true
-					break
-				}
-			}
-			if blocked {
-				continue
-			}
-			cands = append(cands, candidate{name: n.Name, util: util, cost: nodeCost[n.Name]})
+			cands = append(cands, candidate{name: n.Name, util: utils[n.Name], cost: nodeCost[n.Name]})
 		}
 		if len(cands) == 0 {
 			break

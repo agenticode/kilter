@@ -58,6 +58,8 @@ KC apply -f test/e2e/workloads.yaml >/dev/null
 for n in "$CLUSTER-worker" "$CLUSTER-worker2" "$CLUSTER-worker3"; do
   KC annotate node "$n" kilter.dev/hourly-cost=0.192 --overwrite >/dev/null
 done
+# worker3 pretends to be karpenter-managed: kilter must leave it alone.
+KC label node "$CLUSTER-worker3" karpenter.sh/nodepool=general --overwrite >/dev/null
 KC -n kube-system rollout status deployment metrics-server --timeout=180s >/dev/null
 KC rollout status deployment web --timeout=180s >/dev/null
 
@@ -124,6 +126,8 @@ for i in $(seq 1 60); do
   [[ $i == 60 ]] && FAIL "controller never removed a node"
 done
 PASS "node removed: $NODES_BEFORE → $NODES_NOW"
+KC get node "$CLUSTER-worker3" >/dev/null 2>&1 || FAIL "karpenter-managed node was consolidated"
+PASS "karpenter-managed worker3 left untouched (coexistence)"
 
 echo "==> verifying workload health after consolidation"
 KC rollout status deployment web --timeout=180s >/dev/null
@@ -132,3 +136,20 @@ KC rollout status deployment worker --timeout=180s >/dev/null
 PENDING=$(KC get pods --field-selector=status.phase=Pending --no-headers 2>/dev/null | wc -l | tr -d ' ')
 [[ "$PENDING" == "0" ]] || FAIL "$PENDING pods stuck Pending after consolidation"
 PASS "all workloads Running after consolidation, nothing Pending"
+
+echo "==> 5) spot interruption emergency drain"
+kill "$CTRL_PID" 2>/dev/null || true
+KC taint node "$CLUSTER-worker3" aws-node-termination-handler/spot-itn=true:NoSchedule --overwrite >/dev/null
+./bin/kilter controller --brain-url="http://localhost:$BRAIN_PORT" --token=$TOKEN   --cluster-id=e2e --mode=apply --interval=10m --kubeconfig "$KUBECONFIG_FILE" &
+CTRL_PID=$!
+for i in $(seq 1 36); do
+  CORDONED=$(KC get node "$CLUSTER-worker3" -o jsonpath='{.spec.unschedulable}' 2>/dev/null)
+  NONDS=$(KC get pods -A --field-selector "spec.nodeName=$CLUSTER-worker3" -o json     | python3 -c 'import json,sys; pods=json.load(sys.stdin)["items"]; print(sum(1 for p in pods if not any(o.get("kind")=="DaemonSet" for o in p["metadata"].get("ownerReferences",[])) and p["status"]["phase"] not in ("Succeeded","Failed")))')
+  [[ "$CORDONED" == "true" && "$NONDS" == "0" ]] && break
+  sleep 5
+  [[ $i == 36 ]] && FAIL "spot-tainted node not drained (cordoned=$CORDONED, pods=$NONDS)"
+done
+KC get node "$CLUSTER-worker3" >/dev/null || FAIL "emergency drain must NOT delete the node"
+PASS "spot interruption: worker3 cordoned and drained, node left for cloud reclamation"
+KC rollout status deployment web --timeout=180s >/dev/null
+PASS "workloads healthy after emergency drain"

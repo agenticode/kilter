@@ -189,3 +189,25 @@ func TestUIServed(t *testing.T) {
 		t.Fatalf("root: %d → %q", r2.StatusCode, r2.Header.Get("Location"))
 	}
 }
+
+func TestReadOnlyToken(t *testing.T) {
+	b, err := NewBrain(BrainConfig{Token: "admin", ReadToken: "viewer"}, pricing.Embedded(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.Ingest(riskySnapshot("prod", t0))
+	srv := httptest.NewServer(b.Handler())
+	defer srv.Close()
+
+	viewer, _ := NewClient(srv.URL, "viewer")
+	if _, err := viewer.GetInsights(context.Background(), "prod"); err != nil {
+		t.Fatalf("read token must read: %v", err)
+	}
+	if err := viewer.PushSnapshot(context.Background(), riskySnapshot("prod", t0)); err == nil {
+		t.Fatal("read token must NOT ingest")
+	}
+	admin, _ := NewClient(srv.URL, "admin")
+	if err := admin.PushSnapshot(context.Background(), riskySnapshot("prod", t0)); err != nil {
+		t.Fatalf("admin token must ingest: %v", err)
+	}
+}
