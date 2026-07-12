@@ -1,0 +1,43 @@
+{
+  "comment": "Baseline on-demand hourly USD (us-east-1 / us-central1 / eastus class regions). Spot prices are typical observed averages, not guarantees. Override any of this with a custom catalog file or the kilter.dev/hourly-cost node annotation.",
+  "instances": [
+    {"provider": "aws", "name": "t3.medium",   "family": "t3",  "arch": "amd64", "milliCPU": 2000,  "memoryBytes": 4294967296,   "hourlyUSD": 0.0416, "spotHourlyUSD": 0.0125},
+    {"provider": "aws", "name": "t3.large",    "family": "t3",  "arch": "amd64", "milliCPU": 2000,  "memoryBytes": 8589934592,   "hourlyUSD": 0.0832, "spotHourlyUSD": 0.025},
+    {"provider": "aws", "name": "m5.large",    "family": "m5",  "arch": "amd64", "milliCPU": 2000,  "memoryBytes": 8589934592,   "hourlyUSD": 0.096,  "spotHourlyUSD": 0.035},
+    {"provider": "aws", "name": "m5.xlarge",   "family": "m5",  "arch": "amd64", "milliCPU": 4000,  "memoryBytes": 17179869184,  "hourlyUSD": 0.192,  "spotHourlyUSD": 0.070},
+    {"provider": "aws", "name": "m5.2xlarge",  "family": "m5",  "arch": "amd64", "milliCPU": 8000,  "memoryBytes": 34359738368,  "hourlyUSD": 0.384,  "spotHourlyUSD": 0.14},
+    {"provider": "aws", "name": "m5.4xlarge",  "family": "m5",  "arch": "amd64", "milliCPU": 16000, "memoryBytes": 68719476736,  "hourlyUSD": 0.768,  "spotHourlyUSD": 0.28},
+    {"provider": "aws", "name": "m6i.large",   "family": "m6i", "arch": "amd64", "milliCPU": 2000,  "memoryBytes": 8589934592,   "hourlyUSD": 0.096,  "spotHourlyUSD": 0.034},
+    {"provider": "aws", "name": "m6i.xlarge",  "family": "m6i", "arch": "amd64", "milliCPU": 4000,  "memoryBytes": 17179869184,  "hourlyUSD": 0.192,  "spotHourlyUSD": 0.068},
+    {"provider": "aws", "name": "m6i.2xlarge", "family": "m6i", "arch": "amd64", "milliCPU": 8000,  "memoryBytes": 34359738368,  "hourlyUSD": 0.384,  "spotHourlyUSD": 0.135},
+    {"provider": "aws", "name": "m6i.4xlarge", "family": "m6i", "arch": "amd64", "milliCPU": 16000, "memoryBytes": 68719476736,  "hourlyUSD": 0.768,  "spotHourlyUSD": 0.27},
+    {"provider": "aws", "name": "m7g.large",   "family": "m7g", "arch": "arm64", "milliCPU": 2000,  "memoryBytes": 8589934592,   "hourlyUSD": 0.0816, "spotHourlyUSD": 0.030},
+    {"provider": "aws", "name": "m7g.xlarge",  "family": "m7g", "arch": "arm64", "milliCPU": 4000,  "memoryBytes": 17179869184,  "hourlyUSD": 0.1632, "spotHourlyUSD": 0.060},
+    {"provider": "aws", "name": "m7g.2xlarge", "family": "m7g", "arch": "arm64", "milliCPU": 8000,  "memoryBytes": 34359738368,  "hourlyUSD": 0.3264, "spotHourlyUSD": 0.12},
+    {"provider": "aws", "name": "c5.large",    "family": "c5",  "arch": "amd64", "milliCPU": 2000,  "memoryBytes": 4294967296,   "hourlyUSD": 0.085,  "spotHourlyUSD": 0.032},
+    {"provider": "aws", "name": "c5.xlarge",   "family": "c5",  "arch": "amd64", "milliCPU": 4000,  "memoryBytes": 8589934592,   "hourlyUSD": 0.17,   "spotHourlyUSD": 0.064},
+    {"provider": "aws", "name": "c5.2xlarge",  "family": "c5",  "arch": "amd64", "milliCPU": 8000,  "memoryBytes": 17179869184,  "hourlyUSD": 0.34,   "spotHourlyUSD": 0.13},
+    {"provider": "aws", "name": "c6i.large",   "family": "c6i", "arch": "amd64", "milliCPU": 2000,  "memoryBytes": 4294967296,   "hourlyUSD": 0.085,  "spotHourlyUSD": 0.031},
+    {"provider": "aws", "name": "c6i.xlarge",  "family": "c6i", "arch": "amd64", "milliCPU": 4000,  "memoryBytes": 8589934592,   "hourlyUSD": 0.17,   "spotHourlyUSD": 0.062},
+    {"provider": "aws", "name": "r5.large",    "family": "r5",  "arch": "amd64", "milliCPU": 2000,  "memoryBytes": 17179869184,  "hourlyUSD": 0.126,  "spotHourlyUSD": 0.046},
+    {"provider": "aws", "name": "r5.xlarge",   "family": "r5",  "arch": "amd64", "milliCPU": 4000,  "memoryBytes": 34359738368,  "hourlyUSD": 0.252,  "spotHourlyUSD": 0.092},
+    {"provider": "aws", "name": "r5.2xlarge",  "family": "r5",  "arch": "amd64", "milliCPU": 8000,  "memoryBytes": 68719476736,  "hourlyUSD": 0.504,  "spotHourlyUSD": 0.18},
+    {"provider": "aws", "name": "r6i.large",   "family": "r6i", "arch": "amd64", "milliCPU": 2000,  "memoryBytes": 17179869184,  "hourlyUSD": 0.126,  "spotHourlyUSD": 0.045},
+
+    {"provider": "gcp", "name": "e2-standard-2",  "family": "e2", "arch": "amd64", "milliCPU": 2000,  "memoryBytes": 8589934592,  "hourlyUSD": 0.067,  "spotHourlyUSD": 0.020},
+    {"provider": "gcp", "name": "e2-standard-4",  "family": "e2", "arch": "amd64", "milliCPU": 4000,  "memoryBytes": 17179869184, "hourlyUSD": 0.134,  "spotHourlyUSD": 0.040},
+    {"provider": "gcp", "name": "e2-standard-8",  "family": "e2", "arch": "amd64", "milliCPU": 8000,  "memoryBytes": 34359738368, "hourlyUSD": 0.268,  "spotHourlyUSD": 0.080},
+    {"provider": "gcp", "name": "e2-highmem-4",   "family": "e2", "arch": "amd64", "milliCPU": 4000,  "memoryBytes": 34359738368, "hourlyUSD": 0.181,  "spotHourlyUSD": 0.054},
+    {"provider": "gcp", "name": "n2-standard-2",  "family": "n2", "arch": "amd64", "milliCPU": 2000,  "memoryBytes": 8589934592,  "hourlyUSD": 0.097,  "spotHourlyUSD": 0.024},
+    {"provider": "gcp", "name": "n2-standard-4",  "family": "n2", "arch": "amd64", "milliCPU": 4000,  "memoryBytes": 17179869184, "hourlyUSD": 0.194,  "spotHourlyUSD": 0.047},
+    {"provider": "gcp", "name": "n2-standard-8",  "family": "n2", "arch": "amd64", "milliCPU": 8000,  "memoryBytes": 34359738368, "hourlyUSD": 0.388,  "spotHourlyUSD": 0.094},
+    {"provider": "gcp", "name": "n2-highcpu-8",   "family": "n2", "arch": "amd64", "milliCPU": 8000,  "memoryBytes": 8589934592,  "hourlyUSD": 0.286,  "spotHourlyUSD": 0.069},
+    {"provider": "gcp", "name": "t2a-standard-4", "family": "t2a","arch": "arm64", "milliCPU": 4000,  "memoryBytes": 17179869184, "hourlyUSD": 0.154,  "spotHourlyUSD": 0.046},
+
+    {"provider": "azure", "name": "Standard_D2s_v3", "family": "Dsv3", "arch": "amd64", "milliCPU": 2000, "memoryBytes": 8589934592,  "hourlyUSD": 0.096, "spotHourlyUSD": 0.029},
+    {"provider": "azure", "name": "Standard_D4s_v3", "family": "Dsv3", "arch": "amd64", "milliCPU": 4000, "memoryBytes": 17179869184, "hourlyUSD": 0.192, "spotHourlyUSD": 0.058},
+    {"provider": "azure", "name": "Standard_D8s_v3", "family": "Dsv3", "arch": "amd64", "milliCPU": 8000, "memoryBytes": 34359738368, "hourlyUSD": 0.384, "spotHourlyUSD": 0.115},
+    {"provider": "azure", "name": "Standard_E4s_v3", "family": "Esv3", "arch": "amd64", "milliCPU": 4000, "memoryBytes": 34359738368, "hourlyUSD": 0.252, "spotHourlyUSD": 0.076},
+    {"provider": "azure", "name": "Standard_F4s_v2", "family": "Fsv2", "arch": "amd64", "milliCPU": 4000, "memoryBytes": 8589934592,  "hourlyUSD": 0.169, "spotHourlyUSD": 0.051}
+  ]
+}
