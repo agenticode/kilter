@@ -1,0 +1,52 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: web, namespace: default, labels: {app: web}}
+spec:
+  replicas: 3
+  selector: {matchLabels: {app: web}}
+  template:
+    metadata: {labels: {app: web}}
+    spec:
+      containers:
+        - name: app
+          image: registry.k8s.io/pause:3.9
+          resources:
+            requests: {cpu: 500m, memory: 1Gi}
+            limits: {cpu: "1", memory: 2Gi}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: api, namespace: default, labels: {app: api}}
+spec:
+  replicas: 2
+  selector: {matchLabels: {app: api}}
+  template:
+    metadata: {labels: {app: api}}
+    spec:
+      containers:
+        - name: app
+          image: registry.k8s.io/pause:3.9
+          resources:
+            requests: {cpu: 300m, memory: 512Mi}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: worker, namespace: default, labels: {app: worker}}
+spec:
+  replicas: 2
+  selector: {matchLabels: {app: worker}}
+  template:
+    metadata: {labels: {app: worker}}
+    spec:
+      containers:
+        - name: app
+          image: registry.k8s.io/pause:3.9
+          resources:
+            requests: {cpu: 200m, memory: 256Mi}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata: {name: web-pdb, namespace: default}
+spec:
+  minAvailable: 2
+  selector: {matchLabels: {app: web}}
