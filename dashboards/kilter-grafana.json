@@ -1,0 +1,68 @@
+{
+  "__inputs": [{"name": "DS_PROMETHEUS", "label": "Prometheus", "type": "datasource", "pluginId": "prometheus"}],
+  "title": "Kilter — Cluster Cost Optimization",
+  "uid": "kilter-overview",
+  "tags": ["kilter", "cost", "finops"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "refresh": "1m",
+  "time": {"from": "now-24h", "to": "now"},
+  "panels": [
+    {
+      "type": "stat", "title": "Cluster cost ($/hour)", "id": 1,
+      "gridPos": {"h": 6, "w": 6, "x": 0, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [{"expr": "sum(kilter_cluster_cost_hourly_usd)", "legendFormat": "cost"}],
+      "fieldConfig": {"defaults": {"unit": "currencyUSD", "decimals": 3, "color": {"mode": "fixed", "fixedColor": "orange"}}}
+    },
+    {
+      "type": "stat", "title": "Projected monthly cost", "id": 2,
+      "gridPos": {"h": 6, "w": 6, "x": 6, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [{"expr": "sum(kilter_cluster_cost_hourly_usd) * 730", "legendFormat": "monthly"}],
+      "fieldConfig": {"defaults": {"unit": "currencyUSD", "decimals": 0}}
+    },
+    {
+      "type": "stat", "title": "Identified savings ($/month)", "id": 3,
+      "gridPos": {"h": 6, "w": 6, "x": 12, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [{"expr": "sum(kilter_plan_savings_monthly_usd)", "legendFormat": "savings"}],
+      "fieldConfig": {"defaults": {"unit": "currencyUSD", "decimals": 0, "color": {"mode": "fixed", "fixedColor": "green"}}}
+    },
+    {
+      "type": "stat", "title": "Active recommendations", "id": 4,
+      "gridPos": {"h": 6, "w": 6, "x": 18, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [{"expr": "sum(kilter_recommendations)", "legendFormat": "recs"}],
+      "fieldConfig": {"defaults": {"unit": "short"}}
+    },
+    {
+      "type": "timeseries", "title": "Cost per cluster ($/hour)", "id": 5,
+      "gridPos": {"h": 9, "w": 12, "x": 0, "y": 6},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [{"expr": "kilter_cluster_cost_hourly_usd", "legendFormat": "{{cluster}}"}],
+      "fieldConfig": {"defaults": {"unit": "currencyUSD", "custom": {"fillOpacity": 12}}}
+    },
+    {
+      "type": "timeseries", "title": "Savings per cluster ($/month)", "id": 6,
+      "gridPos": {"h": 9, "w": 12, "x": 12, "y": 6},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [{"expr": "kilter_plan_savings_monthly_usd", "legendFormat": "{{cluster}}"}],
+      "fieldConfig": {"defaults": {"unit": "currencyUSD", "custom": {"fillOpacity": 12}}}
+    },
+    {
+      "type": "timeseries", "title": "Snapshot ingest rate", "id": 7,
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 15},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [{"expr": "rate(kilter_snapshots_received_total[5m])", "legendFormat": "{{cluster}}"}],
+      "fieldConfig": {"defaults": {"unit": "ops"}}
+    },
+    {
+      "type": "timeseries", "title": "Tracked containers", "id": 8,
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 15},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [{"expr": "kilter_tracked_containers", "legendFormat": "{{cluster}}"}],
+      "fieldConfig": {"defaults": {"unit": "short"}}
+    }
+  ]
+}

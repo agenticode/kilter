@@ -1,0 +1,65 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="825" height="649" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="13">
+<rect width="100%" height="100%" rx="8" fill="#0d1117"/>
+<rect width="100%" height="28" rx="8" fill="#161b22"/>
+<rect y="14" width="100%" height="14" fill="#161b22"/>
+<circle cx="16" cy="14" r="5" fill="#ff5f57"/>
+<circle cx="34" cy="14" r="5" fill="#febc2e"/>
+<circle cx="52" cy="14" r="5" fill="#28c840"/>
+<text x="50%" y="18" text-anchor="middle" fill="#9ca3af" font-size="12">kilter analyze</text>
+<text x="16.0" y="44" fill="#e5e7eb" xml:space="preserve">  </text>
+<text x="31.7" y="44" fill="#67e8f9" font-weight="bold" xml:space="preserve">◆ Kilter</text>
+<text x="94.5" y="44" fill="#e5e7eb" xml:space="preserve"> </text>
+<text x="102.3" y="44" fill="#e5e7eb" font-weight="bold" xml:space="preserve">cluster analysis</text>
+<text x="16.0" y="63" fill="#e5e7eb" xml:space="preserve">  </text>
+<text x="31.7" y="63" fill="#9ca3af" xml:space="preserve">kubernetes v1.36.1</text>
+<text x="16.0" y="101" fill="#e5e7eb" xml:space="preserve">  NODES        4 (3 workers, 1 control-plane)</text>
+<text x="16.0" y="120" fill="#e5e7eb" xml:space="preserve">  PODS         23 running</text>
+<text x="16.0" y="139" fill="#e5e7eb" xml:space="preserve">  COST         </text>
+<text x="133.8" y="139" fill="#e5e7eb" font-weight="bold" xml:space="preserve">$0.808</text>
+<text x="180.8" y="139" fill="#e5e7eb" xml:space="preserve">/h   →   </text>
+<text x="251.5" y="139" fill="#e5e7eb" font-weight="bold" xml:space="preserve">$589.87</text>
+<text x="306.4" y="139" fill="#e5e7eb" xml:space="preserve">/month</text>
+<text x="16.0" y="177" fill="#e5e7eb" xml:space="preserve">  </text>
+<text x="31.7" y="177" fill="#e5e7eb" font-weight="bold" xml:space="preserve">TOP OVERPROVISIONED WORKLOADS</text>
+<text x="16.0" y="215" fill="#e5e7eb" xml:space="preserve">  WORKLOAD                          CONTAINER                REPLICAS  REQUESTED    USED (avg)  WASTE</text>
+<text x="16.0" y="234" fill="#e5e7eb" xml:space="preserve">  ────────────────────────────────  ───────────────────────  ────────  ───────────  ──────────  ─────</text>
+<text x="16.0" y="253" fill="#e5e7eb" xml:space="preserve">  default/web                       app                      3         1500m/3.0Gi  5m/0Mi      </text>
+<text x="769.6" y="253" fill="#f87171" xml:space="preserve">100%</text>
+<text x="16.0" y="272" fill="#e5e7eb" xml:space="preserve">  default/api                       app                      2         600m/1.0Gi   4m/0Mi      </text>
+<text x="769.6" y="272" fill="#f87171" xml:space="preserve">100%</text>
+<text x="16.0" y="291" fill="#e5e7eb" xml:space="preserve">  default/worker                    app                      2         400m/512Mi   3m/0Mi      </text>
+<text x="769.6" y="291" fill="#f87171" xml:space="preserve">100%</text>
+<text x="16.0" y="310" fill="#e5e7eb" xml:space="preserve">  kube-system/coredns               coredns                  2         200m/140Mi   6m/20Mi     </text>
+<text x="769.6" y="310" fill="#f87171" xml:space="preserve">91%</text>
+<text x="16.0" y="329" fill="#e5e7eb" xml:space="preserve">  kube-system/kindnet               kindnet-cni              4         400m/200Mi   12m/34Mi    </text>
+<text x="769.6" y="329" fill="#f87171" xml:space="preserve">90%</text>
+<text x="16.0" y="348" fill="#e5e7eb" xml:space="preserve">  kube-system/metrics-server        metrics-server           1         100m/200Mi   68m/14Mi    </text>
+<text x="769.6" y="348" fill="#facc15" xml:space="preserve">62%</text>
+<text x="16.0" y="367" fill="#e5e7eb" xml:space="preserve">  kube-system/kilter-control-plane  etcd                     1         100m/100Mi   56m/31Mi    </text>
+<text x="769.6" y="367" fill="#facc15" xml:space="preserve">56%</text>
+<text x="16.0" y="386" fill="#e5e7eb" xml:space="preserve">  kube-system/kilter-control-plane  kube-scheduler           1         100m/0Mi     15m/19Mi    </text>
+<text x="769.6" y="386" fill="#facc15" xml:space="preserve">42%</text>
+<text x="16.0" y="405" fill="#e5e7eb" xml:space="preserve">  kube-system/kilter-control-plane  kube-controller-manager  1         200m/0Mi     31m/53Mi    </text>
+<text x="769.6" y="405" fill="#facc15" xml:space="preserve">42%</text>
+<text x="16.0" y="424" fill="#e5e7eb" xml:space="preserve">  kube-system/kilter-control-plane  kube-apiserver           1         250m/0Mi     133m/231Mi  </text>
+<text x="769.6" y="424" fill="#4ade80" xml:space="preserve">23%</text>
+<text x="16.0" y="462" fill="#e5e7eb" xml:space="preserve">  </text>
+<text x="31.7" y="462" fill="#e5e7eb" font-weight="bold" xml:space="preserve">CONSOLIDATION</text>
+<text x="16.0" y="500" fill="#e5e7eb" xml:space="preserve">  </text>
+<text x="31.7" y="500" fill="#4ade80" xml:space="preserve">✔</text>
+<text x="39.5" y="500" fill="#e5e7eb" xml:space="preserve"> node </text>
+<text x="86.6" y="500" fill="#e5e7eb" font-weight="bold" xml:space="preserve">kilter-worker</text>
+<text x="188.7" y="500" fill="#e5e7eb" xml:space="preserve"> can be drained (17% utilized, 2 pods move) → saves </text>
+<text x="596.9" y="500" fill="#4ade80" xml:space="preserve">$140.16</text>
+<text x="651.9" y="500" fill="#e5e7eb" xml:space="preserve">/month</text>
+<text x="16.0" y="538" fill="#e5e7eb" xml:space="preserve">  </text>
+<text x="31.7" y="538" fill="#e5e7eb" font-weight="bold" xml:space="preserve">PROJECTED SAVINGS:</text>
+<text x="173.0" y="538" fill="#e5e7eb" xml:space="preserve"> </text>
+<text x="180.8" y="538" fill="#4ade80" font-weight="bold" xml:space="preserve">$140.16</text>
+<text x="235.8" y="538" fill="#e5e7eb" xml:space="preserve">/month (24% of node spend)</text>
+<text x="16.0" y="557" fill="#e5e7eb" xml:space="preserve">  GREENFIELD FLOOR: $0.154/h ($112.42/month) </text>
+<text x="369.2" y="557" fill="#9ca3af" xml:space="preserve">— cheapest possible repack of current workloads</text>
+<text x="16.0" y="595" fill="#e5e7eb" xml:space="preserve">  </text>
+<text x="31.7" y="595" fill="#9ca3af" xml:space="preserve">tip: add --watch 30m to sample usage over time and unlock rightsizing</text>
+<text x="16.0" y="614" fill="#e5e7eb" xml:space="preserve">  recommendations with confidence scores.</text>
+</svg>

@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="935" height="307" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="13">
+<rect width="100%" height="100%" rx="8" fill="#0d1117"/>
+<rect width="100%" height="28" rx="8" fill="#161b22"/>
+<rect y="14" width="100%" height="14" fill="#161b22"/>
+<circle cx="16" cy="14" r="5" fill="#ff5f57"/>
+<circle cx="34" cy="14" r="5" fill="#febc2e"/>
+<circle cx="52" cy="14" r="5" fill="#28c840"/>
+<text x="50%" y="18" text-anchor="middle" fill="#9ca3af" font-size="12">kilter simulate --snapshot cluster.json</text>
+<text x="16.0" y="44" fill="#e5e7eb" xml:space="preserve">  </text>
+<text x="31.7" y="44" fill="#67e8f9" font-weight="bold" xml:space="preserve">◆ Kilter</text>
+<text x="94.5" y="44" fill="#e5e7eb" xml:space="preserve"> </text>
+<text x="102.3" y="44" fill="#e5e7eb" font-weight="bold" xml:space="preserve">plan for</text>
+<text x="165.1" y="44" fill="#e5e7eb" xml:space="preserve"> </text>
+<text x="173.0" y="44" fill="#e5e7eb" font-weight="bold" xml:space="preserve">analyze</text>
+<text x="16.0" y="63" fill="#e5e7eb" xml:space="preserve">  </text>
+<text x="31.7" y="63" fill="#9ca3af" xml:space="preserve">created 2026-07-12 01:18:24 UTC · risk: low</text>
+<text x="16.0" y="101" fill="#e5e7eb" xml:space="preserve">  #  ACTION       TARGET                           DETAIL                                                      RISK</text>
+<text x="16.0" y="120" fill="#e5e7eb" xml:space="preserve">  ─  ───────────  ───────────────────────────────  ──────────────────────────────────────────────────────────  ────</text>
+<text x="16.0" y="139" fill="#e5e7eb" xml:space="preserve">  1  cordon-node  kilter-worker                    cordon kilter-worker (17% utilized, $0.192/h)               </text>
+<text x="887.3" y="139" fill="#4ade80" xml:space="preserve">low</text>
+<text x="16.0" y="158" fill="#e5e7eb" xml:space="preserve">  2  evict-pod    default/worker-68f6c784f9-2fdtm  evict default/worker-68f6c784f9-2fdtm (sim target: kilter…  </text>
+<text x="887.3" y="158" fill="#4ade80" xml:space="preserve">low</text>
+<text x="16.0" y="177" fill="#e5e7eb" xml:space="preserve">  3  evict-pod    default/web-6ff85c9487-t9qxv     evict default/web-6ff85c9487-t9qxv (sim target: kilter-wo…  </text>
+<text x="887.3" y="177" fill="#4ade80" xml:space="preserve">low</text>
+<text x="16.0" y="196" fill="#e5e7eb" xml:space="preserve">  4  delete-node  kilter-worker                    remove empty node kilter-worker: saves $140.16/month        </text>
+<text x="887.3" y="196" fill="#4ade80" xml:space="preserve">low</text>
+<text x="16.0" y="234" fill="#e5e7eb" xml:space="preserve">  current  $0.808/h   →   projected  $0.616/h</text>
+<text x="16.0" y="253" fill="#e5e7eb" xml:space="preserve">  </text>
+<text x="31.7" y="253" fill="#e5e7eb" font-weight="bold" xml:space="preserve">savings:</text>
+<text x="94.5" y="253" fill="#e5e7eb" xml:space="preserve"> </text>
+<text x="102.3" y="253" fill="#4ade80" font-weight="bold" xml:space="preserve">$140.16</text>
+<text x="157.3" y="253" fill="#e5e7eb" xml:space="preserve">/month</text>
+<text x="16.0" y="272" fill="#e5e7eb" xml:space="preserve">  </text>
+<text x="31.7" y="272" fill="#9ca3af" xml:space="preserve">greenfield floor:</text>
+<text x="165.1" y="272" fill="#e5e7eb" xml:space="preserve"> $0.154/h</text>
+</svg>
