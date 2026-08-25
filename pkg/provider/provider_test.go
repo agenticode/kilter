@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/service/autoscaling"
@@ -110,6 +111,7 @@ func TestWebhookContract(t *testing.T) {
 
 type fakeASG struct {
 	groups       []types.AutoScalingGroup
+	pages        [][]types.AutoScalingGroup // when set, Describe serves one page per call
 	scaled       map[string]int32
 	terminated   []string
 	terminateErr error
@@ -117,6 +119,18 @@ type fakeASG struct {
 
 func (f *fakeASG) DescribeAutoScalingGroups(ctx context.Context, in *autoscaling.DescribeAutoScalingGroupsInput,
 	_ ...func(*autoscaling.Options)) (*autoscaling.DescribeAutoScalingGroupsOutput, error) {
+	if f.pages != nil {
+		idx := 0
+		if in.NextToken != nil {
+			idx, _ = strconv.Atoi(*in.NextToken)
+		}
+		out := &autoscaling.DescribeAutoScalingGroupsOutput{AutoScalingGroups: f.pages[idx]}
+		if idx+1 < len(f.pages) {
+			tok := strconv.Itoa(idx + 1)
+			out.NextToken = &tok
+		}
+		return out, nil
+	}
 	return &autoscaling.DescribeAutoScalingGroupsOutput{AutoScalingGroups: f.groups}, nil
 }
 

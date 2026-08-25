@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
@@ -36,7 +37,9 @@ type EKS struct {
 // NewEKS loads AWS credentials from the environment (IRSA, instance profile,
 // env vars, shared config) and targets the given cluster's node groups.
 func NewEKS(ctx context.Context, clusterName string) (*EKS, error) {
-	if clusterName == "" {
+	// A blank name would build the tag "kubernetes.io/cluster/" (or with
+	// stray whitespace) that matches no ASG, making Discover silently empty.
+	if strings.TrimSpace(clusterName) == "" {
 		return nil, fmt.Errorf("provider eks: cluster name required (--provider-config=<cluster-name>)")
 	}
 	cfg, err := awsconfig.LoadDefaultConfig(ctx)
@@ -109,8 +112,13 @@ func (e *EKS) Discover(ctx context.Context) ([]NodeGroup, map[string]string, err
 
 // ScaleTo sets a group's desired capacity.
 func (e *EKS) ScaleTo(ctx context.Context, groupID string, desired int) error {
-	if desired < 0 {
-		return fmt.Errorf("provider eks: negative desired %d", desired)
+	if groupID == "" {
+		return fmt.Errorf("provider eks: empty group id")
+	}
+	// The API takes int32; int32(desired) would silently wrap anything past
+	// MaxInt32 (e.g. 1<<32+5 → 5) into a wrong but plausible capacity.
+	if desired < 0 || desired > math.MaxInt32 {
+		return fmt.Errorf("provider eks: desired %d out of range [0, %d]", desired, math.MaxInt32)
 	}
 	d := int32(desired)
 	honor := false
@@ -146,26 +154,53 @@ func (e *EKS) TerminateNode(ctx context.Context, nodeName, providerID string) er
 	return nil
 }
 
-// InstanceIDFromProviderID extracts "i-…" from "aws:///us-east-1a/i-0abc…".
+// InstanceIDFromProviderID extracts "i-…" from "aws:///us-east-1a/i-0abc…"
+// (a bare "i-…" is also accepted). The part after "i-" must be lowercase hex,
+// matching every ID EC2 issues; other last segments that merely start with
+// "i-" (non-AWS providerIDs, English words) are rejected here rather than
+// sent to the AWS API as instance IDs.
 func InstanceIDFromProviderID(providerID string) (string, error) {
 	parts := strings.Split(providerID, "/")
 	last := parts[len(parts)-1]
-	if !strings.HasPrefix(last, "i-") || len(last) < 4 {
+	if !strings.HasPrefix(last, "i-") || len(last) < 4 || !isLowerHex(last[2:]) {
 		return "", fmt.Errorf("cannot extract instance id from providerID %q", providerID)
 	}
 	return last, nil
 }
 
-// isInstanceGone matches the ValidationError the ASG API returns for
-// instances that were already terminated or detached.
+func isLowerHex(s string) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// isInstanceGone reports whether err is the ASG API saying the instance no
+// longer exists, making termination an idempotent success.
+//
+// That state comes back as a ValidationError — but so do refusals where the
+// instance is still RUNNING: decrementing below the group's min size
+// ("Terminating instance without replacement will violate group's min size
+// constraint") and scale-in/termination protection. Those must stay errors;
+// swallowing them would report capacity as freed while the instance keeps
+// billing. The refusal check runs first because those messages also contain
+// "terminat".
 func isInstanceGone(err error) bool {
 	var ae smithy.APIError
-	if errors.As(err, &ae) && ae.ErrorCode() == "ValidationError" {
-		msg := strings.ToLower(ae.ErrorMessage())
-		return strings.Contains(msg, "not found") || strings.Contains(msg, "terminat") ||
-			strings.Contains(msg, "no managed instance")
+	if !errors.As(err, &ae) || ae.ErrorCode() != "ValidationError" {
+		return false
 	}
-	return false
+	msg := strings.ToLower(ae.ErrorMessage())
+	for _, refusal := range []string{"violate", "min size", "protected"} {
+		if strings.Contains(msg, refusal) {
+			return false
+		}
+	}
+	return strings.Contains(msg, "not found") || strings.Contains(msg, "terminat") ||
+		strings.Contains(msg, "no managed instance")
 }
 
 func str(s *string) string {

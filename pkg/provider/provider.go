@@ -16,13 +16,23 @@ import (
 // NodeGroup is a scalable set of homogeneous nodes (an ASG / managed node
 // group / on-prem pool).
 type NodeGroup struct {
-	ID            string   `json:"id"`
-	Name          string   `json:"name"`
-	Min           int      `json:"min"`
-	Max           int      `json:"max"`
-	Desired       int      `json:"desired"`
+	// ID uniquely identifies the group to its provider (ASG name, pool ID)
+	// and is the handle passed back to ScaleTo.
+	ID string `json:"id"`
+	// Name is the human-facing label; often equal to ID.
+	Name string `json:"name"`
+	// Min and Max bound Desired. Desired is the current capacity target,
+	// not the count of running instances — during a scale operation the two
+	// differ, and Desired may transiently sit outside [Min, Max].
+	Min     int `json:"min"`
+	Max     int `json:"max"`
+	Desired int `json:"desired"`
+	// InstanceTypes lists the machine types observed or configured in the
+	// group, deduplicated; order is not significant.
 	InstanceTypes []string `json:"instanceTypes,omitempty"`
-	Spot          bool     `json:"spot,omitempty"`
+	// Spot marks groups running effectively all spot/preemptible capacity.
+	// Best-effort: false also means "could not tell".
+	Spot bool `json:"spot,omitempty"`
 }
 
 // Provider manages node lifecycle for one cluster.
@@ -32,11 +42,16 @@ type Provider interface {
 	// Discover lists node groups and maps Kubernetes node names to group IDs.
 	Discover(ctx context.Context) ([]NodeGroup, map[string]string, error)
 	// ScaleTo sets a group's desired capacity (used for provision-before-drain).
+	// desired must be non-negative; implementations reject out-of-range
+	// values client-side, before any cloud call.
 	ScaleTo(ctx context.Context, groupID string, desired int) error
 	// TerminateNode terminates the cloud instance backing a node, shrinking
 	// its group so the capacity is not replaced. Called after the node is
 	// drained and its Node object deleted. Must be idempotent: terminating an
-	// already-gone instance returns nil.
+	// already-gone instance returns nil. providerID may be empty when the
+	// Node object vanished before it could be read; implementations that
+	// cannot resolve the instance from nodeName alone must return an error
+	// rather than assume the instance is gone.
 	TerminateNode(ctx context.Context, nodeName, providerID string) error
 }
 
