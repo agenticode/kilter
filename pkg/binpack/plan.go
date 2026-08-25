@@ -2,6 +2,7 @@ package binpack
 
 import (
 	"fmt"
+	"math"
 	"sort"
 
 	"github.com/agenticode/kilter/pkg/model"
@@ -26,12 +27,14 @@ type PlanOptions struct {
 	// AllowBurstable admits credit-based CPU shapes (t3, B-series) into plans.
 	// Off by default: their price is only real if you don't burn the CPU.
 	AllowBurstable bool
-	// MaxNodes hard-caps the plan size. Default 1000.
+	// MaxNodes hard-caps the plan size. Default 5000.
 	MaxNodes int
 }
 
 func (o PlanOptions) withDefaults() PlanOptions {
-	if o.SystemReservedFraction <= 0 || o.SystemReservedFraction >= 0.5 {
+	// Positive-range form (not its negation) so NaN also falls to the default
+	// instead of poisoning every allocatable computation.
+	if !(o.SystemReservedFraction > 0 && o.SystemReservedFraction < 0.5) {
 		o.SystemReservedFraction = 0.08
 	}
 	if o.MaxPodsPerNode <= 0 {
@@ -49,7 +52,9 @@ func (o PlanOptions) withDefaults() PlanOptions {
 // noise and plans balloon into many under-sized nodes.
 const effEpsilon = 0.01
 
-// PlannedNode is one node in a plan with its assigned pods.
+// PlannedNode is one node in a plan with its assigned pods. PodUIDs and Used
+// cover workload pods only; DaemonSet overhead (PlanOptions.DaemonSetPods) has
+// already been carved out of the node's usable room but is not listed here.
 type PlannedNode struct {
 	Name        string               `json:"name"`
 	Type        pricing.InstanceType `json:"type"`
@@ -71,7 +76,7 @@ type NodePlan struct {
 // podValueUSD prices a pod's requests at fallback unit economics; used only
 // as the packing-efficiency numerator, never reported as spend.
 func podValueUSD(p *model.PodSpec) float64 {
-	req := p.Requests()
+	req := requestsOf(p)
 	return float64(req.MilliCPU)/1000*pricing.FallbackCPUHourlyUSD +
 		float64(req.MemoryBytes)/(1<<30)*pricing.FallbackGiBHourlyUSD
 }
@@ -105,11 +110,11 @@ func synthNode(it pricing.InstanceType, seq int, opts PlanOptions) model.NodeSpe
 	}
 }
 
-// trialFill opens one empty node of the given type, applies DaemonSet
-// overhead, then packs as many of the (pre-sorted, descending) pods as fit.
-// Returns the packed pod indexes and the used resources.
-func trialFill(it pricing.InstanceType, seq int, sortedPods []*model.PodSpec, opts PlanOptions) (packedIdx []int, used model.Resources, node model.NodeSpec) {
-	node = synthNode(it, seq, opts)
+// openTrialNode builds a one-node simulation of a fresh node of this type
+// with DaemonSet overhead already applied — the room a real node of the type
+// would actually offer workload pods.
+func openTrialNode(it pricing.InstanceType, seq int, opts PlanOptions) (*ClusterState, *NodeState, model.NodeSpec) {
+	node := synthNode(it, seq, opts)
 	cs := NewClusterState([]model.NodeSpec{node}, nil)
 	ns := cs.nodes[0]
 	ns.MaxPods = opts.MaxPodsPerNode
@@ -122,6 +127,14 @@ func trialFill(it pricing.InstanceType, seq int, sortedPods []*model.PodSpec, op
 			cs.forcePlace(&ds, ns)
 		}
 	}
+	return cs, ns, node
+}
+
+// trialFill opens one empty node of the given type, applies DaemonSet
+// overhead, then packs as many of the (pre-sorted, descending) pods as fit.
+// Returns the packed pod indexes and the used resources.
+func trialFill(it pricing.InstanceType, seq int, sortedPods []*model.PodSpec, opts PlanOptions) (packedIdx []int, used model.Resources, node model.NodeSpec) {
+	cs, ns, node := openTrialNode(it, seq, opts)
 
 	// Early-exit floor: once free capacity drops below the smallest remaining
 	// request in either dimension, nothing else can fit.
@@ -130,7 +143,7 @@ func trialFill(it pricing.InstanceType, seq int, sortedPods []*model.PodSpec, op
 		if p == nil {
 			continue
 		}
-		req := p.Requests()
+		req := requestsOf(p)
 		if req.MilliCPU < minCPU {
 			minCPU = req.MilliCPU
 		}
@@ -146,7 +159,7 @@ func trialFill(it pricing.InstanceType, seq int, sortedPods []*model.PodSpec, op
 		if cs.fits(p, ns) == nil {
 			cs.forcePlace(p, ns)
 			packedIdx = append(packedIdx, i)
-			used = used.Add(p.Requests())
+			used = used.Add(requestsOf(p))
 			if ns.Free.MilliCPU < minCPU || ns.Free.MemoryBytes < minMem {
 				break
 			}
@@ -159,28 +172,46 @@ func trialFill(it pricing.InstanceType, seq int, sortedPods []*model.PodSpec, op
 // round, every candidate instance type is trial-packed against the remaining
 // pods and the type with the best packed-value-per-dollar wins one node.
 // Deterministic for identical inputs.
+//
+// Nil pods are ignored and a repeated UID is reported unschedulable rather
+// than double-packed. Candidates whose resolved price is negative, NaN, or
+// infinite are dropped: they would poison the value-per-dollar comparison and
+// the plan's cost totals. A zero price (free capacity) is allowed.
 func PlanNodes(pods []*model.PodSpec, candidates []pricing.InstanceType, opts PlanOptions) NodePlan {
 	opts = opts.withDefaults()
 	plan := NodePlan{}
-	if !opts.AllowBurstable {
-		kept := make([]pricing.InstanceType, 0, len(candidates))
-		for _, it := range candidates {
-			if !it.Burstable {
-				kept = append(kept, it)
-			}
+	kept := make([]pricing.InstanceType, 0, len(candidates))
+	for _, it := range candidates {
+		if it.Burstable && !opts.AllowBurstable {
+			continue
 		}
-		candidates = kept
+		if price := it.Price(opts.Spot); price < 0 || math.IsNaN(price) || math.IsInf(price, 0) {
+			continue
+		}
+		kept = append(kept, it)
+	}
+	candidates = kept
+
+	// Work on a sorted copy (dominant resource descending), nil-ing out packed slots.
+	remaining := make([]*model.PodSpec, 0, len(pods))
+	seen := make(map[string]bool, len(pods))
+	for _, p := range pods {
+		if p == nil {
+			continue
+		}
+		if seen[p.UID] {
+			plan.Unschedulable = append(plan.Unschedulable, Unschedulable{Pod: p, Reasons: []string{"duplicate pod UID"}})
+			continue
+		}
+		seen[p.UID] = true
+		remaining = append(remaining, p)
 	}
 	if len(candidates) == 0 {
-		for _, p := range pods {
+		for _, p := range remaining {
 			plan.Unschedulable = append(plan.Unschedulable, Unschedulable{Pod: p, Reasons: []string{"no candidate instance types"}})
 		}
 		return plan
 	}
-
-	// Work on a sorted copy (dominant resource descending), nil-ing out packed slots.
-	remaining := make([]*model.PodSpec, len(pods))
-	copy(remaining, pods)
 	sort.SliceStable(remaining, func(i, j int) bool {
 		a, b := dominantShare(remaining[i]), dominantShare(remaining[j])
 		if a != b {
@@ -289,16 +320,18 @@ func PlanNodes(pods []*model.PodSpec, candidates []pricing.InstanceType, opts Pl
 		}
 	}
 
-	// Anything left could not be packed; explain against each candidate.
+	// Anything left could not be packed; explain against a fresh node of each
+	// candidate WITH DaemonSet overhead applied — the same room trialFill saw.
+	// Only a pod that genuinely fits some fresh node can have been stopped by
+	// the MaxNodes cap, so the fallback reason below stays honest.
 	for _, p := range remaining {
 		if p == nil {
 			continue
 		}
 		var reasons []string
 		for _, it := range candidates {
-			node := synthNode(it, 99999, opts)
-			cs := NewClusterState([]model.NodeSpec{node}, nil)
-			if err := cs.fits(p, cs.nodes[0]); err != nil {
+			cs, ns, _ := openTrialNode(it, 99999, opts)
+			if err := cs.fits(p, ns); err != nil {
 				reasons = append(reasons, it.Name+": "+err.Error())
 			}
 		}

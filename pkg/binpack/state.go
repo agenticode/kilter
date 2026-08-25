@@ -24,6 +24,10 @@ import (
 const DefaultMaxPodsPerNode = 110
 
 // NodeState tracks one node's remaining schedulable capacity.
+//
+// Free can go negative: ground-truth pods are force-placed without feasibility
+// checks (see NewClusterState), so an overcommitted real node is represented
+// faithfully rather than clamped. Fits never admits new pods onto such a node.
 type NodeState struct {
 	Spec     model.NodeSpec
 	Free     model.Resources
@@ -31,6 +35,35 @@ type NodeState struct {
 	PodCount int
 	MaxPods  int
 	pods     map[string]*model.PodSpec // by UID
+}
+
+// requestsOf returns p's summed requests with negative dimensions clamped to
+// zero. Negative requests cannot survive Kubernetes API validation, but a
+// buggy collector must not be able to inflate capacity: subtracting a negative
+// request would *grow* a node's Free and let the simulator promise room that
+// does not exist. Used by every accounting path so place/remove stay symmetric.
+func requestsOf(p *model.PodSpec) model.Resources {
+	req := p.Requests()
+	if req.MilliCPU < 0 {
+		req.MilliCPU = 0
+	}
+	if req.MemoryBytes < 0 {
+		req.MemoryBytes = 0
+	}
+	return req
+}
+
+// extendedOf returns p's summed extended requests with non-positive entries
+// dropped, for the same reason requestsOf clamps: a negative GPU request must
+// not mint free GPUs on a node that has none.
+func extendedOf(p *model.PodSpec) map[string]int64 {
+	ext := p.ExtendedRequests()
+	for k, v := range ext {
+		if v <= 0 {
+			delete(ext, k)
+		}
+	}
+	return ext
 }
 
 // Pods returns the pods currently assigned to this node (unordered).
@@ -54,8 +87,9 @@ type ClusterState struct {
 
 // NewClusterState builds a simulation from existing nodes and pods. Existing
 // pods are force-placed onto their nodes without feasibility checks (the
-// cluster is ground truth, even when drifted); pending pods (no node) are
-// ignored here and can be scheduled explicitly.
+// cluster is ground truth, even when drifted); pending pods (no node) and pods
+// referencing a node absent from nodes are ignored here and can be scheduled
+// explicitly.
 func NewClusterState(nodes []model.NodeSpec, pods []model.PodSpec) *ClusterState {
 	cs := &ClusterState{
 		nodeIndex:  map[string]*NodeState{},
@@ -77,8 +111,14 @@ func NewClusterState(nodes []model.NodeSpec, pods []model.PodSpec) *ClusterState
 	return cs
 }
 
-// AddNode inserts a node into the simulation.
+// AddNode inserts a node into the simulation. Re-adding an existing name
+// replaces the previous node entirely — its pods leave the simulation, exactly
+// as RemoveNode followed by AddNode — so the index and node list can never
+// disagree about which state backs a name.
 func (cs *ClusterState) AddNode(spec model.NodeSpec) *NodeState {
+	if _, exists := cs.nodeIndex[spec.Name]; exists {
+		cs.RemoveNode(spec.Name) // cannot fail: the name is indexed
+	}
 	ns := &NodeState{
 		Spec:    spec,
 		Free:    spec.Allocatable,
@@ -91,9 +131,13 @@ func (cs *ClusterState) AddNode(spec model.NodeSpec) *NodeState {
 			ns.FreeExt[k] = v
 		}
 	}
-	cs.nodes = append(cs.nodes, ns)
+	// cs.nodes stays sorted by name; splice into position rather than re-sorting
+	// the whole slice on every add.
+	idx := sort.Search(len(cs.nodes), func(i int) bool { return cs.nodes[i].Spec.Name >= spec.Name })
+	cs.nodes = append(cs.nodes, nil)
+	copy(cs.nodes[idx+1:], cs.nodes[idx:])
+	cs.nodes[idx] = ns
 	cs.nodeIndex[spec.Name] = ns
-	sort.Slice(cs.nodes, func(i, j int) bool { return cs.nodes[i].Spec.Name < cs.nodes[j].Spec.Name })
 	return ns
 }
 
@@ -106,27 +150,37 @@ func (cs *ClusterState) Node(name string) (*NodeState, bool) {
 // Nodes returns node states sorted by name.
 func (cs *ClusterState) Nodes() []*NodeState { return cs.nodes }
 
-func (cs *ClusterState) forcePlace(p *model.PodSpec, ns *NodeState) {
+// forcePlace assigns p to ns without feasibility checks and reports whether it
+// was placed. A UID already on the node is left untouched: overwriting the map
+// entry while decrementing Free twice would corrupt accounting forever.
+func (cs *ClusterState) forcePlace(p *model.PodSpec, ns *NodeState) bool {
+	if _, dup := ns.pods[p.UID]; dup {
+		return false
+	}
 	ns.pods[p.UID] = p
 	ns.PodCount++
-	ns.Free = ns.Free.Sub(p.Requests())
-	for k, v := range p.ExtendedRequests() {
+	ns.Free = ns.Free.Sub(requestsOf(p))
+	for k, v := range extendedOf(p) {
 		if ns.FreeExt == nil {
 			ns.FreeExt = map[string]int64{}
 		}
 		ns.FreeExt[k] -= v
 	}
 	cs.adjustTopo(p, &ns.Spec, +1)
+	return true
 }
 
 // Place assigns a pod to a node, updating capacity and topology counts.
-// Callers should have verified Fits first; Place does not re-check.
+// Callers should have verified Fits first; Place does not re-check, but it
+// does reject a UID that is already on the node.
 func (cs *ClusterState) Place(p *model.PodSpec, nodeName string) error {
 	ns, ok := cs.nodeIndex[nodeName]
 	if !ok {
 		return fmt.Errorf("binpack: unknown node %q", nodeName)
 	}
-	cs.forcePlace(p, ns)
+	if !cs.forcePlace(p, ns) {
+		return fmt.Errorf("binpack: pod %q already on node %q", p.UID, nodeName)
+	}
 	return nil
 }
 
@@ -142,8 +196,10 @@ func (cs *ClusterState) Remove(podUID, nodeName string) error {
 	}
 	delete(ns.pods, podUID)
 	ns.PodCount--
-	ns.Free = ns.Free.Add(p.Requests())
-	for k, v := range p.ExtendedRequests() {
+	// Mirror forcePlace exactly (same clamping) so remove restores precisely
+	// what place consumed.
+	ns.Free = ns.Free.Add(requestsOf(p))
+	for k, v := range extendedOf(p) {
 		ns.FreeExt[k] += v
 	}
 	cs.adjustTopo(p, &ns.Spec, -1)
@@ -216,7 +272,7 @@ func (cs *ClusterState) workloadCount(wl, topoKey, domain string) int {
 func (cs *ClusterState) Fits(p *model.PodSpec, nodeName string) error {
 	ns, ok := cs.nodeIndex[nodeName]
 	if !ok {
-		return fmt.Errorf("unknown node %q", nodeName)
+		return fmt.Errorf("binpack: unknown node %q", nodeName)
 	}
 	return cs.fits(p, ns)
 }
@@ -232,10 +288,10 @@ func (cs *ClusterState) fits(p *model.PodSpec, ns *NodeState) error {
 	if ns.PodCount >= ns.MaxPods {
 		return fmt.Errorf("node pod limit %d reached", ns.MaxPods)
 	}
-	if req := p.Requests(); !ns.Free.Fits(req) {
+	if req := requestsOf(p); !ns.Free.Fits(req) {
 		return fmt.Errorf("insufficient free resources: need %s, free %s", req, ns.Free)
 	}
-	for k, v := range p.ExtendedRequests() {
+	for k, v := range extendedOf(p) {
 		if ns.FreeExt[k] < v {
 			return fmt.Errorf("insufficient %s: need %d, free %d", k, v, ns.FreeExt[k])
 		}
@@ -309,10 +365,17 @@ func (cs *ClusterState) checkSkew(wl string, c model.TopologySpreadConstraint, d
 	if minCount < 0 {
 		minCount = 0
 	}
+	// Kubernetes API validation requires maxSkew >= 1. Placing into the least-
+	// loaded domain always yields skew 1 here, so a garbage maxSkew <= 0 would
+	// reject every placement; treat it as the strictest valid constraint instead.
+	maxSkew := int(c.MaxSkew)
+	if maxSkew < 1 {
+		maxSkew = 1
+	}
 	after := counts[domain] + 1
-	if int32(after-minCount) > c.MaxSkew {
+	if after-minCount > maxSkew {
 		return fmt.Errorf("topology spread: placing in %s=%s gives skew %d > maxSkew %d",
-			c.TopologyKey, domain, after-minCount, c.MaxSkew)
+			c.TopologyKey, domain, after-minCount, maxSkew)
 	}
 	return nil
 }
@@ -389,9 +452,23 @@ type Unschedulable struct {
 // pods sorted by dominant resource descending; each goes to the fitting node
 // that leaves the least normalized capacity behind (tightest fit). Mutates cs.
 // Returns assignments (pod UID → node name) and pods that fit nowhere.
+// Nil entries are ignored; a repeated UID is reported unschedulable rather
+// than double-booked.
 func (cs *ClusterState) Schedule(pods []*model.PodSpec) (map[string]string, []Unschedulable) {
-	sorted := make([]*model.PodSpec, len(pods))
-	copy(sorted, pods)
+	sorted := make([]*model.PodSpec, 0, len(pods))
+	seen := make(map[string]bool, len(pods))
+	var failed []Unschedulable
+	for _, p := range pods {
+		if p == nil {
+			continue
+		}
+		if seen[p.UID] {
+			failed = append(failed, Unschedulable{Pod: p, Reasons: []string{"duplicate pod UID"}})
+			continue
+		}
+		seen[p.UID] = true
+		sorted = append(sorted, p)
+	}
 	sort.SliceStable(sorted, func(i, j int) bool {
 		a, b := dominantShare(sorted[i]), dominantShare(sorted[j])
 		if a != b {
@@ -401,7 +478,6 @@ func (cs *ClusterState) Schedule(pods []*model.PodSpec) (map[string]string, []Un
 	})
 
 	assignments := map[string]string{}
-	var failed []Unschedulable
 	for _, p := range sorted {
 		best, reasons := cs.bestNode(p)
 		if best == nil {
@@ -419,7 +495,7 @@ func (cs *ClusterState) bestNode(p *model.PodSpec) (*NodeState, []string) {
 	var best *NodeState
 	bestScore := 0.0
 	var reasons []string
-	req := p.Requests()
+	req := requestsOf(p)
 	for _, ns := range cs.nodes {
 		if err := cs.fits(p, ns); err != nil {
 			reasons = append(reasons, ns.Spec.Name+": "+err.Error())
@@ -451,7 +527,7 @@ func leftoverScore(ns *NodeState, req model.Resources) float64 {
 // dominantShare normalizes a pod's requests to a single sortable magnitude
 // using the conventional 1 vCPU ≈ 4 GiB exchange rate.
 func dominantShare(p *model.PodSpec) float64 {
-	req := p.Requests()
+	req := requestsOf(p)
 	cpu := float64(req.MilliCPU)
 	mem := float64(req.MemoryBytes) / float64(4<<30) * 1000
 	if cpu > mem {
