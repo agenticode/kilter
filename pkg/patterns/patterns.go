@@ -47,18 +47,31 @@ type Features struct {
 	AutoCorr24h float64 `json:"autoCorr24h"` // lag-24h autocorrelation, -1..1
 	TrendPerDay float64 `json:"trendPerDay"` // linear slope as fraction of mean per day
 	SpikeRate   float64 `json:"spikeRate"`   // fraction of samples > 2× mean
-	IdleFrac    float64 `json:"idleFrac"`    // fraction of samples < 10% of p95
+	IdleFrac    float64 `json:"idleFrac"`    // fraction of samples < 10% of p95 (exact zeros when p95 is 0)
 	MedianRatio float64 `json:"medianRatio"` // median / p95: near 0 = truly idle between runs
 }
 
 // capacity: 48h at 5-minute samples.
 const ringCap = 576
 
+// maxSample rejects absurd magnitudes the same way NaN/Inf/negative are
+// rejected: 1e18 is far beyond any real usage telemetry (an exabyte of
+// memory bytes, a quadrillion millicores), so anything above it is pipeline
+// garbage. Keeping every stored value ≤ 1e18 also guarantees all downstream
+// aggregates (sums, squared deviations, cross products over ≤ ringCap
+// samples) stay comfortably finite, so Analyze never emits Inf/NaN features.
+const maxSample = 1e18
+
 // minClassifySamples before leaving ClassUnknown.
 const minClassifySamples = 48
 
 // Detector ingests usage samples for one series. Not safe for concurrent
 // use; owners (recommender state) serialize access.
+//
+// Samples are expected in non-decreasing timestamp order (the ring stores
+// insertion order and the trend/autocorrelation math reads it as a time
+// series). Out-of-order samples do not panic or corrupt state, but they
+// degrade AutoCorr24h and TrendPerDay quality until they rotate out.
 type Detector struct {
 	vals  [ringCap]float64
 	times [ringCap]int64 // unix seconds
@@ -66,9 +79,11 @@ type Detector struct {
 	head  int            // next write position
 }
 
-// Add ingests one sample.
+// Add ingests one sample. Garbage values — NaN, ±Inf, negative, or
+// absurdly large (> maxSample) — are dropped so one bad scrape cannot
+// poison 48h of learned behavior.
 func (d *Detector) Add(t time.Time, v float64) {
-	if math.IsNaN(v) || math.IsInf(v, 0) || v < 0 {
+	if math.IsNaN(v) || math.IsInf(v, 0) || v < 0 || v > maxSample {
 		return
 	}
 	d.vals[d.head] = v
@@ -103,6 +118,11 @@ func (d *Detector) series() ([]float64, []int64) {
 }
 
 // Analyze computes features and a classification.
+//
+// Invariant: every returned feature is finite (Add rejects values that
+// could overflow the aggregates), with CV ≥ 0, AutoCorr24h in [-1,1], and
+// SpikeRate, IdleFrac, MedianRatio in [0,1]. Consumers may do arithmetic
+// with them without re-checking for NaN/Inf.
 func (d *Detector) Analyze() (Class, Features) {
 	vals, times := d.series()
 	f := Features{Samples: len(vals)}
@@ -134,7 +154,12 @@ func (d *Detector) Analyze() (Class, Features) {
 	p95 := percentile(vals, 0.95)
 	idle := 0
 	for _, v := range vals {
-		if v < 0.10*p95 {
+		// p95 == 0 means >95% of samples are exactly zero (values are
+		// non-negative), which collapses the relative threshold v < 0.10*p95
+		// to v < 0 and would report IdleFrac = 0 for the idlest possible
+		// series — misclassifying rare-spike crons as bursty/diurnal. Count
+		// exact zeros as idle in that regime.
+		if v < 0.10*p95 || (p95 == 0 && v == 0) {
 			idle++
 		}
 	}
@@ -174,14 +199,16 @@ func classify(f Features) Class {
 // Policy is the class-specific sizing posture applied on top of the
 // operator's base config.
 type Policy struct {
-	CPUPercentile  float64
-	CPUHeadroom    float64
-	MemoryHeadroom float64
-	Note           string
+	CPUPercentile  float64 // usage percentile to size CPU from, in (0,1]
+	CPUHeadroom    float64 // multiplier applied to the CPU percentile, ≥ 1
+	MemoryHeadroom float64 // multiplier applied to the memory percentile, ≥ 1
+	Note           string  // human-readable rationale for decision logs
 }
 
 // PolicyFor returns the adaptive policy for a class. Base values are the
-// operator's configured defaults; classes tighten or loosen them.
+// operator's configured defaults; classes tighten or loosen them. Inputs
+// are assumed already validated by config loading (percentile in (0,1],
+// headrooms ≥ 1) — garbage in propagates out.
 func PolicyFor(c Class, baseCPUPercentile, baseCPUHeadroom, baseMemHeadroom float64) Policy {
 	p := Policy{CPUPercentile: baseCPUPercentile, CPUHeadroom: baseCPUHeadroom, MemoryHeadroom: baseMemHeadroom}
 	switch c {
@@ -232,6 +259,11 @@ func PriorWasteEstimate() (low, high float64, source string) {
 
 // ---- small math helpers ----
 
+// percentile returns the lower-value (truncating-index) quantile: the
+// element at index ⌊p·(n-1)⌋ of the sorted copy. That biases slightly low
+// versus linear interpolation, which is the safe direction for the idle
+// threshold it feeds. p outside [0,1] (including NaN) is clamped — without
+// the clamp, int(NaN) is platform-defined and would index out of range.
 func percentile(vals []float64, p float64) float64 {
 	if len(vals) == 0 {
 		return 0
@@ -240,6 +272,12 @@ func percentile(vals []float64, p float64) float64 {
 	copy(cp, vals)
 	// insertion-free selection: simple sort is fine at ring sizes
 	sortFloats(cp)
+	if !(p > 0) { // catches p <= 0 and NaN
+		return cp[0]
+	}
+	if p >= 1 {
+		return cp[len(cp)-1]
+	}
 	idx := int(p * float64(len(cp)-1))
 	return cp[idx]
 }
@@ -279,7 +317,14 @@ func slopePerDay(vals []float64, times []int64, mean float64) float64 {
 		return 0
 	}
 	b := (n*sxy - sx*sy) / den
-	return b / mean
+	r := b / mean
+	// Belt-and-braces: a degenerate fit (pathological timestamps, subnormal
+	// mean) must never leak Inf/NaN into Features — consumers do arithmetic
+	// with TrendPerDay directly when sizing memory.
+	if math.IsNaN(r) || math.IsInf(r, 0) {
+		return 0
+	}
+	return r
 }
 
 // autoCorrAtLag computes autocorrelation at the given lag in seconds,
@@ -348,8 +393,10 @@ func abs64(v int64) int64 {
 	return v
 }
 
-// String renders features compactly for decision reasons.
+// String renders features compactly for decision reasons. MedianRatio is
+// included because the batch-vs-bursty distinction hinges on it, and every
+// automated decision must be able to say why.
 func (f Features) String() string {
-	return fmt.Sprintf("cv=%.2f ac24=%.2f trend=%+.0f%%/d spikes=%.0f%% idle=%.0f%%",
-		f.CV, f.AutoCorr24h, f.TrendPerDay*100, f.SpikeRate*100, f.IdleFrac*100)
+	return fmt.Sprintf("cv=%.2f ac24=%.2f trend=%+.0f%%/d spikes=%.0f%% idle=%.0f%% med=%.3f",
+		f.CV, f.AutoCorr24h, f.TrendPerDay*100, f.SpikeRate*100, f.IdleFrac*100, f.MedianRatio)
 }
