@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"time"
@@ -26,7 +27,12 @@ type RemoteForecaster struct {
 	hc  *http.Client
 }
 
-// NewRemoteForecaster validates the endpoint URL.
+// maxResponseBytes caps how much of a remote response is read: a misbehaving
+// model server must not be able to balloon the brain's memory.
+const maxResponseBytes = 8 << 20
+
+// NewRemoteForecaster validates the endpoint URL. The client enforces a
+// 10-second request timeout in addition to any caller context deadline.
 func NewRemoteForecaster(endpoint string) (*RemoteForecaster, error) {
 	u, err := url.Parse(endpoint)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
@@ -35,10 +41,19 @@ func NewRemoteForecaster(endpoint string) (*RemoteForecaster, error) {
 	return &RemoteForecaster{url: endpoint, hc: &http.Client{Timeout: 10 * time.Second}}, nil
 }
 
-// Forecast requests `horizon` future points for the series.
+// Forecast requests `horizon` future points for the series. It returns
+// exactly horizon points or an error — a partial answer would silently
+// under-cover the horizon for callers that take the max over the window.
 func (rf *RemoteForecaster) Forecast(ctx context.Context, series []float64, horizon int) ([]float64, error) {
 	if len(series) == 0 || horizon < 1 {
 		return nil, fmt.Errorf("forecast: empty series or horizon %d", horizon)
+	}
+	// Reject non-finite inputs up front: json.Marshal would fail on them
+	// anyway, but with an error that doesn't say where the garbage is.
+	for i, v := range series {
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			return nil, fmt.Errorf("forecast: series[%d] is non-finite (%v)", i, v)
+		}
 	}
 	body, err := json.Marshal(map[string]any{"series": series, "horizon": horizon})
 	if err != nil {
@@ -55,20 +70,22 @@ func (rf *RemoteForecaster) Forecast(ctx context.Context, series []float64, hori
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
+		// Drain a little so the keep-alive connection can be reused.
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
 		return nil, fmt.Errorf("forecast: remote returned %d", resp.StatusCode)
 	}
 	var out struct {
 		Forecast []float64 `json:"forecast"`
 	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 8<<20)).Decode(&out); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxResponseBytes)).Decode(&out); err != nil {
 		return nil, fmt.Errorf("forecast: decode remote response: %w", err)
 	}
-	if len(out.Forecast) == 0 {
-		return nil, fmt.Errorf("forecast: remote returned no points")
+	if len(out.Forecast) != horizon {
+		return nil, fmt.Errorf("forecast: remote returned %d points, want %d", len(out.Forecast), horizon)
 	}
-	for _, v := range out.Forecast {
-		if v != v || v < 0 { // NaN or negative demand
-			return nil, fmt.Errorf("forecast: remote returned invalid value %v", v)
+	for i, v := range out.Forecast {
+		if math.IsNaN(v) || math.IsInf(v, 0) || v < 0 { // demand must be finite and non-negative
+			return nil, fmt.Errorf("forecast: remote returned invalid value %v at point %d", v, i)
 		}
 	}
 	return out.Forecast, nil

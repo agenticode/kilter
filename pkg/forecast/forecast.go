@@ -5,12 +5,28 @@
 //
 // All models are online (O(1) per sample, bounded memory) so the brain can
 // track hundreds of thousands of series under high load.
+//
+// Models are not safe for concurrent use; callers serialize access per series.
 package forecast
 
 import (
 	"fmt"
 	"math"
 )
+
+// maxAbsSample bounds the magnitude of an accepted observation. Real resource
+// quantities (millicores, bytes, dollars) sit far below 1e150; anything larger
+// is sensor garbage, and admitting it would let intermediate products such as
+// delta² or level+trend overflow float64 and permanently poison the online
+// state with ±Inf/NaN. With inputs bounded here every intermediate stays
+// finite: |delta| ≤ 2e150, so delta² ≤ 4e300 < MaxFloat64.
+const maxAbsSample = 1e150
+
+// usable reports whether v may enter a model. The range test is also false
+// for NaN and ±Inf, so a single comparison covers all garbage classes.
+func usable(v float64) bool {
+	return v >= -maxAbsSample && v <= maxAbsSample
+}
 
 // EWMA is an exponentially weighted moving average with online variance
 // (EWMVar), suitable as a cheap baseline + band model.
@@ -30,9 +46,10 @@ func NewEWMA(alpha float64) (*EWMA, error) {
 	return &EWMA{alpha: alpha}, nil
 }
 
-// Add feeds one observation.
+// Add feeds one observation. Garbage samples (NaN, ±Inf, or magnitude beyond
+// maxAbsSample) are ignored and do not count toward N.
 func (e *EWMA) Add(v float64) {
-	if math.IsNaN(v) || math.IsInf(v, 0) {
+	if !usable(v) {
 		return
 	}
 	e.n++
@@ -56,9 +73,14 @@ func (e *EWMA) Mean() float64 { return e.mean }
 // StdDev returns the current smoothed standard deviation.
 func (e *EWMA) StdDev() float64 { return math.Sqrt(e.vari) }
 
-// UpperBound returns mean + k*stddev, floored at the mean.
+// UpperBound returns mean + k*stddev, floored at the mean: a negative or NaN
+// k can never produce a bound below the current mean.
 func (e *EWMA) UpperBound(k float64) float64 {
-	return e.mean + k*e.StdDev()
+	b := e.mean + k*e.StdDev()
+	if math.IsNaN(b) || b < e.mean {
+		return e.mean
+	}
+	return b
 }
 
 // HoltWinters is additive triple exponential smoothing. With Gamma=0 and
@@ -78,7 +100,10 @@ type HoltWinters struct {
 
 // NewHoltWinters validates parameters. seasonLen == 0 disables seasonality.
 func NewHoltWinters(alpha, beta, gamma float64, seasonLen int) (*HoltWinters, error) {
-	if alpha <= 0 || alpha > 1 || beta < 0 || beta > 1 || gamma < 0 || gamma > 1 {
+	// NaN fails every range comparison below, so it must be rejected
+	// explicitly; ±Inf is already caught by the range checks.
+	if math.IsNaN(alpha) || math.IsNaN(beta) || math.IsNaN(gamma) ||
+		alpha <= 0 || alpha > 1 || beta < 0 || beta > 1 || gamma < 0 || gamma > 1 {
 		return nil, fmt.Errorf("forecast: smoothing params out of range a=%v b=%v g=%v", alpha, beta, gamma)
 	}
 	if seasonLen < 0 || seasonLen == 1 {
@@ -101,9 +126,11 @@ func (hw *HoltWinters) Ready() bool {
 // N returns the number of samples observed.
 func (hw *HoltWinters) N() int { return hw.n }
 
-// Add feeds one observation (fixed sampling interval assumed).
+// Add feeds one observation (fixed sampling interval assumed). Garbage
+// samples (NaN, ±Inf, or magnitude beyond maxAbsSample) are ignored: they do
+// not count toward N and do not shift the seasonal phase.
 func (hw *HoltWinters) Add(v float64) {
-	if math.IsNaN(v) || math.IsInf(v, 0) {
+	if !usable(v) {
 		return
 	}
 	hw.n++
@@ -167,10 +194,15 @@ func (hw *HoltWinters) Forecast(h int) float64 {
 	}
 	v := hw.level + float64(h)*hw.trend
 	if hw.seasonLen > 0 {
-		si := (hw.n - 1 + h) % hw.seasonLen
+		// Reduce h modulo the season before adding: (hw.n - 1 + h) can
+		// overflow int for large horizons, and a negative index into
+		// seasonal would panic.
+		si := ((hw.n-1)%hw.seasonLen + h%hw.seasonLen) % hw.seasonLen
 		v += hw.seasonal[si]
 	}
-	if v < 0 {
+	// Demand cannot be negative, and a degenerate model must never report
+	// unbounded demand; 0 is the package-wide "no usable forecast" sentinel.
+	if v < 0 || math.IsNaN(v) || math.IsInf(v, 0) {
 		return 0
 	}
 	return v
@@ -201,15 +233,22 @@ func NewSpikeDetector(alpha, k float64) (*SpikeDetector, error) {
 	if err != nil {
 		return nil, err
 	}
-	if k <= 0 {
-		return nil, fmt.Errorf("forecast: k %v must be > 0", k)
+	// NaN fails k <= 0, and an infinite k yields a NaN band (Inf*0 when the
+	// baseline variance is 0) that would silently never flag a spike.
+	if math.IsNaN(k) || math.IsInf(k, 0) || k <= 0 {
+		return nil, fmt.Errorf("forecast: k %v must be finite and > 0", k)
 	}
 	return &SpikeDetector{baseline: e, k: k}, nil
 }
 
-// Observe feeds a sample and reports whether it is a spike. Warm-up (first 10
-// samples) never reports spikes.
+// Observe feeds a sample and reports whether it is a spike. Garbage samples
+// (NaN, ±Inf, or magnitude beyond maxAbsSample) are ignored entirely: they
+// are never spikes, do not move the baseline, and do not dilute SpikeRate.
+// Warm-up (first 10 samples) never reports spikes.
 func (s *SpikeDetector) Observe(v float64) bool {
+	if !usable(v) {
+		return false
+	}
 	s.total++
 	warm := s.baseline.N() >= 10
 	spike := false
