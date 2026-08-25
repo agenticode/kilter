@@ -4,6 +4,10 @@
 //  2. Instance-type lookup in the catalog (embedded baseline or custom file)
 //  3. Fallback unit economics ($/vCPU-h + $/GiB-h)
 //
+// Pods with no node to be priced by — EKS Fargate pods, each in its own
+// single-pod VM — are priced instead by their billed vCPU/memory tier; see
+// fargate.go.
+//
 // Embedded prices are a baseline (us-east-1 class), good for relative savings
 // math; exact billing belongs to your cloud invoice. Everything is overridable.
 package pricing
@@ -70,10 +74,12 @@ type catalogFile struct {
 	Instances []InstanceType `json:"instances"`
 }
 
-// Catalog is an indexed set of instance types.
+// Catalog is an indexed set of instance types, plus the Fargate rate table
+// used to price pods that have no node to be priced by (see fargate.go).
 type Catalog struct {
 	instances []InstanceType
 	index     map[string]InstanceType // provider + "/" + name
+	fargate   FargateRates
 }
 
 // Load parses a catalog from JSON and validates every entry: positive shape
@@ -90,7 +96,7 @@ func Load(r io.Reader) (*Catalog, error) {
 	if len(f.Instances) == 0 {
 		return nil, fmt.Errorf("pricing: catalog has no instances")
 	}
-	c := &Catalog{index: map[string]InstanceType{}}
+	c := &Catalog{index: map[string]InstanceType{}, fargate: DefaultFargateRates()}
 	for _, it := range f.Instances {
 		if it.Name == "" || it.Provider == "" || it.MilliCPU <= 0 || it.MemoryBytes <= 0 || it.HourlyUSD <= 0 {
 			return nil, fmt.Errorf("pricing: invalid instance entry %q/%q", it.Provider, it.Name)
@@ -179,6 +185,9 @@ const (
 	SourceAnnotation CostSource = "annotation"
 	SourceCatalog    CostSource = "catalog"
 	SourceFallback   CostSource = "fallback"
+	// SourceFargateNode marks a node that has no node price at all: it is a
+	// Fargate single-pod VM, billed as a pod configuration instead.
+	SourceFargateNode CostSource = "fargate-node"
 )
 
 // NodeHourlyCost resolves one node's hourly price via annotation → catalog →
@@ -187,6 +196,14 @@ const (
 // can be built by other paths) and garbage negative capacity clamps to zero
 // instead of pricing a node below free.
 func (c *Catalog) NodeHourlyCost(n *model.NodeSpec) (float64, CostSource) {
+	// A Fargate "node" is a single-pod VM. Its reported capacity is not what
+	// AWS bills — the pod's quantized configuration is (§4.1) — and that
+	// capacity is routinely larger than the billed one, so pricing it here at
+	// any source, annotation included, is a silent overcharge. It has no node
+	// price: SnapshotCost prices its pod instead.
+	if n.IsFargate() {
+		return 0, SourceFargateNode
+	}
 	if n.HourlyCost > 0 && !math.IsInf(n.HourlyCost, 1) {
 		return n.HourlyCost, SourceAnnotation
 	}
@@ -213,27 +230,79 @@ type NodeCost struct {
 	Spot       bool       `json:"spot,omitempty"`
 }
 
-// ClusterCost aggregates a snapshot's node prices.
+// ClusterCost aggregates a snapshot's node prices and its Fargate pod prices.
 type ClusterCost struct {
 	HourlyUSD  float64    `json:"hourlyUSD"`
 	MonthlyUSD float64    `json:"monthlyUSD"`
 	Nodes      []NodeCost `json:"nodes"`
+	// Fargate holds the per-pod prices of Fargate-hosted pods. Their
+	// single-pod VMs never appear in Nodes.
+	Fargate          []FargatePodCost `json:"fargate,omitempty"`
+	FargateHourlyUSD float64          `json:"fargateHourlyUSD,omitempty"`
+	// Warnings records billing inputs that did not add up (a pod too large for
+	// Fargate, an unparseable CapacityProvisioned, a quantizer/AWS
+	// disagreement). Nothing here is silently absorbed.
+	Warnings []string `json:"warnings,omitempty"`
 }
 
-// SnapshotCost prices every node in the snapshot. A nil snapshot prices as an
-// empty cluster. Invariant: HourlyUSD equals the sum of the per-node entries.
+// SnapshotCost prices a snapshot: node-backed nodes by their shape, Fargate
+// pods by their billed configuration. A nil snapshot prices as an empty
+// cluster.
+//
+// Fargate is not node math. A Fargate "node" is a single-pod VM whose reported
+// capacity is not the bill, so it is excluded from Nodes entirely and its pod
+// is priced by ProvisionedCapacity if AWS stamped one, else by the quantizer
+// (§4.1.2) — never by node capacity, which is the silent mispricing this
+// exists to remove. Pods on Fargate nodes are priced in snapshot order, so the
+// result is deterministic.
+//
+// Invariant: HourlyUSD equals the sum of the per-node entries plus the sum of
+// the per-Fargate-pod entries, and FargateHourlyUSD equals the latter.
 func (c *Catalog) SnapshotCost(snap *model.ClusterSnapshot) ClusterCost {
 	out := ClusterCost{}
 	if snap == nil {
 		return out
 	}
+	fargateNodes := make(map[string]bool)
 	for i := range snap.Nodes {
 		n := &snap.Nodes[i]
+		if n.IsFargate() {
+			if n.Name != "" { // an unnamed node must not capture unscheduled pods
+				fargateNodes[n.Name] = true
+			}
+			continue
+		}
 		h, src := c.NodeHourlyCost(n)
 		out.Nodes = append(out.Nodes, NodeCost{
 			Node: n.Name, HourlyUSD: h, MonthlyUSD: h * HoursPerMonth, Source: src, Spot: n.Spot,
 		})
 		out.HourlyUSD += h
+	}
+	if len(fargateNodes) > 0 {
+		rates := c.FargateRates()
+		for i := range snap.Pods {
+			p := &snap.Pods[i]
+			if !fargateNodes[p.NodeName] {
+				continue
+			}
+			out.Warnings = append(out.Warnings, FargatePodWarnings(p)...)
+			cfg, src, err := FargatePodConfig(p)
+			if err != nil {
+				// A pod above the Fargate ceiling cannot be scheduled, so it
+				// has no bill to report. Loudly unpriced beats a fabricated
+				// number in either direction.
+				out.Warnings = append(out.Warnings, fmt.Sprintf(
+					"fargate pod %s/%s left unpriced: %v", p.Namespace, p.Name, err))
+				continue
+			}
+			h := rates.Cost(cfg)
+			out.Fargate = append(out.Fargate, FargatePodCost{
+				Pod: p.Namespace + "/" + p.Name, UID: p.UID, Node: p.NodeName,
+				Config: cfg, HourlyUSD: h, MonthlyUSD: h * HoursPerMonth, Source: src,
+			})
+			out.FargateHourlyUSD += h
+			out.HourlyUSD += h
+		}
 	}
 	out.MonthlyUSD = out.HourlyUSD * HoursPerMonth
 	return out
