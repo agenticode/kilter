@@ -191,6 +191,17 @@ type PodSpec struct {
 	NodeName string `json:"nodeName,omitempty"`
 
 	Containers []ContainerSpec `json:"containers"`
+	// InitRequests is the element-wise maximum over the pod's init container
+	// requests. Init containers run to completion one at a time, so they never
+	// stack: the pod's effective request is max(InitRequests, sum of
+	// Containers' requests) per dimension. Zero value = no init containers.
+	// Fargate sizes (and bills) a pod from exactly that maximum.
+	InitRequests Resources `json:"initRequests,omitempty"`
+	// ProvisionedCapacity is the billed capacity AWS stamped on a Fargate pod
+	// via the CapacityProvisioned annotation (e.g. "0.25vCPU 0.5GB"). It is
+	// ground truth for what the pod costs and outranks any computed estimate.
+	// Zero value = not a Fargate pod, or the annotation was absent.
+	ProvisionedCapacity Resources `json:"provisionedCapacity,omitempty"`
 
 	NodeSelector     map[string]string          `json:"nodeSelector,omitempty"`
 	RequiredAffinity []NodeSelectorTerm         `json:"requiredAffinity,omitempty"` // ORed terms
@@ -282,10 +293,35 @@ type NodeSpec struct {
 	Spot         bool    `json:"spot,omitempty"`
 	HourlyCost   float64 `json:"hourlyCost,omitempty"` // resolved cost, USD/h
 
-	// ManagedBy marks nodes whose lifecycle belongs to another autoscaler
-	// ("karpenter"). Kilter defers node surgery on such nodes by default and
-	// lets its rightsizing feed that autoscaler's consolidation instead.
+	// ManagedBy marks nodes whose lifecycle Kilter does not own:
+	// ManagedByKarpenter (another autoscaler consolidates them; Kilter's
+	// rightsizing feeds it) or ManagedByFargate (the "node" is a single-pod
+	// Fargate VM — there is nothing to pack, drain, or delete).
 	ManagedBy string `json:"managedBy,omitempty"`
+}
+
+// Values for NodeSpec.ManagedBy.
+const (
+	ManagedByKarpenter = "karpenter"
+	ManagedByFargate   = "fargate"
+)
+
+// LabelComputeType is the EKS node label naming the compute engine behind a
+// node; the value "fargate" marks a Fargate single-pod VM.
+const LabelComputeType = "eks.amazonaws.com/compute-type"
+
+// IsFargate reports whether the node is a Fargate single-pod VM rather than a
+// real, shareable machine. Such a "node" hosts exactly one pod, is billed by
+// quantized pod configuration rather than by node shape, and must never enter
+// bin-packing, consolidation, or node pricing.
+//
+// The label is checked as well as ManagedBy so a snapshot taken by an older
+// collector — which never set ManagedBy — is still classified correctly.
+func (n *NodeSpec) IsFargate() bool {
+	if n == nil {
+		return false
+	}
+	return n.ManagedBy == ManagedByFargate || n.Labels[LabelComputeType] == ManagedByFargate
 }
 
 // Usage is a point-in-time measured usage sample for a container.
