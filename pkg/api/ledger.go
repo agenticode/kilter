@@ -1,6 +1,7 @@
 package api
 
 import (
+	"fmt"
 	"net/http"
 	"sort"
 	"sync"
@@ -29,6 +30,23 @@ type LedgerEntry struct {
 	Done    int                  `json:"done"`
 	Failed  int                  `json:"failed"`
 	Aborted bool                 `json:"aborted,omitempty"`
+}
+
+// validate rejects entries that would corrupt the audit record or the
+// realized-savings math. Mode is checked strictly because report() filters on
+// the exact string "apply": a misspelled mode would otherwise be silently
+// excluded from realized savings instead of loudly rejected.
+func (e *LedgerEntry) validate() error {
+	if e.Mode != "dry-run" && e.Mode != "apply" {
+		return fmt.Errorf("mode must be %q or %q, got %q", "dry-run", "apply", e.Mode)
+	}
+	if e.Done < 0 || e.Failed < 0 {
+		return fmt.Errorf("step counters must be non-negative (done=%d failed=%d)", e.Done, e.Failed)
+	}
+	if e.CostBeforeHourlyUSD < 0 || e.ProjectedHourlyUSD < 0 {
+		return fmt.Errorf("hourly costs must be non-negative (before=%v projected=%v)", e.CostBeforeHourlyUSD, e.ProjectedHourlyUSD)
+	}
+	return nil
 }
 
 // CostPoint is one observation of the cluster's priced hourly cost.
@@ -84,7 +102,7 @@ func (l *ledgerState) report() LedgerReport {
 	rep := LedgerReport{
 		Entries:      append([]LedgerEntry(nil), l.entries...),
 		CostTimeline: append([]CostPoint(nil), l.costHist...),
-		Method:       "realized = (measured hourly cost before first applied action − latest measured hourly cost) × 730",
+		Method:       "realized = (measured hourly cost before first applied action − latest measured hourly cost) × 730; 0 until a measurement taken after that action exists",
 	}
 	sort.Slice(rep.Entries, func(i, j int) bool { return rep.Entries[i].At.After(rep.Entries[j].At) })
 	var firstApply *LedgerEntry
@@ -93,9 +111,21 @@ func (l *ledgerState) report() LedgerReport {
 			firstApply = &l.entries[i]
 		}
 	}
-	if firstApply != nil && len(l.costHist) > 0 {
-		latest := l.costHist[len(l.costHist)-1]
-		rep.RealizedMonthlyUSD = (firstApply.CostBeforeHourlyUSD - latest.HourlyUSD) * pricing.HoursPerMonth
+	if firstApply != nil {
+		// "Latest" is by measurement timestamp, not append order, so replayed
+		// or out-of-order snapshots can't roll the comparison point backwards.
+		// A measurement from before the action says nothing about its effect:
+		// until one taken at/after the action arrives, realized stays 0
+		// rather than passing off pre-action cost as an outcome.
+		var latest *CostPoint
+		for i := range l.costHist {
+			if latest == nil || l.costHist[i].At.After(latest.At) {
+				latest = &l.costHist[i]
+			}
+		}
+		if latest != nil && !latest.At.Before(firstApply.At) {
+			rep.RealizedMonthlyUSD = (firstApply.CostBeforeHourlyUSD - latest.HourlyUSD) * pricing.HoursPerMonth
+		}
 	}
 	return rep
 }
@@ -133,6 +163,13 @@ type approvalState struct {
 func (a *approvalState) approve(fp string, now time.Time) Approval {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	// Purge expired approvals here too, not just on reads: a writer that
+	// approves ever-changing fingerprints must not grow the map unbounded.
+	for f, ap := range a.byF {
+		if now.After(ap.ExpiresAt) {
+			delete(a.byF, f)
+		}
+	}
 	ap := Approval{Fingerprint: fp, ApprovedAt: now, ExpiresAt: now.Add(approvalTTL)}
 	a.byF[fp] = ap
 	return ap
@@ -185,6 +222,10 @@ func (b *Brain) registerTrustRoutes(mux *http.ServeMux) {
 		if err := decodeBody(w, r, b.cfg.MaxBodyBytes, &e); err != nil {
 			return
 		}
+		if err := e.validate(); err != nil {
+			writeErr(w, http.StatusBadRequest, err)
+			return
+		}
 		e.Cluster = r.PathValue("id")
 		if e.At.IsZero() {
 			e.At = time.Now().UTC()
@@ -207,7 +248,9 @@ func (b *Brain) registerTrustRoutes(mux *http.ServeMux) {
 		if err := decodeBody(w, r, 1<<20, &req); err != nil {
 			return
 		}
-		if len(req.Fingerprint) < 8 {
+		// Plan fingerprints are 16 hex chars today; 8–128 leaves room for
+		// longer hashes while keeping junk out of the approval map.
+		if len(req.Fingerprint) < 8 || len(req.Fingerprint) > 128 {
 			writeErr(w, http.StatusBadRequest, errBadFingerprint)
 			return
 		}
@@ -230,6 +273,6 @@ var errBadFingerprint = &fingerprintErr{}
 
 type fingerprintErr struct{}
 
-func (*fingerprintErr) Error() string { return "fingerprint must be at least 8 characters" }
+func (*fingerprintErr) Error() string { return "fingerprint must be 8 to 128 characters" }
 
 var _ = model.Insight{} // keep import stable across edits
