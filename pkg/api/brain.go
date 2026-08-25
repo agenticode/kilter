@@ -7,12 +7,14 @@ package api
 import (
 	"compress/gzip"
 	"context"
+	"crypto/subtle"
 	"embed"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sort"
 	"sync"
 	"time"
 
@@ -191,6 +193,11 @@ func (b *Brain) Ingest(snap *model.ClusterSnapshot) error {
 	if snap == nil || snap.ClusterID == "" {
 		return errors.New("snapshot must carry a clusterID")
 	}
+	if snap.Timestamp.IsZero() {
+		// A zero timestamp would put a year-1 point on the cost timeline and
+		// permanently stall the demand tracker's cadence estimate.
+		snap.Timestamp = time.Now().UTC()
+	}
 	start := time.Now()
 	r, err := b.recommenderFor(snap.ClusterID)
 	if err != nil {
@@ -243,6 +250,13 @@ func (b *Brain) Recommendations(cluster string) ([]recommend.Recommendation, err
 	if snap == nil {
 		return nil, fmt.Errorf("unknown cluster %q", cluster)
 	}
+	return b.recommendationsFor(cluster, snap)
+}
+
+// recommendationsFor computes recommendations against a specific snapshot so
+// callers needing snapshot/recommendation coherence (Plan) never mix two
+// snapshots when a concurrent ingest lands between reads.
+func (b *Brain) recommendationsFor(cluster string, snap *model.ClusterSnapshot) ([]recommend.Recommendation, error) {
 	r, err := b.recommenderFor(cluster)
 	if err != nil {
 		return nil, err
@@ -252,13 +266,14 @@ func (b *Brain) Recommendations(cluster string) ([]recommend.Recommendation, err
 	return recs, nil
 }
 
-// Plan builds a fresh plan for a cluster and records it.
+// Plan builds a fresh plan for a cluster and records it. The plan and its
+// recommendations are derived from the same snapshot.
 func (b *Brain) Plan(cluster string) (*plan.Plan, error) {
 	snap := b.snapshotFor(cluster)
 	if snap == nil {
 		return nil, fmt.Errorf("unknown cluster %q", cluster)
 	}
-	recs, err := b.Recommendations(cluster)
+	recs, err := b.recommendationsFor(cluster, snap)
 	if err != nil {
 		return nil, err
 	}
@@ -309,7 +324,7 @@ func (b *Brain) Insights(ctx context.Context, cluster string) ([]model.Insight, 
 	return out, nil
 }
 
-// Clusters lists known cluster ids.
+// Clusters lists known cluster ids, sorted for deterministic API output.
 func (b *Brain) Clusters() []string {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
@@ -317,6 +332,7 @@ func (b *Brain) Clusters() []string {
 	for c := range b.lastSnap {
 		out = append(out, c)
 	}
+	sort.Strings(out)
 	return out
 }
 
@@ -399,8 +415,8 @@ func (b *Brain) authz(next http.HandlerFunc, write bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if b.cfg.Token != "" {
 			got := r.Header.Get("Authorization")
-			ok := got == "Bearer "+b.cfg.Token ||
-				(!write && b.cfg.ReadToken != "" && got == "Bearer "+b.cfg.ReadToken)
+			ok := bearerEqual(got, b.cfg.Token) ||
+				(!write && b.cfg.ReadToken != "" && bearerEqual(got, b.cfg.ReadToken))
 			if !ok {
 				writeErr(w, http.StatusUnauthorized, errors.New("invalid or missing token"))
 				return
@@ -408,6 +424,12 @@ func (b *Brain) authz(next http.HandlerFunc, write bool) http.HandlerFunc {
 		}
 		next(w, r)
 	}
+}
+
+// bearerEqual compares an Authorization header against "Bearer <token>" in
+// constant time so the match position can't be recovered by timing probes.
+func bearerEqual(header, token string) bool {
+	return subtle.ConstantTimeCompare([]byte(header), []byte("Bearer "+token)) == 1
 }
 
 func (b *Brain) handleIngest(w http.ResponseWriter, r *http.Request) {
@@ -425,7 +447,7 @@ func (b *Brain) handleIngest(w http.ResponseWriter, r *http.Request) {
 	var snap model.ClusterSnapshot
 	dec := json.NewDecoder(reader)
 	if err := dec.Decode(&snap); err != nil {
-		writeErr(w, http.StatusBadRequest, fmt.Errorf("decode snapshot: %w", err))
+		writeErr(w, decodeStatus(err), fmt.Errorf("decode snapshot: %w", err))
 		return
 	}
 	if err := b.Ingest(&snap); err != nil {
@@ -444,10 +466,20 @@ func (readCloser) Close() error { return nil }
 func decodeBody(w http.ResponseWriter, r *http.Request, maxBytes int64, out any) error {
 	body := http.MaxBytesReader(w, r.Body, maxBytes)
 	if err := json.NewDecoder(body).Decode(out); err != nil {
-		writeErr(w, http.StatusBadRequest, fmt.Errorf("decode body: %w", err))
+		writeErr(w, decodeStatus(err), fmt.Errorf("decode body: %w", err))
 		return err
 	}
 	return nil
+}
+
+// decodeStatus distinguishes "your body is too big" (413) from "your JSON is
+// broken" (400) so clients don't debug the wrong problem.
+func decodeStatus(err error) int {
+	var mbe *http.MaxBytesError
+	if errors.As(err, &mbe) {
+		return http.StatusRequestEntityTooLarge
+	}
+	return http.StatusBadRequest
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {

@@ -50,20 +50,27 @@ func (d *demandTracker) observe(snap *model.ClusterSnapshot) {
 	d.mem.Add(mem)
 	d.cpuHist = appendCapped(d.cpuHist, cpu, demandHistCap)
 	d.memHist = appendCapped(d.memHist, mem, demandHistCap)
-	if !d.lastAt.IsZero() {
-		gap := snap.Timestamp.Sub(d.lastAt)
-		if gap > 0 && gap < time.Hour {
-			if d.interval == 0 {
-				d.interval = gap
-			} else {
-				d.interval = (d.interval*4 + gap) / 5
+	// Only in-order snapshots advance the cadence clock: a replayed or
+	// out-of-order snapshot must not drag lastAt backwards, or the next
+	// in-order gap would be inflated and skew the interval EWMA.
+	if snap.Timestamp.After(d.lastAt) {
+		if !d.lastAt.IsZero() {
+			gap := snap.Timestamp.Sub(d.lastAt)
+			if gap < time.Hour {
+				if d.interval == 0 {
+					d.interval = gap
+				} else {
+					d.interval = (d.interval*4 + gap) / 5
+				}
 			}
 		}
+		d.lastAt = snap.Timestamp
 	}
-	d.lastAt = snap.Timestamp
 	d.points++
 }
 
+// appendCapped appends v and drops the oldest elements so len(s) never
+// exceeds cap_ (the newest cap_ values are always kept).
 func appendCapped(s []float64, v float64, cap_ int) []float64 {
 	s = append(s, v)
 	if len(s) > cap_ {
@@ -74,10 +81,17 @@ func appendCapped(s []float64, v float64, cap_ int) []float64 {
 
 // forecastPeak predicts the max demand over the horizon, preferring the
 // external forecaster when configured and healthy.
+//
+// Invariant: d.mu is never held across the remote forecaster's HTTP calls.
+// observe() (the snapshot-ingest path) takes the same mutex, so blocking on
+// the network here would stall ingestion for the whole cluster for up to the
+// remote client's timeout. History is copied under the lock instead — the
+// copies also keep the remote call from racing appendCapped's in-place
+// re-slicing of the backing arrays.
 func (d *demandTracker) forecastPeak(ctx context.Context, rf *forecast.RemoteForecaster, horizon time.Duration) (cpu, mem float64, ok bool) {
 	d.mu.Lock()
-	defer d.mu.Unlock()
 	if d.points < 10 || d.interval <= 0 {
+		d.mu.Unlock()
 		return 0, 0, false
 	}
 	steps := int(horizon / d.interval)
@@ -87,14 +101,24 @@ func (d *demandTracker) forecastPeak(ctx context.Context, rf *forecast.RemoteFor
 	if steps > 5000 {
 		steps = 5000
 	}
+	var cpuHist, memHist []float64
 	if rf != nil {
-		fc, err1 := rf.Forecast(ctx, d.cpuHist, steps)
-		fm, err2 := rf.Forecast(ctx, d.memHist, steps)
+		cpuHist = append([]float64(nil), d.cpuHist...)
+		memHist = append([]float64(nil), d.memHist...)
+	}
+	d.mu.Unlock()
+
+	if rf != nil {
+		fc, err1 := rf.Forecast(ctx, cpuHist, steps)
+		fm, err2 := rf.Forecast(ctx, memHist, steps)
 		if err1 == nil && err2 == nil {
 			return maxOf(fc), maxOf(fm), true
 		}
 		// fall through to built-in models on any remote failure
 	}
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	for h := 1; h <= steps; h++ {
 		if v := d.cpu.Forecast(h); v > cpu {
 			cpu = v
@@ -106,6 +130,8 @@ func (d *demandTracker) forecastPeak(ctx context.Context, rf *forecast.RemoteFor
 	return cpu, mem, d.cpu.Ready()
 }
 
+// maxOf returns the largest value in s, floored at 0: demand cannot be
+// negative, and an empty series yields 0 (which never trips a capacity check).
 func maxOf(s []float64) float64 {
 	m := 0.0
 	for _, v := range s {
