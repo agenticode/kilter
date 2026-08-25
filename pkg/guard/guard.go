@@ -12,6 +12,7 @@ package guard
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -26,8 +27,17 @@ const (
 )
 
 // ModeFor resolves a workload's effective mode: workload annotation beats
-// namespace annotation beats the given default.
+// namespace annotation beats the given default. Invalid or empty annotations
+// are ignored at each level; if the default is also invalid, ModeApply is
+// assumed. If the snapshot holds duplicate entries for ref, the first one
+// with a valid mode wins.
+//
+// A nil snapshot yields ModeRecommend: with no snapshot the annotations —
+// including any opt-outs — are invisible, so never act on the workload.
 func ModeFor(snap *model.ClusterSnapshot, ref model.WorkloadRef, def string) string {
+	if snap == nil {
+		return ModeRecommend
+	}
 	for _, w := range snap.Workloads {
 		if w.Ref == ref && validMode(w.Mode) {
 			return w.Mode
@@ -51,8 +61,11 @@ func validMode(m string) bool {
 // an empty window list means "always allowed".
 type Window struct {
 	Days  [7]bool // time.Weekday indexing (Sunday=0)
-	Start int     // minutes since midnight
-	End   int     // minutes; End <= Start means the window crosses midnight
+	Start int     // minutes since midnight, 0..1439 (inclusive bound)
+	// End in minutes since midnight, 0..1440 (24:00 == 1440, exclusive
+	// bound). End <= Start means the window crosses midnight into the next
+	// day; Start == End therefore means a full 24 h starting at Start.
+	End int
 }
 
 var dayNames = map[string]time.Weekday{
@@ -77,11 +90,19 @@ func ParseWindows(spec string) ([]Window, error) {
 		if err := parseDays(fields[0], &w); err != nil {
 			return nil, err
 		}
-		var sh, sm, eh, em int
-		if _, err := fmt.Sscanf(fields[1], "%d:%d-%d:%d", &sh, &sm, &eh, &em); err != nil {
+		lo, hi, ok := strings.Cut(fields[1], "-")
+		if !ok {
 			return nil, fmt.Errorf("guard: bad time range %q", fields[1])
 		}
-		if sh < 0 || sh > 23 || eh < 0 || eh > 24 || sm < 0 || sm > 59 || em < 0 || em > 59 {
+		sh, sm, ok1 := parseHHMM(lo)
+		eh, em, ok2 := parseHHMM(hi)
+		if !ok1 || !ok2 {
+			return nil, fmt.Errorf("guard: bad time range %q", fields[1])
+		}
+		// Start must stay strictly before end-of-day (0..23:59); the end may
+		// be 24:00 exactly, but never past it — a Window carries minutes in
+		// [0,1440] and InWindow relies on that.
+		if sh > 23 || sm > 59 || em > 59 || eh > 24 || (eh == 24 && em > 0) {
 			return nil, fmt.Errorf("guard: time out of range in %q", fields[1])
 		}
 		w.Start, w.End = sh*60+sm, eh*60+em
@@ -115,7 +136,39 @@ func parseDays(s string, w *Window) error {
 	return nil
 }
 
+// parseHHMM parses a strict "H:MM"-style clock time into hour and minute.
+// Only ASCII digits around a single colon are accepted — no signs, no
+// spaces, no trailing text. (fmt.Sscanf would silently accept "+2:00" and
+// ignore trailing garbage like "06:00:30", turning typos into wrong windows.)
+func parseHHMM(s string) (h, m int, ok bool) {
+	hs, ms, found := strings.Cut(s, ":")
+	if !found || !isDigits(hs) || !isDigits(ms) {
+		return 0, 0, false
+	}
+	var herr, merr error
+	h, herr = strconv.Atoi(hs)
+	m, merr = strconv.Atoi(ms)
+	if herr != nil || merr != nil { // overflow on absurd digit runs
+		return 0, 0, false
+	}
+	return h, m, true
+}
+
+func isDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 // InWindow reports whether t falls inside any window (empty list = always).
+// Times compare as wall clock in t's location: the caller chooses the
+// timezone the windows are written in by choosing t's location.
 func InWindow(windows []Window, t time.Time) bool {
 	if len(windows) == 0 {
 		return true
@@ -141,14 +194,22 @@ func InWindow(windows []Window, t time.Time) bool {
 
 // BreakerConfig tunes the automation circuit breaker.
 type BreakerConfig struct {
-	// MaxNotReadyFraction of nodes before tripping. Default 0.2.
+	// MaxNotReadyFraction is the highest tolerated fraction of NotReady
+	// nodes; strictly exceeding it trips the breaker. Zero, negative, and
+	// NaN all mean "use the default" (0.2); values >= 1 can never be
+	// exceeded and so disable the node-health check.
 	MaxNotReadyFraction float64
-	// MaxPendingPods before tripping (absolute). Default 10.
+	// MaxPendingPods is the highest tolerated number of Pending pods;
+	// strictly exceeding it trips the breaker. Values <= 0 mean "use the
+	// default" (10).
 	MaxPendingPods int
 }
 
 func (c BreakerConfig) withDefaults() BreakerConfig {
-	if c.MaxNotReadyFraction <= 0 {
+	// !(x > 0) rather than x <= 0: NaN fails every comparison, so a NaN
+	// fraction would otherwise slip through and silently disable the
+	// node-health check (ratio > NaN is always false).
+	if !(c.MaxNotReadyFraction > 0) {
 		c.MaxNotReadyFraction = 0.2
 	}
 	if c.MaxPendingPods <= 0 {
@@ -160,8 +221,17 @@ func (c BreakerConfig) withDefaults() BreakerConfig {
 // Breaker decides whether the cluster is healthy enough for automation.
 // Optimizing a struggling cluster is how incidents become outages: when the
 // breaker is open, Kilter observes and recommends but touches nothing.
+//
+// Degenerate snapshots fail safe: a nil snapshot or an empty node list means
+// collection failed or the cluster is gone, and either way there is nothing
+// Kilter should be touching, so the breaker opens. A freeze annotation
+// short-circuits with a single reason; other health signals are not evaluated
+// behind it.
 func Breaker(snap *model.ClusterSnapshot, cfg BreakerConfig) (open bool, reasons []string) {
 	cfg = cfg.withDefaults()
+	if snap == nil {
+		return true, []string{"no cluster snapshot"}
+	}
 	if snap.Frozen {
 		return true, []string{"cluster frozen via kilter.dev/freeze annotation on kube-system"}
 	}
@@ -172,7 +242,9 @@ func Breaker(snap *model.ClusterSnapshot, cfg BreakerConfig) (open bool, reasons
 			notReady++
 		}
 	}
-	if total > 0 && float64(notReady)/float64(total) > cfg.MaxNotReadyFraction {
+	if total == 0 {
+		reasons = append(reasons, "snapshot has no nodes")
+	} else if float64(notReady)/float64(total) > cfg.MaxNotReadyFraction {
 		reasons = append(reasons, fmt.Sprintf("%d/%d nodes NotReady", notReady, total))
 	}
 	pending := 0
