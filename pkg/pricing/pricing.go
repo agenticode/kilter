@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"sort"
 
@@ -27,7 +28,9 @@ var embeddedCatalog []byte
 const (
 	FallbackCPUHourlyUSD = 0.0330 // per vCPU-hour
 	FallbackGiBHourlyUSD = 0.0044 // per GiB-hour
-	HoursPerMonth        = 730
+	// HoursPerMonth converts hourly to monthly cost using the billing-average
+	// month (8760 h/year ÷ 12), the same convention cloud calculators use.
+	HoursPerMonth = 730
 )
 
 // InstanceType describes one purchasable node shape.
@@ -52,7 +55,9 @@ func (it InstanceType) Resources() model.Resources {
 	return model.Resources{MilliCPU: it.MilliCPU, MemoryBytes: it.MemoryBytes}
 }
 
-// Price returns the hourly price for the given lifecycle.
+// Price returns the hourly price for the given lifecycle. Asking for spot
+// when no positive spot price is known falls back to the on-demand price —
+// overstating cost rather than inventing a discount.
 func (it InstanceType) Price(spot bool) float64 {
 	if spot && it.SpotHourlyUSD > 0 {
 		return it.SpotHourlyUSD
@@ -71,7 +76,10 @@ type Catalog struct {
 	index     map[string]InstanceType // provider + "/" + name
 }
 
-// Load parses a catalog from JSON.
+// Load parses a catalog from JSON and validates every entry: positive shape
+// and on-demand price, non-negative spot price, a known architecture, and no
+// duplicate provider/name pairs. Catalog numbers feed decisions directly, so
+// bad data fails loudly here instead of silently skewing plans later.
 func Load(r io.Reader) (*Catalog, error) {
 	var f catalogFile
 	dec := json.NewDecoder(r)
@@ -87,11 +95,23 @@ func Load(r io.Reader) (*Catalog, error) {
 		if it.Name == "" || it.Provider == "" || it.MilliCPU <= 0 || it.MemoryBytes <= 0 || it.HourlyUSD <= 0 {
 			return nil, fmt.Errorf("pricing: invalid instance entry %q/%q", it.Provider, it.Name)
 		}
+		if it.SpotHourlyUSD < 0 {
+			return nil, fmt.Errorf("pricing: negative spot price for %q/%q", it.Provider, it.Name)
+		}
 		if it.Arch == "" {
 			it.Arch = "amd64"
 		}
+		if it.Arch != "amd64" && it.Arch != "arm64" {
+			return nil, fmt.Errorf("pricing: unknown arch %q for %q/%q (want amd64 or arm64)", it.Arch, it.Provider, it.Name)
+		}
+		key := it.Provider + "/" + it.Name
+		if _, dup := c.index[key]; dup {
+			// A duplicate would double-count in Candidates while Lookup sees
+			// only one of the two prices — reject rather than pick a winner.
+			return nil, fmt.Errorf("pricing: duplicate instance entry %q", key)
+		}
 		c.instances = append(c.instances, it)
-		c.index[it.Provider+"/"+it.Name] = it
+		c.index[key] = it
 	}
 	return c, nil
 }
@@ -123,6 +143,8 @@ func (c *Catalog) Lookup(provider, name string) (InstanceType, bool) {
 
 // Candidates returns instance types for a provider (all providers if empty),
 // optionally filtered by architecture, sorted by hourly price ascending.
+// Price ties break by (provider, name) so the ordering — and therefore any
+// plan derived from it — is reproducible regardless of catalog file order.
 func (c *Catalog) Candidates(provider, arch string) []InstanceType {
 	var out []InstanceType
 	for _, it := range c.instances {
@@ -134,7 +156,16 @@ func (c *Catalog) Candidates(provider, arch string) []InstanceType {
 		}
 		out = append(out, it)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].HourlyUSD < out[j].HourlyUSD })
+	sort.Slice(out, func(i, j int) bool {
+		a, b := out[i], out[j]
+		if a.HourlyUSD != b.HourlyUSD {
+			return a.HourlyUSD < b.HourlyUSD
+		}
+		if a.Provider != b.Provider {
+			return a.Provider < b.Provider
+		}
+		return a.Name < b.Name
+	})
 	return out
 }
 
@@ -150,9 +181,13 @@ const (
 	SourceFallback   CostSource = "fallback"
 )
 
-// NodeHourlyCost resolves one node's hourly price.
+// NodeHourlyCost resolves one node's hourly price via annotation → catalog →
+// fallback. The result is always finite and ≥ 0 for a Load-validated catalog:
+// a non-finite annotation is ignored (collectors guard this too, but snapshots
+// can be built by other paths) and garbage negative capacity clamps to zero
+// instead of pricing a node below free.
 func (c *Catalog) NodeHourlyCost(n *model.NodeSpec) (float64, CostSource) {
-	if n.HourlyCost > 0 {
+	if n.HourlyCost > 0 && !math.IsInf(n.HourlyCost, 1) {
 		return n.HourlyCost, SourceAnnotation
 	}
 	if n.InstanceType != "" {
@@ -160,8 +195,8 @@ func (c *Catalog) NodeHourlyCost(n *model.NodeSpec) (float64, CostSource) {
 			return it.Price(n.Spot), SourceCatalog
 		}
 	}
-	cpu := float64(n.Capacity.MilliCPU) / 1000 * FallbackCPUHourlyUSD
-	mem := float64(n.Capacity.MemoryBytes) / (1 << 30) * FallbackGiBHourlyUSD
+	cpu := float64(max(n.Capacity.MilliCPU, 0)) / 1000 * FallbackCPUHourlyUSD
+	mem := float64(max(n.Capacity.MemoryBytes, 0)) / (1 << 30) * FallbackGiBHourlyUSD
 	cost := cpu + mem
 	if n.Spot {
 		cost *= 0.35 // typical spot discount
@@ -185,9 +220,13 @@ type ClusterCost struct {
 	Nodes      []NodeCost `json:"nodes"`
 }
 
-// SnapshotCost prices every node in the snapshot.
+// SnapshotCost prices every node in the snapshot. A nil snapshot prices as an
+// empty cluster. Invariant: HourlyUSD equals the sum of the per-node entries.
 func (c *Catalog) SnapshotCost(snap *model.ClusterSnapshot) ClusterCost {
 	out := ClusterCost{}
+	if snap == nil {
+		return out
+	}
 	for i := range snap.Nodes {
 		n := &snap.Nodes[i]
 		h, src := c.NodeHourlyCost(n)
