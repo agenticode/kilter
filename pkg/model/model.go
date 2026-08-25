@@ -6,6 +6,7 @@ package model
 
 import (
 	"fmt"
+	"math"
 	"time"
 )
 
@@ -16,12 +17,45 @@ type Resources struct {
 	MemoryBytes int64 `json:"memoryBytes"`
 }
 
-func (r Resources) Add(o Resources) Resources {
-	return Resources{r.MilliCPU + o.MilliCPU, r.MemoryBytes + o.MemoryBytes}
+// satAdd64 returns a+b clamped to the int64 range instead of wrapping.
+func satAdd64(a, b int64) int64 {
+	s := a + b
+	if a > 0 && b > 0 && s < 0 {
+		return math.MaxInt64
+	}
+	if a < 0 && b < 0 && s >= 0 {
+		return math.MinInt64
+	}
+	return s
 }
 
+// satSub64 returns a-b clamped to the int64 range instead of wrapping.
+func satSub64(a, b int64) int64 {
+	d := a - b
+	if a >= 0 && b < 0 && d < 0 {
+		return math.MaxInt64
+	}
+	if a < 0 && b > 0 && d >= 0 {
+		return math.MinInt64
+	}
+	return d
+}
+
+// Add returns the element-wise sum, saturating at the int64 bounds instead of
+// wrapping. Wraparound is the dangerous failure here: a garbage snapshot whose
+// requests sum past MaxInt64 would flip negative, and downstream accounting
+// clamps negative requests to zero — minting free capacity out of an absurdly
+// large pod. A saturated sum stays absurdly large and fails Fits everywhere,
+// which is the safe direction.
+func (r Resources) Add(o Resources) Resources {
+	return Resources{satAdd64(r.MilliCPU, o.MilliCPU), satAdd64(r.MemoryBytes, o.MemoryBytes)}
+}
+
+// Sub returns the element-wise difference, saturating at the int64 bounds
+// instead of wrapping. Negative results are legitimate (overcommit shows up as
+// negative Free); only wraparound is forbidden, for the same reason as Add.
 func (r Resources) Sub(o Resources) Resources {
-	return Resources{r.MilliCPU - o.MilliCPU, r.MemoryBytes - o.MemoryBytes}
+	return Resources{satSub64(r.MilliCPU, o.MilliCPU), satSub64(r.MemoryBytes, o.MemoryBytes)}
 }
 
 // Fits reports whether o fits inside r (both dimensions).
@@ -44,6 +78,8 @@ func (r Resources) Max(o Resources) Resources {
 	return out
 }
 
+// String renders as "<milliCPU>m/<MiB>Mi" for logs; memory truncates toward
+// zero, so sub-MiB amounts print as 0Mi.
 func (r Resources) String() string {
 	return fmt.Sprintf("%dm/%dMi", r.MilliCPU, r.MemoryBytes/(1<<20))
 }
@@ -61,23 +97,28 @@ const (
 	KindBarePod     WorkloadKind = "Pod"
 )
 
-// WorkloadRef identifies a workload (controller) in a cluster.
+// WorkloadRef identifies a workload (controller) in a cluster. It is used as
+// a map key across the decision engine, so it must stay comparable — never
+// add slice or map fields.
 type WorkloadRef struct {
 	Kind      WorkloadKind `json:"kind"`
 	Namespace string       `json:"namespace"`
 	Name      string       `json:"name"`
 }
 
+// String renders as "Kind/namespace/name".
 func (w WorkloadRef) String() string {
 	return fmt.Sprintf("%s/%s/%s", w.Kind, w.Namespace, w.Name)
 }
 
-// ContainerKey identifies a container template within a workload.
+// ContainerKey identifies a container template within a workload. Like
+// WorkloadRef it serves as a map key, so it must stay comparable.
 type ContainerKey struct {
 	Workload  WorkloadRef `json:"workload"`
 	Container string      `json:"container"`
 }
 
+// String renders as "Kind/namespace/name/container".
 func (c ContainerKey) String() string {
 	return c.Workload.String() + "/" + c.Container
 }
@@ -179,7 +220,9 @@ func (p *PodSpec) Requests() Resources {
 	return sum
 }
 
-// ExtendedRequests sums non-core resource requests across containers.
+// ExtendedRequests sums non-core resource requests across containers,
+// saturating at the int64 bounds (see Add for why wraparound is dangerous).
+// Returns nil when no container declares extended resources.
 func (p *PodSpec) ExtendedRequests() map[string]int64 {
 	var out map[string]int64
 	for _, c := range p.Containers {
@@ -187,13 +230,16 @@ func (p *PodSpec) ExtendedRequests() map[string]int64 {
 			if out == nil {
 				out = map[string]int64{}
 			}
-			out[k] += v
+			out[k] = satAdd64(out[k], v)
 		}
 	}
 	return out
 }
 
-// Limits sums container limits (0 means unlimited for that dimension).
+// Limits sums container limits. A zero limit means unlimited for that
+// dimension, so the sum understates the pod: a single zero-limit container
+// makes the true pod-level cap unbounded even though the sum stays finite.
+// Callers enforcing a ceiling must check for zero-limit containers themselves.
 func (p *PodSpec) Limits() Resources {
 	var sum Resources
 	for _, c := range p.Containers {
@@ -268,7 +314,11 @@ type PDB struct {
 	CoveredPodUIDs []string `json:"coveredPodUIDs,omitempty"`
 }
 
-// Matches reports whether the PDB selector matches the given labels.
+// Matches reports whether the PDB selector matches the given labels. An empty
+// selector matches nothing — unlike the Kubernetes empty-selects-all rule —
+// so a zero-value PDB cannot freeze eviction for a whole namespace. Genuine
+// select-all PDBs are still honored: collectors express them through
+// CoveredPodUIDs, which Covers prefers over label matching.
 func (p *PDB) Matches(labels map[string]string) bool {
 	if len(p.Selector) == 0 {
 		return false
@@ -282,8 +332,13 @@ func (p *PDB) Matches(labels map[string]string) bool {
 }
 
 // Covers reports whether the PDB applies to the pod, preferring exact
-// collection-time coverage over label matching.
+// collection-time coverage over label matching. An empty CoveredPodUIDs is
+// indistinguishable from "collector didn't fill it", so it falls back to
+// Selector, which errs toward covering. A nil receiver or pod never covers.
 func (p *PDB) Covers(pod *PodSpec) bool {
+	if p == nil || pod == nil {
+		return false
+	}
 	if pod.Namespace != p.Namespace {
 		return false
 	}
@@ -351,7 +406,9 @@ type ClusterSnapshot struct {
 	Frozen bool `json:"frozen,omitempty"`
 }
 
-// NodesByName indexes nodes.
+// NodesByName indexes nodes by name. Values point into s.Nodes, so mutations
+// through the map are visible in the snapshot. Duplicate names keep the last
+// entry.
 func (s *ClusterSnapshot) NodesByName() map[string]*NodeSpec {
 	m := make(map[string]*NodeSpec, len(s.Nodes))
 	for i := range s.Nodes {
@@ -360,8 +417,14 @@ func (s *ClusterSnapshot) NodesByName() map[string]*NodeSpec {
 	return m
 }
 
-// PodsOnNode returns pods assigned to the given node.
+// PodsOnNode returns pods assigned to the given node. An empty node name
+// returns nil rather than the unscheduled pods that carry an empty NodeName:
+// no real node is named "", and counting pending pods as running on one would
+// silently inflate a caller's utilization math.
 func (s *ClusterSnapshot) PodsOnNode(node string) []*PodSpec {
+	if node == "" {
+		return nil
+	}
 	var out []*PodSpec
 	for i := range s.Pods {
 		if s.Pods[i].NodeName == node {
