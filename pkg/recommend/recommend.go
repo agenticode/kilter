@@ -66,7 +66,35 @@ func (c Config) validate() error {
 	if c.MinChangeRatio < 0 || c.MinChangeRatio >= 1 {
 		return fmt.Errorf("recommend: MinChangeRatio out of [0,1)")
 	}
+	// MinSamples/MinWindow gate every recommendation AND divide the confidence
+	// score; zero would let empty histograms recommend (target = bare floors,
+	// i.e. shrink-to-nothing) and turn confidence into NaN. Require positive.
+	if c.MinSamples < 1 {
+		return fmt.Errorf("recommend: MinSamples must be >= 1")
+	}
+	if c.MinWindow <= 0 {
+		return fmt.Errorf("recommend: MinWindow must be > 0")
+	}
+	if c.MinMilliCPU < 0 || c.MinMemoryBytes < 0 {
+		return fmt.Errorf("recommend: request floors must be >= 0")
+	}
 	return nil
+}
+
+// ceilInt64 converts a float to int64 rounding up, clamping to [0, MaxInt64].
+// Converting an out-of-range float64 to int64 is implementation-specific in Go
+// (arm64 saturates, amd64 wraps to MinInt64) — without the clamp a huge OOM
+// bump or limit ratio could silently become a negative floor on amd64.
+func ceilInt64(f float64) int64 {
+	f = math.Ceil(f)
+	if math.IsNaN(f) || f <= 0 {
+		return 0
+	}
+	// float64(MaxInt64) rounds to exactly 2^63; anything >= it overflows.
+	if f >= math.MaxInt64 {
+		return math.MaxInt64
+	}
+	return int64(f)
 }
 
 // containerState is the learned memory for one container key (aggregated
@@ -143,8 +171,13 @@ func newState() *containerState {
 	}
 }
 
-// ObserveSnapshot ingests usage samples and OOM/restart signals.
+// ObserveSnapshot ingests usage samples and OOM/restart signals. Garbage
+// samples (negative usage, zero timestamp) are dropped rather than clamped —
+// see the guards below for why. A nil snapshot is a no-op.
 func (r *Recommender) ObserveSnapshot(snap *model.ClusterSnapshot) {
+	if snap == nil {
+		return
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -160,6 +193,9 @@ func (r *Recommender) ObserveSnapshot(snap *model.ClusterSnapshot) {
 				st = newState()
 				r.states[key] = st
 			}
+			// First sight of a pod only seeds the restart baseline: a count
+			// that was already non-zero before we watched is history we cannot
+			// attribute to a fresh OOM, so it must not bump the floor.
 			prev, seen := st.podRestarts[pod.UID]
 			if seen && c.RestartCount > prev && c.LastOOMKilled {
 				st.oomCount++
@@ -171,7 +207,7 @@ func (r *Recommender) ObserveSnapshot(snap *model.ClusterSnapshot) {
 					oomedAt = c.Requests.MemoryBytes
 				}
 				if oomedAt > 0 {
-					bumped := int64(float64(oomedAt) * r.cfg.OOMBumpRatio)
+					bumped := ceilInt64(float64(oomedAt) * r.cfg.OOMBumpRatio)
 					if bumped > st.oomFloorBytes {
 						st.oomFloorBytes = bumped
 					}
@@ -182,6 +218,14 @@ func (r *Recommender) ObserveSnapshot(snap *model.ClusterSnapshot) {
 	}
 
 	for _, u := range snap.Usage {
+		// Garbage guards. Negative usage clamped to zero would drag
+		// percentiles down (an unsafe shrink from broken telemetry); a
+		// zero timestamp would anchor firstSample at year 1, blowing the
+		// observation window open and inflating confidence. Skip entirely —
+		// a collector emitting either is broken, not reporting low usage.
+		if u.MilliCPU < 0 || u.MemoryBytes < 0 || u.Timestamp.IsZero() {
+			continue
+		}
 		st := r.states[u.Key]
 		if st == nil {
 			st = newState()
@@ -190,6 +234,11 @@ func (r *Recommender) ObserveSnapshot(snap *model.ClusterSnapshot) {
 		w := 1.0
 		if u.WindowSeconds > 60 {
 			w = float64(u.WindowSeconds) / 60.0
+			// Cap at one hour's worth so a single mis-reported averaging
+			// window cannot dominate the whole learned distribution.
+			if w > 60 {
+				w = 60
+			}
 		}
 		st.cpu.AddSample(float64(u.MilliCPU), w, u.Timestamp)
 		st.mem.AddSample(float64(u.MemoryBytes), w, u.Timestamp)
@@ -206,13 +255,12 @@ func (r *Recommender) ObserveSnapshot(snap *model.ClusterSnapshot) {
 	}
 
 	// Prune restart bookkeeping for pods that no longer exist.
-	for key, st := range r.states {
+	for _, st := range r.states {
 		for uid := range st.podRestarts {
 			if !livePods[uid] {
 				delete(st.podRestarts, uid)
 			}
 		}
-		_ = key
 	}
 }
 
@@ -230,7 +278,11 @@ func hpaCPUWorkloads(snap *model.ClusterSnapshot) map[model.WorkloadRef]string {
 
 // Recommendations computes sizing decisions for every container currently
 // present in the snapshot. Containers without enough history return no entry.
+// A nil snapshot returns nil.
 func (r *Recommender) Recommendations(snap *model.ClusterSnapshot) []Recommendation {
+	if snap == nil {
+		return nil
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -288,18 +340,18 @@ func (r *Recommender) recommendOne(key model.ContainerKey, st *containerState,
 	}
 	pol := patterns.PolicyFor(class, r.cfg.CPUPercentile, r.cfg.CPUHeadroom, r.cfg.MemoryHeadroom)
 
-	targetCPU := int64(math.Ceil(st.cpu.Percentile(pol.CPUPercentile) * pol.CPUHeadroom))
+	targetCPU := ceilInt64(st.cpu.Percentile(pol.CPUPercentile) * pol.CPUHeadroom)
 	if targetCPU < r.cfg.MinMilliCPU {
 		targetCPU = r.cfg.MinMilliCPU
 	}
 
 	memP := st.mem.Percentile(r.cfg.MemoryPercentile) * pol.MemoryHeadroom
 	memPeak := st.mem.Max()
-	targetMem := int64(math.Ceil(math.Max(memP, memPeak)))
+	targetMem := ceilInt64(math.Max(memP, memPeak))
 	// Predictive sizing for up-trending memory: cover the next day of growth
 	// so the workload does not walk into its own ceiling.
 	if _, mf := st.memDet.Analyze(); mf.TrendPerDay > 0.05 {
-		projected := int64(memPeak * (1 + math.Min(mf.TrendPerDay, 1.0)))
+		projected := ceilInt64(memPeak * (1 + math.Min(mf.TrendPerDay, 1.0)))
 		if projected > targetMem {
 			targetMem = projected
 		}
@@ -327,17 +379,35 @@ func (r *Recommender) recommendOne(key model.ContainerKey, st *containerState,
 
 	// Limits policy: preserve the container's limit:request ratio per dimension.
 	// No limit stays no limit. Guaranteed (limit==request) stays Guaranteed.
+	// A limit with no request (ratio undefined) is carried forward unchanged
+	// rather than dropped — silently removing a limit changes QoS class and
+	// node-pressure OOM behavior. Invariant: an emitted limit is never below
+	// the emitted request (the API server rejects such a spec).
 	targetLim := model.Resources{}
-	if curLim.MilliCPU > 0 && curReq.MilliCPU > 0 {
-		ratio := float64(curLim.MilliCPU) / float64(curReq.MilliCPU)
-		targetLim.MilliCPU = int64(math.Ceil(float64(target.MilliCPU) * ratio))
+	if curLim.MilliCPU > 0 {
+		if curReq.MilliCPU > 0 {
+			ratio := float64(curLim.MilliCPU) / float64(curReq.MilliCPU)
+			targetLim.MilliCPU = ceilInt64(float64(target.MilliCPU) * ratio)
+		} else {
+			targetLim.MilliCPU = curLim.MilliCPU
+		}
+		if targetLim.MilliCPU < target.MilliCPU {
+			targetLim.MilliCPU = target.MilliCPU
+		}
 	}
-	if curLim.MemoryBytes > 0 && curReq.MemoryBytes > 0 {
-		ratio := float64(curLim.MemoryBytes) / float64(curReq.MemoryBytes)
-		targetLim.MemoryBytes = int64(math.Ceil(float64(target.MemoryBytes) * ratio))
-		// Memory limit must never sit below the OOM floor.
+	if curLim.MemoryBytes > 0 {
+		if curReq.MemoryBytes > 0 {
+			ratio := float64(curLim.MemoryBytes) / float64(curReq.MemoryBytes)
+			targetLim.MemoryBytes = ceilInt64(float64(target.MemoryBytes) * ratio)
+		} else {
+			targetLim.MemoryBytes = curLim.MemoryBytes
+		}
+		// Memory limit must never sit below the OOM floor or the new request.
 		if st.oomFloorBytes > 0 && targetLim.MemoryBytes < st.oomFloorBytes {
 			targetLim.MemoryBytes = st.oomFloorBytes
+		}
+		if targetLim.MemoryBytes < target.MemoryBytes {
+			targetLim.MemoryBytes = target.MemoryBytes
 		}
 	}
 
@@ -451,6 +521,15 @@ func (r *Recommender) Restore(states []CheckpointState) (restored int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for _, cs := range states {
+		// Self-inconsistent scalar state is corrupt: negative counters or a
+		// backwards/one-sided time range would inflate the observation window
+		// and with it the confidence score — acting confidently on corrupt
+		// state is exactly what a checkpoint must not cause.
+		if cs.Samples < 0 || cs.OOMCount < 0 || cs.OOMFloor < 0 ||
+			cs.LastSample.Before(cs.FirstSample) ||
+			cs.FirstSample.IsZero() != cs.LastSample.IsZero() {
+			continue
+		}
 		cpu, err := histogram.FromCheckpoint(cs.CPU)
 		if err != nil {
 			continue
