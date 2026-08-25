@@ -5,12 +5,17 @@ import (
 	"sort"
 
 	"github.com/agenticode/kilter/pkg/model"
+	"github.com/agenticode/kilter/pkg/patterns"
 )
 
 // Insights runs the detection layer over current state: predictive findings
 // derived from learned distributions and trends, each with its evidence.
 // This is read-only — insights inform operators and future plans.
+// A nil snapshot returns nil.
 func (r *Recommender) Insights(snap *model.ClusterSnapshot) []model.Insight {
+	if snap == nil {
+		return nil
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -81,7 +86,7 @@ func (r *Recommender) Insights(snap *model.ClusterSnapshot) []model.Insight {
 
 		// Behavior signal: sustained growth is worth knowing about even
 		// before it threatens a limit.
-		if class, cf := st.cpuDet.Analyze(); class == "growing" {
+		if class, cf := st.cpuDet.Analyze(); class == patterns.ClassGrowing {
 			out = append(out, model.Insight{
 				Kind: "growth-trend", Severity: "info",
 				Workload: key.Workload, Container: key.Container,
