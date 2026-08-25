@@ -20,6 +20,7 @@ import (
 	"strings"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -86,25 +87,43 @@ type Actuator struct {
 	client kubernetes.Interface
 	cfg    Config
 	budget *safety.Budget
+	// evictBackoff is the base delay between retries of a PDB-refused
+	// eviction: attempt n waits n×evictBackoff. Shortened only in tests.
+	evictBackoff time.Duration
 }
 
-// New builds an actuator.
+// New builds an actuator. An unset Mode defaults to dry-run; any other
+// unknown Mode is rejected rather than defaulted, because everything past
+// this constructor trusts Mode blindly — a typo'd mode must fail here, not
+// fall through the dry-run check and mutate a live cluster.
 func New(client kubernetes.Interface, cfg Config) (*Actuator, error) {
 	if client == nil {
 		return nil, fmt.Errorf("actuate: nil client")
 	}
 	cfg = cfg.withDefaults()
+	if cfg.Mode != ModeDryRun && cfg.Mode != ModeApply {
+		return nil, fmt.Errorf("actuate: unknown mode %q", cfg.Mode)
+	}
 	return &Actuator{
-		client: client,
-		cfg:    cfg,
-		budget: safety.NewBudget(cfg.MaxEvictionsPerHour, time.Hour),
+		client:       client,
+		cfg:          cfg,
+		budget:       safety.NewBudget(cfg.MaxEvictionsPerHour, time.Hour),
+		evictBackoff: 10 * time.Second,
 	}, nil
 }
+
+// Step outcome values recorded in StepStatus.Status.
+const (
+	StatusDone    = "done"    // step applied and confirmed
+	StatusDryRun  = "dry-run" // step previewed only (counted as done in Report)
+	StatusSkipped = "skipped" // step not applicable (unknown type)
+	StatusFailed  = "failed"  // step attempted and failed; Error is set
+)
 
 // StepStatus is the outcome of one executed step.
 type StepStatus struct {
 	Step   plan.Step `json:"step"`
-	Status string    `json:"status"` // done | dry-run | skipped | failed
+	Status string    `json:"status"` // one of the Status* constants
 	Error  string    `json:"error,omitempty"`
 }
 
@@ -114,10 +133,13 @@ type Report struct {
 	Started  time.Time    `json:"started"`
 	Finished time.Time    `json:"finished"`
 	Steps    []StepStatus `json:"steps"`
-	Done     int          `json:"done"`
-	Failed   int          `json:"failed"`
-	Skipped  int          `json:"skipped"`
-	// Aborted is set when a failure stopped the remaining steps.
+	// Done counts steps that succeeded — including dry-run previews, so a
+	// clean dry-run and a clean apply of the same plan report the same Done.
+	Done    int `json:"done"`
+	Failed  int `json:"failed"`
+	Skipped int `json:"skipped"`
+	// Aborted is set when a failure stopped the remaining steps; steps that
+	// never ran are absent from Steps.
 	Aborted bool `json:"aborted,omitempty"`
 }
 
@@ -129,6 +151,9 @@ type Report struct {
 func (a *Actuator) ExecutePlan(ctx context.Context, p *plan.Plan) *Report {
 	rep := &Report{Mode: a.cfg.Mode, Started: time.Now().UTC()}
 	defer func() { rep.Finished = time.Now().UTC() }()
+	if p == nil {
+		return rep
+	}
 
 	for _, s := range p.Steps {
 		if ctx.Err() != nil {
@@ -138,11 +163,11 @@ func (a *Actuator) ExecutePlan(ctx context.Context, p *plan.Plan) *Report {
 		st := a.execute(ctx, s)
 		rep.Steps = append(rep.Steps, st)
 		switch st.Status {
-		case "done", "dry-run":
+		case StatusDone, StatusDryRun:
 			rep.Done++
-		case "skipped":
+		case StatusSkipped:
 			rep.Skipped++
-		case "failed":
+		case StatusFailed:
 			rep.Failed++
 			if s.Type != plan.StepResizeWorkload && s.Type != plan.StepEvictPod {
 				// Cordon/delete failure: stop the whole plan.
@@ -158,9 +183,24 @@ func (a *Actuator) ExecutePlan(ctx context.Context, p *plan.Plan) *Report {
 
 func (a *Actuator) execute(ctx context.Context, s plan.Step) StepStatus {
 	log := a.cfg.Logger.With("step", s.Seq, "type", string(s.Type))
+	switch s.Type {
+	case plan.StepResizeWorkload, plan.StepCordonNode, plan.StepEvictPod, plan.StepDeleteNode:
+	default:
+		// Checked before the dry-run branch so both modes report the same
+		// thing: a step apply would skip must not preview as success.
+		return StepStatus{Step: s, Status: StatusSkipped, Error: "unknown step type"}
+	}
 	if a.cfg.Mode == ModeDryRun {
+		// Previews validate what they can without an API call, so garbage
+		// steps surface on the dry run rather than on apply day.
+		if s.Type == plan.StepResizeWorkload {
+			if err := validateResize(s.Container, s.ToReq, s.ToLim); err != nil {
+				log.Error("dry-run: invalid step", "err", err)
+				return StepStatus{Step: s, Status: StatusFailed, Error: err.Error()}
+			}
+		}
 		log.Info("dry-run", "detail", s.Detail)
-		return StepStatus{Step: s, Status: "dry-run"}
+		return StepStatus{Step: s, Status: StatusDryRun}
 	}
 	var err error
 	switch s.Type {
@@ -174,18 +214,19 @@ func (a *Actuator) execute(ctx context.Context, s plan.Step) StepStatus {
 		if err = a.WaitNodeEmpty(ctx, s.Node); err == nil {
 			err = a.DeleteNode(ctx, s.Node)
 		}
-	default:
-		return StepStatus{Step: s, Status: "skipped", Error: "unknown step type"}
 	}
 	if err != nil {
 		log.Error("step failed", "err", err)
-		return StepStatus{Step: s, Status: "failed", Error: err.Error()}
+		return StepStatus{Step: s, Status: StatusFailed, Error: err.Error()}
 	}
 	log.Info("step done", "detail", s.Detail)
-	return StepStatus{Step: s, Status: "done"}
+	return StepStatus{Step: s, Status: StatusDone}
 }
 
 // resourcesToK8s renders a model.Resources as a k8s resource map fragment.
+// Zero fields are omitted: under a strategic merge patch an absent key leaves
+// the workload's current value unchanged. Negative values are rejected by
+// validateResize before this is ever called.
 func resourcesToK8s(r model.Resources) map[string]string {
 	out := map[string]string{}
 	if r.MilliCPU > 0 {
@@ -197,9 +238,30 @@ func resourcesToK8s(r model.Resources) map[string]string {
 	return out
 }
 
+// validateResize rejects resize inputs that would otherwise fail in confusing
+// ways or, worse, succeed as a lie: a negative quantity would be silently
+// dropped from the patch and the no-op reported "done", and an empty container
+// name would strategic-merge-append a nameless broken container to the
+// template instead of updating an existing one.
+func validateResize(container string, req, lim model.Resources) error {
+	if container == "" {
+		return fmt.Errorf("resize: empty container name")
+	}
+	if req.MilliCPU < 0 || req.MemoryBytes < 0 || lim.MilliCPU < 0 || lim.MemoryBytes < 0 {
+		return fmt.Errorf("resize container %s: negative resources (req %s, lim %s)", container, req, lim)
+	}
+	return nil
+}
+
 // ResizeWorkload patches the controller's pod template with new requests and
 // limits for one container, then (optionally) resizes running pods in place.
+// Zero-valued fields of req/lim leave the corresponding current value
+// unchanged, so a fully-zero resize is a deliberate no-op (the undo path uses
+// this when the original workload had nothing set).
 func (a *Actuator) ResizeWorkload(ctx context.Context, ref model.WorkloadRef, container string, req, lim model.Resources) error {
+	if err := validateResize(container, req, lim); err != nil {
+		return err
+	}
 	patch := map[string]any{
 		"spec": map[string]any{
 			"template": map[string]any{
@@ -244,6 +306,8 @@ func (a *Actuator) ResizeWorkload(ctx context.Context, ref model.WorkloadRef, co
 func (a *Actuator) resizePodsInPlace(ctx context.Context, ref model.WorkloadRef, container string, req, lim model.Resources) {
 	pods, err := a.client.CoreV1().Pods(ref.Namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
+		a.cfg.Logger.Warn("in-place resize skipped: listing pods failed (rollout will converge)",
+			"workload", ref.String(), "err", err)
 		return
 	}
 	patch := map[string]any{
@@ -257,10 +321,15 @@ func (a *Actuator) resizePodsInPlace(ctx context.Context, ref model.WorkloadRef,
 			}},
 		},
 	}
-	raw, _ := json.Marshal(patch)
+	raw, err := json.Marshal(patch)
+	if err != nil {
+		a.cfg.Logger.Warn("in-place resize skipped: patch marshal failed (rollout will converge)",
+			"workload", ref.String(), "err", err)
+		return
+	}
 	for i := range pods.Items {
 		pod := &pods.Items[i]
-		if or := metav1.GetControllerOf(pod); or == nil || !ownedBy(pod, ref) {
+		if !ownedBy(pod, ref) {
 			continue
 		}
 		_, err := a.client.CoreV1().Pods(ref.Namespace).
@@ -272,8 +341,14 @@ func (a *Actuator) resizePodsInPlace(ctx context.Context, ref model.WorkloadRef,
 	}
 }
 
-// ownedBy loosely matches a pod to its workload through owner names: direct
-// owner for statefulsets, hash-suffixed ReplicaSet for deployments.
+// ownedBy matches a pod to its workload through owner names: direct owner for
+// statefulsets; for deployments the controller is a ReplicaSet named
+// <deployment>-<pod-template-hash>, so the pod's hash label reconstructs the
+// exact expected name. A bare name-prefix test is not enough: deployment "api"
+// must not claim pods of "api-gateway" (ReplicaSet "api-gateway-<hash>" has
+// the prefix "api-"), or an in-place resize would squeeze a sibling workload's
+// running pods. False negatives are safe here — the template rollout converges
+// any pod this skips.
 func ownedBy(pod *corev1.Pod, ref model.WorkloadRef) bool {
 	or := metav1.GetControllerOf(pod)
 	if or == nil || pod.Namespace != ref.Namespace {
@@ -283,7 +358,8 @@ func ownedBy(pod *corev1.Pod, ref model.WorkloadRef) bool {
 	case model.KindStatefulSet:
 		return or.Kind == "StatefulSet" && or.Name == ref.Name
 	case model.KindDeployment:
-		return or.Kind == "ReplicaSet" && strings.HasPrefix(or.Name, ref.Name+"-")
+		hash := pod.Labels[appsv1.DefaultDeploymentUniqueLabelKey]
+		return or.Kind == "ReplicaSet" && hash != "" && or.Name == ref.Name+"-"+hash
 	}
 	return false
 }
@@ -310,10 +386,12 @@ func (a *Actuator) Uncordon(ctx context.Context, node string) error {
 
 // EvictPod evicts "namespace/name" through the eviction API, honoring the
 // local sliding budget; the apiserver additionally enforces PDBs. A PDB
-// rejection (429) is retried a few times before giving up.
+// rejection (429) is retried a few times before giving up. The budget slot is
+// consumed per attempt sequence, even when the pod turns out to be already
+// gone — counting conservatively can only slow us down, never over-disrupt.
 func (a *Actuator) EvictPod(ctx context.Context, nsName string) error {
 	parts := strings.SplitN(nsName, "/", 2)
-	if len(parts) != 2 {
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
 		return fmt.Errorf("evict: bad pod ref %q", nsName)
 	}
 	ns, name := parts[0], parts[1]
@@ -327,7 +405,7 @@ func (a *Actuator) EvictPod(ctx context.Context, nsName string) error {
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
-			case <-time.After(time.Duration(attempt) * 10 * time.Second):
+			case <-time.After(time.Duration(attempt) * a.evictBackoff):
 			}
 		}
 		err := a.client.CoreV1().Pods(ns).EvictV1(ctx, ev)
@@ -388,9 +466,20 @@ func (a *Actuator) WaitNodeEmpty(ctx context.Context, node string) error {
 // the backing instance so the freed capacity stops billing. Provider failure
 // is a step failure: capacity accounting must never be assumed.
 func (a *Actuator) DeleteNode(ctx context.Context, node string) error {
+	// The Node object is the only record of the providerID. With a real
+	// provider, a transient read failure must fail the step BEFORE the
+	// delete: deleting first would orphan the instance — no ID left to
+	// terminate it with, billing forever — while failing here just retries
+	// the whole (idempotent) step on the next reconcile.
 	providerID := ""
-	if n, err := a.client.CoreV1().Nodes().Get(ctx, node, metav1.GetOptions{}); err == nil {
+	switch n, err := a.client.CoreV1().Nodes().Get(ctx, node, metav1.GetOptions{}); {
+	case err == nil:
 		providerID = n.Spec.ProviderID
+	case apierrors.IsNotFound(err):
+		// Already deleted by someone else; proceed so the provider call
+		// still runs — termination is confirmed, never assumed.
+	case a.cfg.Provider.Name() != "none":
+		return fmt.Errorf("delete node %s: reading providerID before delete: %w", node, err)
 	}
 	err := a.client.CoreV1().Nodes().Delete(ctx, node, metav1.DeleteOptions{})
 	if err != nil && !apierrors.IsNotFound(err) {
