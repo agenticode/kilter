@@ -8,10 +8,12 @@ package collect
 import (
 	"context"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
 
+	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -23,14 +25,19 @@ import (
 
 // Annotations and labels Kilter understands.
 const (
-	AnnoHourlyCost  = "kilter.dev/hourly-cost"
-	AnnoDoNotEvict  = "kilter.dev/do-not-evict"
+	// AnnoHourlyCost on a node overrides its modeled price (USD/hour).
+	// Only finite positive decimals are honored; anything else is ignored.
+	AnnoHourlyCost = "kilter.dev/hourly-cost"
+	// AnnoDoNotEvict ("true") on a pod pins it: Kilter never evicts it.
+	AnnoDoNotEvict = "kilter.dev/do-not-evict"
+	// AnnoCASafeEvict is cluster-autoscaler's pin; "false" means do not evict.
 	AnnoCASafeEvict = "cluster-autoscaler.kubernetes.io/safe-to-evict"
 	AnnoMode        = "kilter.dev/mode"   // off | recommend | apply
 	AnnoFreeze      = "kilter.dev/freeze" // "true" on kube-system = kill switch
 )
 
-// Collector gathers ClusterSnapshots from one cluster.
+// Collector gathers ClusterSnapshots from one cluster. It holds no mutable
+// state, so one Collector is safe for concurrent Snapshot calls.
 type Collector struct {
 	Client  kubernetes.Interface
 	Metrics metricsclient.Interface // optional; nil disables usage collection
@@ -43,6 +50,13 @@ type Collector struct {
 // Snapshot lists topology (+ usage when a metrics client is present) and
 // returns a self-consistent snapshot. Topology errors abort; metrics errors
 // degrade gracefully (topology is still useful without usage).
+//
+// "Topology errors abort" is a safety property, not just hygiene: a partial
+// snapshot lies. A failed ReplicaSet list would misattribute every Deployment
+// pod, a failed HPA list would let the brain fight an autoscaler it can't
+// see, a failed PDB list would plan evictions with no disruption budget, and
+// a failed Namespace list would report Frozen=false while the operator's
+// kill switch is set. Callers skip the cycle on error, which is always safe.
 func (c *Collector) Snapshot(ctx context.Context) (*model.ClusterSnapshot, error) {
 	if c.Client == nil {
 		return nil, fmt.Errorf("collect: nil kubernetes client")
@@ -68,27 +82,31 @@ func (c *Collector) Snapshot(ctx context.Context) (*model.ClusterSnapshot, error
 
 	// ReplicaSets index for owner resolution (RS → Deployment).
 	rsOwner := map[string]model.WorkloadRef{}
-	if rsList, err := c.Client.AppsV1().ReplicaSets(c.Namespace).List(ctx, metav1.ListOptions{}); err == nil {
-		for i := range rsList.Items {
-			rs := &rsList.Items[i]
-			key := rs.Namespace + "/" + rs.Name
-			if or := metav1.GetControllerOf(rs); or != nil && or.Kind == "Deployment" {
-				rsOwner[key] = model.WorkloadRef{Kind: model.KindDeployment, Namespace: rs.Namespace, Name: or.Name}
-			} else {
-				rsOwner[key] = model.WorkloadRef{Kind: model.KindReplicaSet, Namespace: rs.Namespace, Name: rs.Name}
-			}
+	rsList, err := c.Client.AppsV1().ReplicaSets(c.Namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("collect replicasets: %w", err)
+	}
+	for i := range rsList.Items {
+		rs := &rsList.Items[i]
+		key := rs.Namespace + "/" + rs.Name
+		if or := metav1.GetControllerOf(rs); or != nil && or.Kind == "Deployment" {
+			rsOwner[key] = model.WorkloadRef{Kind: model.KindDeployment, Namespace: rs.Namespace, Name: or.Name}
+		} else {
+			rsOwner[key] = model.WorkloadRef{Kind: model.KindReplicaSet, Namespace: rs.Namespace, Name: rs.Name}
 		}
 	}
 	jobOwner := map[string]model.WorkloadRef{}
-	if jobList, err := c.Client.BatchV1().Jobs(c.Namespace).List(ctx, metav1.ListOptions{}); err == nil {
-		for i := range jobList.Items {
-			j := &jobList.Items[i]
-			key := j.Namespace + "/" + j.Name
-			if or := metav1.GetControllerOf(j); or != nil && or.Kind == "CronJob" {
-				jobOwner[key] = model.WorkloadRef{Kind: model.KindCronJob, Namespace: j.Namespace, Name: or.Name}
-			} else {
-				jobOwner[key] = model.WorkloadRef{Kind: model.KindJob, Namespace: j.Namespace, Name: j.Name}
-			}
+	jobList, err := c.Client.BatchV1().Jobs(c.Namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("collect jobs: %w", err)
+	}
+	for i := range jobList.Items {
+		j := &jobList.Items[i]
+		key := j.Namespace + "/" + j.Name
+		if or := metav1.GetControllerOf(j); or != nil && or.Kind == "CronJob" {
+			jobOwner[key] = model.WorkloadRef{Kind: model.KindCronJob, Namespace: j.Namespace, Name: or.Name}
+		} else {
+			jobOwner[key] = model.WorkloadRef{Kind: model.KindJob, Namespace: j.Namespace, Name: j.Name}
 		}
 	}
 
@@ -99,22 +117,30 @@ func (c *Collector) Snapshot(ctx context.Context) (*model.ClusterSnapshot, error
 		snap.Pods = append(snap.Pods, p)
 	}
 
-	c.collectWorkloads(ctx, snap)
-	c.collectPDBs(ctx, snap, podList.Items)
+	if err := c.collectWorkloads(ctx, snap); err != nil {
+		return nil, err
+	}
+	if err := c.collectPDBs(ctx, snap, podList.Items); err != nil {
+		return nil, err
+	}
 
-	// Namespace-level policy annotations + the cluster freeze switch.
-	if nsList, err := c.Client.CoreV1().Namespaces().List(ctx, metav1.ListOptions{}); err == nil {
-		for i := range nsList.Items {
-			ns := &nsList.Items[i]
-			if m := ns.Annotations[AnnoMode]; m != "" {
-				if snap.NamespaceModes == nil {
-					snap.NamespaceModes = map[string]string{}
-				}
-				snap.NamespaceModes[ns.Name] = m
+	// Namespace-level policy annotations + the cluster freeze switch. This
+	// list must not degrade: an unreadable freeze switch has to stop the
+	// cycle (fail closed), not report an unfrozen cluster.
+	nsList, err := c.Client.CoreV1().Namespaces().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("collect namespaces: %w", err)
+	}
+	for i := range nsList.Items {
+		ns := &nsList.Items[i]
+		if m := ns.Annotations[AnnoMode]; m != "" {
+			if snap.NamespaceModes == nil {
+				snap.NamespaceModes = map[string]string{}
 			}
-			if ns.Name == "kube-system" && ns.Annotations[AnnoFreeze] == "true" {
-				snap.Frozen = true
-			}
+			snap.NamespaceModes[ns.Name] = m
+		}
+		if ns.Name == "kube-system" && ns.Annotations[AnnoFreeze] == "true" {
+			snap.Frozen = true
 		}
 	}
 
@@ -153,45 +179,79 @@ func (c *Collector) collectUsage(ctx context.Context, snap *model.ClusterSnapsho
 		for _, cm := range pm.Containers {
 			cpu := cm.Usage.Cpu().MilliValue()
 			mem := cm.Usage.Memory().Value()
+			// A negative reading is meter corruption. Dropping it beats
+			// recording it: these samples feed percentile histograms that
+			// size requests, and a bogus low sample argues for shrinking a
+			// workload that never used less.
+			if cpu < 0 || mem < 0 {
+				continue
+			}
 			snap.Usage = append(snap.Usage, model.Usage{
 				Key:           model.ContainerKey{Workload: wl, Container: cm.Name},
 				PodUID:        uidByKey[key],
 				Timestamp:     ts,
 				MilliCPU:      cpu,
 				MemoryBytes:   mem,
-				WindowSeconds: int32(pm.Window.Duration.Seconds()),
+				WindowSeconds: clampWindowSeconds(pm.Window.Duration),
 			})
 		}
 	}
 }
 
-func (c *Collector) collectWorkloads(ctx context.Context, snap *model.ClusterSnapshot) {
+// clampWindowSeconds converts a metrics window to whole seconds with a
+// well-defined result for garbage inputs. Downstream weights samples by
+// window length, so this must never go negative or wrap: a direct
+// int32(float64) conversion of an out-of-range value is platform-dependent
+// (MinInt32 on amd64, saturation on arm64). Negative windows report 0
+// (= unknown, weighted as one sample).
+func clampWindowSeconds(d time.Duration) int32 {
+	s := int64(d / time.Second)
+	if s < 0 {
+		return 0
+	}
+	if s > math.MaxInt32 {
+		return math.MaxInt32
+	}
+	return int32(s)
+}
+
+func (c *Collector) collectWorkloads(ctx context.Context, snap *model.ClusterSnapshot) error {
 	type hpaInfo struct {
 		min, max   int32
 		targetsCPU bool
 		owner      string
 	}
 	hpas := map[string]hpaInfo{} // Kind/ns/name
-	if hpaList, err := c.Client.AutoscalingV2().HorizontalPodAutoscalers(c.Namespace).List(ctx, metav1.ListOptions{}); err == nil {
-		for i := range hpaList.Items {
-			h := &hpaList.Items[i]
-			info := hpaInfo{max: h.Spec.MaxReplicas}
-			if h.Spec.MinReplicas != nil {
-				info.min = *h.Spec.MinReplicas
-			}
-			for _, or := range h.OwnerReferences {
-				if or.Kind == "ScaledObject" {
-					info.owner = "keda" // KEDA drives this HPA
-				}
-			}
-			for _, m := range h.Spec.Metrics {
-				if m.Type == "Resource" && m.Resource != nil && m.Resource.Name == corev1.ResourceCPU {
-					info.targetsCPU = true
-				}
-			}
-			key := h.Spec.ScaleTargetRef.Kind + "/" + h.Namespace + "/" + h.Spec.ScaleTargetRef.Name
-			hpas[key] = info
+	hpaList, err := c.Client.AutoscalingV2().HorizontalPodAutoscalers(c.Namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return fmt.Errorf("collect hpas: %w", err)
+	}
+	for i := range hpaList.Items {
+		h := &hpaList.Items[i]
+		info := hpaInfo{max: h.Spec.MaxReplicas}
+		if h.Spec.MinReplicas != nil {
+			info.min = *h.Spec.MinReplicas
 		}
+		for _, or := range h.OwnerReferences {
+			if or.Kind == "ScaledObject" {
+				info.owner = "keda" // KEDA drives this HPA
+			}
+		}
+		// Both metric shapes make the HPA react to CPU: shrinking CPU
+		// requests raises utilization % and the HPA scales out to
+		// compensate, so the brain must know before resizing CPU.
+		for _, m := range h.Spec.Metrics {
+			if m.Type == autoscalingv2.ResourceMetricSourceType &&
+				m.Resource != nil && m.Resource.Name == corev1.ResourceCPU {
+				info.targetsCPU = true
+			}
+			if m.Type == autoscalingv2.ContainerResourceMetricSourceType &&
+				m.ContainerResource != nil && m.ContainerResource.Name == corev1.ResourceCPU {
+				info.targetsCPU = true
+			}
+		}
+		key := h.Spec.ScaleTargetRef.Kind + "/" + h.Namespace + "/" + h.Spec.ScaleTargetRef.Name
+		hpas[key] = info
 	}
 	attach := func(ref model.WorkloadRef, replicas, ready int32, lbls, annos map[string]string) {
 		w := model.WorkloadInfo{Ref: ref, Replicas: replicas, Ready: ready, Labels: lbls, Mode: annos[AnnoMode]}
@@ -202,41 +262,48 @@ func (c *Collector) collectWorkloads(ctx context.Context, snap *model.ClusterSna
 		}
 		snap.Workloads = append(snap.Workloads, w)
 	}
-	if l, err := c.Client.AppsV1().Deployments(c.Namespace).List(ctx, metav1.ListOptions{}); err == nil {
-		for i := range l.Items {
-			d := &l.Items[i]
-			var reps int32 = 1
-			if d.Spec.Replicas != nil {
-				reps = *d.Spec.Replicas
-			}
-			attach(model.WorkloadRef{Kind: model.KindDeployment, Namespace: d.Namespace, Name: d.Name},
-				reps, d.Status.ReadyReplicas, d.Labels, d.Annotations)
-		}
+	deps, err := c.Client.AppsV1().Deployments(c.Namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return fmt.Errorf("collect deployments: %w", err)
 	}
-	if l, err := c.Client.AppsV1().StatefulSets(c.Namespace).List(ctx, metav1.ListOptions{}); err == nil {
-		for i := range l.Items {
-			s := &l.Items[i]
-			var reps int32 = 1
-			if s.Spec.Replicas != nil {
-				reps = *s.Spec.Replicas
-			}
-			attach(model.WorkloadRef{Kind: model.KindStatefulSet, Namespace: s.Namespace, Name: s.Name},
-				reps, s.Status.ReadyReplicas, s.Labels, s.Annotations)
+	for i := range deps.Items {
+		d := &deps.Items[i]
+		var reps int32 = 1
+		if d.Spec.Replicas != nil {
+			reps = *d.Spec.Replicas
 		}
+		attach(model.WorkloadRef{Kind: model.KindDeployment, Namespace: d.Namespace, Name: d.Name},
+			reps, d.Status.ReadyReplicas, d.Labels, d.Annotations)
 	}
-	if l, err := c.Client.AppsV1().DaemonSets(c.Namespace).List(ctx, metav1.ListOptions{}); err == nil {
-		for i := range l.Items {
-			d := &l.Items[i]
-			attach(model.WorkloadRef{Kind: model.KindDaemonSet, Namespace: d.Namespace, Name: d.Name},
-				d.Status.DesiredNumberScheduled, d.Status.NumberReady, d.Labels, d.Annotations)
+	stss, err := c.Client.AppsV1().StatefulSets(c.Namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return fmt.Errorf("collect statefulsets: %w", err)
+	}
+	for i := range stss.Items {
+		s := &stss.Items[i]
+		var reps int32 = 1
+		if s.Spec.Replicas != nil {
+			reps = *s.Spec.Replicas
 		}
+		attach(model.WorkloadRef{Kind: model.KindStatefulSet, Namespace: s.Namespace, Name: s.Name},
+			reps, s.Status.ReadyReplicas, s.Labels, s.Annotations)
 	}
+	dss, err := c.Client.AppsV1().DaemonSets(c.Namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return fmt.Errorf("collect daemonsets: %w", err)
+	}
+	for i := range dss.Items {
+		d := &dss.Items[i]
+		attach(model.WorkloadRef{Kind: model.KindDaemonSet, Namespace: d.Namespace, Name: d.Name},
+			d.Status.DesiredNumberScheduled, d.Status.NumberReady, d.Labels, d.Annotations)
+	}
+	return nil
 }
 
-func (c *Collector) collectPDBs(ctx context.Context, snap *model.ClusterSnapshot, pods []corev1.Pod) {
+func (c *Collector) collectPDBs(ctx context.Context, snap *model.ClusterSnapshot, pods []corev1.Pod) error {
 	pdbList, err := c.Client.PolicyV1().PodDisruptionBudgets(c.Namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
-		return
+		return fmt.Errorf("collect pdbs: %w", err)
 	}
 	for i := range pdbList.Items {
 		k := &pdbList.Items[i]
@@ -260,6 +327,7 @@ func (c *Collector) collectPDBs(ctx context.Context, snap *model.ClusterSnapshot
 		}
 		snap.PDBs = append(snap.PDBs, p)
 	}
+	return nil
 }
 
 // ConvertNode maps a corev1.Node to the domain model.
@@ -314,7 +382,10 @@ func ConvertNode(n *corev1.Node) model.NodeSpec {
 		out.ManagedBy = "karpenter" // pre-v1 karpenter label
 	}
 	if v, ok := n.Annotations[AnnoHourlyCost]; ok {
-		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {
+		// Only finite positive values: ParseFloat accepts "Inf" with a nil
+		// error, and one +Inf node would poison every downstream cost sum.
+		// (NaN is already rejected by f > 0.)
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 && !math.IsInf(f, 0) {
 			out.HourlyCost = f
 		}
 	}
@@ -322,11 +393,16 @@ func ConvertNode(n *corev1.Node) model.NodeSpec {
 }
 
 // isExtendedResource reports whether a resource name gates scheduling
-// beyond cpu/memory (GPUs, FPGAs, vendor devices).
+// beyond cpu/memory (GPUs, FPGAs, vendor devices, hugepages).
 func isExtendedResource(name string) bool {
 	switch name {
 	case "cpu", "memory", "ephemeral-storage", "pods":
 		return false
+	}
+	// Hugepages are accounted separately from memory by the scheduler; a pod
+	// requesting them can only land on a node with a matching allocatable pool.
+	if strings.HasPrefix(name, "hugepages-") {
+		return true
 	}
 	return strings.Contains(name, "/") // vendor-namespaced (nvidia.com/gpu, …)
 }
@@ -375,8 +451,10 @@ func ConvertPod(p *corev1.Pod, rsOwner, jobOwner map[string]model.WorkloadRef) m
 	for _, cs := range p.Status.ContainerStatuses {
 		statuses[cs.Name] = cs
 	}
-	for i := range p.Spec.Containers {
-		c := &p.Spec.Containers[i]
+	for _, cs := range p.Status.InitContainerStatuses {
+		statuses[cs.Name] = cs
+	}
+	convert := func(c *corev1.Container) model.ContainerSpec {
 		spec := model.ContainerSpec{
 			Name: c.Name,
 			Requests: model.Resources{
@@ -403,7 +481,22 @@ func ConvertPod(p *corev1.Pod, rsOwner, jobOwner map[string]model.WorkloadRef) m
 				spec.LastOOMKilled = term.Reason == "OOMKilled"
 			}
 		}
-		out.Containers = append(out.Containers, spec)
+		return spec
+	}
+	// Restartable init containers (native sidecars, restartPolicy: Always)
+	// run for the pod's whole life and count toward the scheduler's request
+	// sum exactly like app containers; omitting them undercounts the pod's
+	// node footprint and overcommits packing. Plain run-to-completion init
+	// containers stay excluded: they bound scheduling only via
+	// max(init, sum(app)), which this sum-based model cannot express.
+	for i := range p.Spec.InitContainers {
+		c := &p.Spec.InitContainers[i]
+		if c.RestartPolicy != nil && *c.RestartPolicy == corev1.ContainerRestartPolicyAlways {
+			out.Containers = append(out.Containers, convert(c))
+		}
+	}
+	for i := range p.Spec.Containers {
+		out.Containers = append(out.Containers, convert(&p.Spec.Containers[i]))
 	}
 
 	for _, v := range p.Spec.Volumes {
@@ -488,8 +581,11 @@ func resolveOwner(p *corev1.Pod, rsOwner, jobOwner map[string]model.WorkloadRef)
 }
 
 // DaemonSetTemplates extracts one representative pod per DaemonSet from a
-// snapshot, for per-node overhead in planning.
+// snapshot, for per-node overhead in planning. A nil snapshot yields nil.
 func DaemonSetTemplates(snap *model.ClusterSnapshot) []model.PodSpec {
+	if snap == nil {
+		return nil
+	}
 	seen := map[model.WorkloadRef]bool{}
 	var out []model.PodSpec
 	for i := range snap.Pods {
