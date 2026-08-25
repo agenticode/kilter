@@ -38,6 +38,9 @@ type SpotReport struct {
 //   - PDBs covering the pods currently allow ≥1 disruption
 //   - not a StatefulSet (interruption ≠ graceful scale-in for stateful apps)
 func BuildSpotReport(snap *model.ClusterSnapshot, catalog *pricing.Catalog, minReplicas int) SpotReport {
+	if snap == nil {
+		return SpotReport{}
+	}
 	if minReplicas < 2 {
 		minReplicas = 2
 	}
@@ -57,12 +60,13 @@ func BuildSpotReport(snap *model.ClusterSnapshot, catalog *pricing.Catalog, minR
 		s := SpotSafety{Workload: ref, Replicas: len(pods)}
 		var reqOnDemand model.Resources
 		for _, p := range pods {
+			req := clampedRequests(p)
 			if n, ok := nodes[p.NodeName]; ok && n.Spot {
 				s.OnSpot++
 			} else {
-				reqOnDemand = reqOnDemand.Add(p.Requests())
+				reqOnDemand = reqOnDemand.Add(req)
 			}
-			s.Requests = s.Requests.Add(p.Requests())
+			s.Requests = s.Requests.Add(req)
 		}
 
 		switch {
@@ -107,12 +111,19 @@ func BuildSpotReport(snap *model.ClusterSnapshot, catalog *pricing.Catalog, minR
 }
 
 // typicalSpotDiscount averages the catalog's spot discount for the cluster's
-// dominant provider; falls back to the industry-typical 65%.
+// dominant provider; falls back to the industry-typical 65% when the catalog
+// is absent or carries no usable spot prices.
 func typicalSpotDiscount(snap *model.ClusterSnapshot, catalog *pricing.Catalog) float64 {
+	if catalog == nil {
+		return 0.65
+	}
 	provider, _ := dominantProviderArch(snap)
 	sum, n := 0.0, 0
 	for _, it := range catalog.Candidates(provider, "") {
-		if it.SpotHourlyUSD > 0 {
+		// A spot price at or above on-demand is bad catalog data, not a
+		// discount; counted, it would drag the average toward (or below)
+		// zero and could turn the whole savings estimate negative.
+		if it.SpotHourlyUSD > 0 && it.SpotHourlyUSD < it.HourlyUSD {
 			sum += 1 - it.SpotHourlyUSD/it.HourlyUSD
 			n++
 		}
@@ -137,6 +148,9 @@ var SpotInterruptionTaints = []string{
 // Controllers fast-track their drains: cooldowns don't apply (the machine is
 // dying either way), but PDBs still do.
 func InterruptedSpotNodes(snap *model.ClusterSnapshot) []string {
+	if snap == nil {
+		return nil
+	}
 	var out []string
 	for i := range snap.Nodes {
 		n := &snap.Nodes[i]
@@ -158,6 +172,9 @@ func InterruptedSpotNodes(snap *model.ClusterSnapshot) []string {
 // node. It does NOT delete the node (the cloud reclaims it) and does not
 // simulate placement (there is no time; the scheduler will place evictees).
 func EmergencyDrainPlan(snap *model.ClusterSnapshot, node string) *Plan {
+	if snap == nil {
+		return &Plan{Risk: RiskMedium, Notes: []string{"emergency drain skipped: nil snapshot"}}
+	}
 	p := &Plan{ClusterID: snap.ClusterID, CreatedAt: snap.Timestamp, Risk: RiskMedium}
 	seq := 1
 	p.Steps = append(p.Steps, Step{
@@ -176,8 +193,9 @@ func EmergencyDrainPlan(snap *model.ClusterSnapshot, node string) *Plan {
 		// The machine is being reclaimed: everything on it dies shortly.
 		// A graceful eviction now beats a hypervisor kill in minutes — even
 		// for pods with local storage (that data is lost either way). Only
-		// DaemonSets (pointless) and explicit opt-outs are skipped.
-		if pod.Workload.Kind == model.KindDaemonSet || pod.DoNotEvict {
+		// DaemonSets (pointless), already-terminal pods (nothing to save),
+		// and explicit opt-outs are skipped.
+		if pod.Workload.Kind == model.KindDaemonSet || pod.DoNotEvict || isTerminal(pod) {
 			continue
 		}
 		p.Steps = append(p.Steps, Step{
@@ -188,5 +206,8 @@ func EmergencyDrainPlan(snap *model.ClusterSnapshot, node string) *Plan {
 		seq++
 	}
 	p.Notes = append(p.Notes, "emergency spot drain: cooldowns bypassed, PDBs still enforced by the eviction API")
+	// Fingerprinted like every other plan so the audit ledger can identify
+	// what the fast path did (emergency drains skip approval, not audit).
+	p.Fingerprint = fingerprint(p.Steps)
 	return p
 }

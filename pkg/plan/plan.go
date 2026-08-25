@@ -142,16 +142,21 @@ func Build(snap *model.ClusterSnapshot, recs []recommend.Recommendation, catalog
 	if snap == nil || catalog == nil {
 		return nil, fmt.Errorf("plan: nil snapshot or catalog")
 	}
-	if cfg.MinNodeUtilization <= 0 {
+	// Positive-range form (not <= 0) so NaN also falls back to the default.
+	// Every float comparison against NaN is false, so a NaN threshold would
+	// otherwise silently disable the guard it tunes — worst of all
+	// MinClusterHeadroom, whose check reads `free/alloc < cfg` and would wave
+	// arbitrarily aggressive packing through.
+	if !(cfg.MinNodeUtilization > 0) {
 		cfg.MinNodeUtilization = 0.5
 	}
-	if cfg.MinConfidence <= 0 {
+	if !(cfg.MinConfidence > 0) {
 		cfg.MinConfidence = 0.6
 	}
 	if cfg.MaxNodeRemovals <= 0 {
 		cfg.MaxNodeRemovals = 3
 	}
-	if cfg.MinClusterHeadroom <= 0 {
+	if !(cfg.MinClusterHeadroom > 0) {
 		cfg.MinClusterHeadroom = 0.10
 	}
 
@@ -164,9 +169,18 @@ func Build(snap *model.ClusterSnapshot, recs []recommend.Recommendation, catalog
 	}
 
 	// Working copies: pods get virtually resized, then consolidation runs on
-	// the adjusted shapes.
-	pods := make([]model.PodSpec, len(snap.Pods))
-	copy(pods, snap.Pods)
+	// the adjusted shapes. Terminal pods are dropped up front: snapshots keep
+	// them (completed Jobs, failed pods pending GC) but the scheduler no
+	// longer counts their requests and a drain skips them. Kept, they would
+	// inflate utilization, consume simulated capacity, draw pointless evict
+	// steps — and one completed bare pod would pin its node forever.
+	pods := make([]model.PodSpec, 0, len(snap.Pods))
+	for i := range snap.Pods {
+		if isTerminal(&snap.Pods[i]) {
+			continue
+		}
+		pods = append(pods, snap.Pods[i])
+	}
 	seq := 1
 
 	// Guardrails: workloads opted out of automation pin their pods (never
@@ -193,6 +207,7 @@ func Build(snap *model.ClusterSnapshot, recs []recommend.Recommendation, catalog
 				accepted[r.Key] = r
 			}
 		}
+		applied := map[model.ContainerKey]bool{} // recs that touched a live pod container
 		for i := range pods {
 			pod := &pods[i]
 			cloned := false
@@ -202,6 +217,7 @@ func Build(snap *model.ClusterSnapshot, recs []recommend.Recommendation, catalog
 				if !ok {
 					continue
 				}
+				applied[key] = true
 				// The pods slice is a shallow copy: Containers still aliases
 				// the caller's snapshot. Clone before the virtual resize or
 				// we'd corrupt the brain's stored state.
@@ -217,13 +233,26 @@ func Build(snap *model.ClusterSnapshot, recs []recommend.Recommendation, catalog
 				}
 			}
 		}
+		declared := make(map[model.WorkloadRef]bool, len(snap.Workloads))
+		for i := range snap.Workloads {
+			declared[snap.Workloads[i].Ref] = true
+		}
 		// One resize step per accepted recommendation, ordered by workload.
+		// A rec that matched no pod container AND whose workload the snapshot
+		// no longer declares is stale (workload deleted, container renamed):
+		// emitting its step would only hand the actuator a guaranteed failure.
+		// Scaled-to-zero workloads keep their steps via the declared check.
 		keys := make([]model.ContainerKey, 0, len(accepted))
 		for k := range accepted {
 			keys = append(keys, k)
 		}
 		sort.Slice(keys, func(i, j int) bool { return keys[i].String() < keys[j].String() })
+		stale := 0
 		for _, k := range keys {
+			if !applied[k] && !declared[k.Workload] {
+				stale++
+				continue
+			}
 			r := accepted[k]
 			p.Rightsizing = append(p.Rightsizing, r)
 			p.Steps = append(p.Steps, Step{
@@ -235,6 +264,10 @@ func Build(snap *model.ClusterSnapshot, recs []recommend.Recommendation, catalog
 					r.CurrentRequest, r.TargetRequest, r.Confidence, r.Reason),
 			})
 			seq++
+		}
+		if stale > 0 {
+			p.Notes = append(p.Notes, fmt.Sprintf(
+				"%d stale recommendation(s) dropped: target workload/container no longer in the snapshot", stale))
 		}
 	}
 
@@ -253,13 +286,15 @@ func Build(snap *model.ClusterSnapshot, recs []recommend.Recommendation, catalog
 		used := make(map[string]model.Resources, len(nodes))
 		for i := range pods {
 			if n := pods[i].NodeName; n != "" {
-				used[n] = used[n].Add(pods[i].Requests())
+				used[n] = used[n].Add(clampedRequests(&pods[i]))
 			}
 		}
 		out := make(map[string]float64, len(nodes))
 		for i := range nodes {
 			alloc := nodes[i].Allocatable
-			if alloc.MilliCPU == 0 || alloc.MemoryBytes == 0 {
+			// A node reporting non-positive allocatable is broken, not empty:
+			// read it as fully utilized so it never looks like a cheap win.
+			if alloc.MilliCPU <= 0 || alloc.MemoryBytes <= 0 {
 				out[nodes[i].Name] = 1
 				continue
 			}
@@ -276,6 +311,11 @@ func Build(snap *model.ClusterSnapshot, recs []recommend.Recommendation, catalog
 	}
 
 	removed := 0
+	// Nodes an accepted removal moved pods onto are pinned for the rest of
+	// the plan: a later step deleting a node an earlier step targets would
+	// make the plan self-contradictory (the actuator would drain replacements
+	// it has no steps for, and WaitNodeEmpty would time the step out).
+	targeted := map[string]bool{}
 	for removed < cfg.MaxNodeRemovals {
 		// Rank current candidates each round on the evolving state.
 		utils := utilizationMap(nodes, pods)
@@ -291,7 +331,7 @@ func Build(snap *model.ClusterSnapshot, recs []recommend.Recommendation, catalog
 		var cands []candidate
 		for i := range nodes {
 			n := &nodes[i]
-			if !n.Ready || n.Unschedulable || isControlPlane(n) || blockedNodes[n.Name] {
+			if !n.Ready || n.Unschedulable || isControlPlane(n) || blockedNodes[n.Name] || targeted[n.Name] {
 				continue
 			}
 			if cfg.RespectManagedNodes && n.ManagedBy != "" {
@@ -323,6 +363,11 @@ func Build(snap *model.ClusterSnapshot, recs []recommend.Recommendation, catalog
 			}
 			nodes, pods = newNodes, newPods
 			p.Steps = append(p.Steps, steps...)
+			for _, s := range steps {
+				if s.TargetNode != "" {
+					targeted[s.TargetNode] = true
+				}
+			}
 			p.Removals = append(p.Removals, removal)
 			removed++
 			accepted = true
@@ -384,15 +429,29 @@ func tryRemove(nodes []model.NodeSpec, pods []model.PodSpec, name string, util, 
 		evictable = append(evictable, p)
 	}
 
-	// PDB dry check before reserving anything.
+	// Reserve PDB disruptions for the whole eviction set up front. Per-pod
+	// CanEvict checks cannot see two pods on this node sharing one budget, so
+	// reservation itself is the only reliable group check. The guard outlives
+	// this call (it accumulates across removals in a plan), so every failure
+	// path below MUST release what was reserved here — a leaked reservation
+	// would silently block later, legitimate removals in the same plan.
+	var reserved []*model.PodSpec
+	rollback := func() {
+		for _, p := range reserved {
+			guard.Release(p)
+		}
+	}
 	for _, p := range evictable {
-		if ok, _ := guard.CanEvict(p); !ok {
+		if ok, _ := guard.Reserve(p); !ok {
+			rollback()
 			return nil, nil, nil, NodeRemoval{}, false
 		}
+		reserved = append(reserved, p)
 	}
 
 	assign, failed := cs.Schedule(evictable)
 	if len(failed) > 0 {
+		rollback()
 		return nil, nil, nil, NodeRemoval{}, false
 	}
 
@@ -403,18 +462,15 @@ func tryRemove(nodes []model.NodeSpec, pods []model.PodSpec, name string, util, 
 		alloc = alloc.Add(ns.Spec.Allocatable)
 	}
 	if alloc.MilliCPU > 0 && float64(free.MilliCPU)/float64(alloc.MilliCPU) < cfg.MinClusterHeadroom {
+		rollback()
 		return nil, nil, nil, NodeRemoval{}, false
 	}
 	if alloc.MemoryBytes > 0 && float64(free.MemoryBytes)/float64(alloc.MemoryBytes) < cfg.MinClusterHeadroom {
+		rollback()
 		return nil, nil, nil, NodeRemoval{}, false
 	}
 
-	// Commit: reserve PDB disruptions; evolve arrays; emit steps.
-	for _, p := range evictable {
-		if ok, _ := guard.Reserve(p); !ok {
-			return nil, nil, nil, NodeRemoval{}, false // raced budget; abort removal
-		}
-	}
+	// Commit: the reservations stand; evolve arrays; emit steps.
 
 	newNodes := make([]model.NodeSpec, 0, len(nodes)-1)
 	for _, n := range nodes {
@@ -519,6 +575,29 @@ func maxKey(m map[string]int) string {
 		}
 	}
 	return best
+}
+
+// clampedRequests returns p's summed requests with negative dimensions
+// clamped to zero, mirroring pkg/binpack's accounting: a buggy collector
+// emitting negative requests must not deflate utilization (faking
+// consolidation candidates) or savings estimates.
+func clampedRequests(p *model.PodSpec) model.Resources {
+	req := p.Requests()
+	if req.MilliCPU < 0 {
+		req.MilliCPU = 0
+	}
+	if req.MemoryBytes < 0 {
+		req.MemoryBytes = 0
+	}
+	return req
+}
+
+// isTerminal reports whether the pod has finished running (Succeeded or
+// Failed). Terminal pods still appear in snapshots until garbage-collected,
+// but hold no node resources and cannot be disrupted; planning treats them
+// as absent, matching the scheduler and kubectl drain.
+func isTerminal(p *model.PodSpec) bool {
+	return p.Phase == "Succeeded" || p.Phase == "Failed"
 }
 
 func isControlPlane(n *model.NodeSpec) bool {
