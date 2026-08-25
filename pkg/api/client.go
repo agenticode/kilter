@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/agenticode/kilter/pkg/model"
 	"github.com/agenticode/kilter/pkg/plan"
@@ -91,12 +92,18 @@ func (c *Client) do(ctx context.Context, method, path string, body []byte, gzipB
 	return fmt.Errorf("api: giving up after %d attempts: %w", c.retries, lastErr)
 }
 
+// truncate bounds a response body for embedding in an error message, cutting
+// at a rune boundary so multi-byte characters are never split.
 func truncate(b []byte) string {
-	s := string(b)
-	if len(s) > 300 {
-		return s[:300] + "…"
+	s := strings.TrimSpace(string(b))
+	if len(s) <= 300 {
+		return s
 	}
-	return strings.TrimSpace(s)
+	cut := 300
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "…"
 }
 
 // PushSnapshot uploads a snapshot (gzip-compressed).

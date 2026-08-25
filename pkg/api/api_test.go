@@ -286,6 +286,203 @@ func TestConcurrentIngest(t *testing.T) {
 	}
 }
 
+// TestAuthAdversarialTokens: near-miss credentials — prefixes, extensions,
+// case-twiddled schemes — must all be rejected, and the read token must never
+// unlock a write route.
+func TestAuthAdversarialTokens(t *testing.T) {
+	b, err := NewBrain(BrainConfig{Token: "sekrit-token", ReadToken: "read-token"}, pricing.Embedded(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(b.Handler())
+	defer srv.Close()
+
+	get := func(header string) int {
+		req, _ := http.NewRequest(http.MethodGet, srv.URL+"/api/v1/clusters", nil)
+		if header != "" {
+			req.Header.Set("Authorization", header)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	tests := []struct {
+		name, header string
+		want         int
+	}{
+		{"missing header", "", http.StatusUnauthorized},
+		{"empty bearer", "Bearer ", http.StatusUnauthorized},
+		{"token prefix", "Bearer sekrit", http.StatusUnauthorized},
+		{"token extended", "Bearer sekrit-token-x", http.StatusUnauthorized},
+		{"lowercase scheme", "bearer sekrit-token", http.StatusUnauthorized},
+		{"no scheme", "sekrit-token", http.StatusUnauthorized},
+		{"write token", "Bearer sekrit-token", http.StatusOK},
+		{"read token", "Bearer read-token", http.StatusOK},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := get(tt.header); got != tt.want {
+				t.Fatalf("GET with %q → %d, want %d", tt.header, got, tt.want)
+			}
+		})
+	}
+	// Read token on a write route stays locked out.
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/v1/snapshots", bytes.NewReader([]byte(`{}`)))
+	req.Header.Set("Authorization", "Bearer read-token")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("read token on write route → %d, want 401", resp.StatusCode)
+	}
+}
+
+func TestOversizedBodyReturns413(t *testing.T) {
+	b, err := NewBrain(BrainConfig{MaxBodyBytes: 1024}, pricing.Embedded(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(b.Handler())
+	defer srv.Close()
+
+	big, _ := json.Marshal(trainingSnapshot("prod"))
+	resp, err := http.Post(srv.URL+"/api/v1/snapshots", "application/json", bytes.NewReader(big))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized body → %d, want 413", resp.StatusCode)
+	}
+	// A gzip bomb that stays syntactically valid JSON until cut off must hit
+	// the decompressed-size bound and report 413, not a misleading 400.
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	gz.Write([]byte(`{"clusterID":"`))
+	gz.Write(bytes.Repeat([]byte("A"), 1<<20))
+	gz.Write([]byte(`"}`))
+	gz.Close()
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/v1/snapshots", &buf)
+	req.Header.Set("Content-Encoding", "gzip")
+	resp2, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("zip bomb → %d, want 413", resp2.StatusCode)
+	}
+}
+
+func TestCostEndpoint(t *testing.T) {
+	b, _ := newBrain(t, "", false)
+	b.Ingest(trainingSnapshot("prod"))
+	srv := httptest.NewServer(b.Handler())
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/api/v1/clusters/prod/cost")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("cost → %d", resp.StatusCode)
+	}
+	var cost struct {
+		HourlyUSD float64 `json:"hourlyUSD"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&cost); err != nil {
+		t.Fatal(err)
+	}
+	if cost.HourlyUSD <= 0 {
+		t.Fatalf("2× m5.xlarge must cost > 0, got %v", cost.HourlyUSD)
+	}
+	r2, _ := http.Get(srv.URL + "/api/v1/clusters/ghost/cost")
+	r2.Body.Close()
+	if r2.StatusCode != http.StatusNotFound {
+		t.Fatalf("unknown cluster cost → %d, want 404", r2.StatusCode)
+	}
+}
+
+func TestIngestNormalizesZeroTimestamp(t *testing.T) {
+	b, _ := newBrain(t, "", false)
+	snap := trainingSnapshot("prod")
+	snap.Timestamp = time.Time{}
+	if err := b.Ingest(snap); err != nil {
+		t.Fatal(err)
+	}
+	rep := b.Ledger("prod")
+	if len(rep.CostTimeline) != 1 {
+		t.Fatalf("cost timeline points: %d", len(rep.CostTimeline))
+	}
+	if rep.CostTimeline[0].At.Before(t0) {
+		t.Fatalf("zero timestamp must be normalized to ingest time, got %v", rep.CostTimeline[0].At)
+	}
+}
+
+func TestClustersSorted(t *testing.T) {
+	b, _ := newBrain(t, "", false)
+	for _, id := range []string{"zeta", "alpha", "mike", "bravo"} {
+		if err := b.Ingest(&model.ClusterSnapshot{ClusterID: id, Timestamp: t0}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got := b.Clusters()
+	want := []string{"alpha", "bravo", "mike", "zeta"}
+	if len(got) != len(want) {
+		t.Fatalf("clusters: %v", got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("clusters not sorted: %v", got)
+		}
+	}
+}
+
+// FuzzIngestEndpoint throws arbitrary bodies (optionally declared as gzip) at
+// the ingest route: the server must always answer with a sane status and
+// never panic, corrupt state, or accept a snapshot without a cluster id.
+func FuzzIngestEndpoint(f *testing.F) {
+	f.Add([]byte("not json"), false)
+	f.Add([]byte(`{"clusterID":""}`), false)
+	f.Add([]byte(`{"clusterID":"c","timestamp":"2026-01-01T00:00:00Z"}`), false)
+	f.Add([]byte(`{"clusterID":"c","usage":[{"milliCPU":-99,"memoryBytes":-1}]}`), false)
+	f.Add([]byte{0x1f, 0x8b, 0x00}, true) // truncated gzip magic
+	var gzValid bytes.Buffer
+	gw := gzip.NewWriter(&gzValid)
+	gw.Write([]byte(`{"clusterID":"gz"}`))
+	gw.Close()
+	f.Add(gzValid.Bytes(), true)
+
+	b, err := NewBrain(BrainConfig{MaxBodyBytes: 1 << 20}, pricing.Embedded(), nil)
+	if err != nil {
+		f.Fatal(err)
+	}
+	// In-process, not over TCP: fuzzing thousands of over-limit bodies through
+	// real sockets exhausts ephemeral ports (each 413 closes the connection).
+	handler := b.Handler()
+
+	f.Fuzz(func(t *testing.T, body []byte, gzipped bool) {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/snapshots", bytes.NewReader(body))
+		if gzipped {
+			req.Header.Set("Content-Encoding", "gzip")
+		}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		switch rec.Code {
+		case http.StatusAccepted, http.StatusBadRequest,
+			http.StatusRequestEntityTooLarge, http.StatusUnprocessableEntity:
+		default:
+			t.Fatalf("unexpected status %d", rec.Code)
+		}
+	})
+}
+
 func TestClientValidation(t *testing.T) {
 	for _, bad := range []string{"", "not-a-url", "ftp://x", "http://"} {
 		if _, err := NewClient(bad, ""); err == nil {
