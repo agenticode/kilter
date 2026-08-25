@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"regexp"
 	"sort"
 	"strconv"
@@ -116,7 +117,10 @@ func (s *Syncer) fetchOnDemand(ctx context.Context) ([]kpricing.InstanceType, er
 		{Type: pricingtypes.FilterTypeTermMatch, Field: strPtr("preInstalledSw"), Value: strPtr("NA")},
 		{Type: pricingtypes.FilterTypeTermMatch, Field: strPtr("capacitystatus"), Value: strPtr("Used")},
 	}
-	var out []kpricing.InstanceType
+	// Dedupe by instance type, keeping the cheapest quote: the Pricing API
+	// can list more than one SKU matching the filters for the same type, and
+	// a catalog with duplicate entries is rejected by pricing.Load.
+	byName := map[string]kpricing.InstanceType{}
 	var next *string
 	for {
 		resp, err := s.pricing.GetProducts(ctx, &pricing.GetProductsInput{
@@ -129,14 +133,21 @@ func (s *Syncer) fetchOnDemand(ctx context.Context) ([]kpricing.InstanceType, er
 		}
 		for _, raw := range resp.PriceList {
 			it, ok := ParsePriceListEntry(raw)
-			if ok && s.wantFamily(it.Name) {
-				out = append(out, it)
+			if !ok || !s.wantFamily(it.Name) {
+				continue
+			}
+			if cur, seen := byName[it.Name]; !seen || it.HourlyUSD < cur.HourlyUSD {
+				byName[it.Name] = it
 			}
 		}
 		if resp.NextToken == nil || *resp.NextToken == "" {
 			break
 		}
 		next = resp.NextToken
+	}
+	out := make([]kpricing.InstanceType, 0, len(byName))
+	for _, it := range byName {
+		out = append(out, it)
 	}
 	return out, nil
 }
@@ -180,7 +191,14 @@ func ParsePriceListEntry(raw string) (kpricing.InstanceType, bool) {
 			if dim.Unit != "Hrs" {
 				continue
 			}
-			if v, err := strconv.ParseFloat(dim.PricePerUnit["USD"], 64); err == nil && v > 0 {
+			v, err := strconv.ParseFloat(dim.PricePerUnit["USD"], 64)
+			if err != nil || math.IsNaN(v) || math.IsInf(v, 1) || v <= 0 {
+				continue
+			}
+			// Keep the lowest positive quote: these are Go maps, so "last
+			// one wins" would make repeated syncs disagree whenever a SKU
+			// carries more than one hourly dimension.
+			if price == 0 || v < price {
 				price = v
 			}
 		}
@@ -197,15 +215,25 @@ func ParsePriceListEntry(raw string) (kpricing.InstanceType, bool) {
 		MilliCPU:    vcpu * 1000,
 		MemoryBytes: memBytes,
 		HourlyUSD:   price,
-		Burstable:   strings.HasPrefix(fam, "t"),
+		Burstable:   burstableRe.MatchString(fam),
 	}, true
 }
+
+// burstableRe matches the credit-based t-families (t2, t3, t3a, t4g). A bare
+// "t" prefix is not enough: trn1/trn2 are Trainium instances priced for
+// sustained use, and flagging them burstable would hide them from planners.
+var burstableRe = regexp.MustCompile(`^t[0-9]`)
 
 var famRe = regexp.MustCompile(`^([a-z]+)([0-9]+)([a-z-]*)$`)
 
 // archOf infers CPU architecture from the family's modifier letters:
 // a Graviton family carries "g" after the generation digit (m7g, c6gd, t4g).
+// a1 — first-generation Graviton — predates that convention and is the one
+// arm64 family with no "g" modifier.
 func archOf(family string) string {
+	if family == "a1" {
+		return "arm64"
+	}
 	m := famRe.FindStringSubmatch(family)
 	if m != nil && strings.Contains(m[3], "g") {
 		return "arm64"
@@ -224,22 +252,34 @@ func parseMemory(s string) (int64, bool) {
 	if err != nil || v <= 0 {
 		return 0, false
 	}
+	var unit float64
 	switch m[2] {
 	case "MiB":
-		return int64(v * (1 << 20)), true
+		unit = 1 << 20
 	case "GiB":
-		return int64(v * (1 << 30)), true
+		unit = 1 << 30
 	case "TiB":
-		return int64(v * (1 << 40)), true
+		unit = 1 << 40
+	default:
+		return 0, false
 	}
-	return 0, false
+	b := v * unit
+	// Float→int64 conversion overflow is not defined to saturate in Go; on
+	// some arches it wraps negative, which would poison capacity math. No
+	// real instance is anywhere near 2^63 bytes, so reject instead.
+	if b >= math.MaxInt64 {
+		return 0, false
+	}
+	return int64(b), true
 }
 
-// fetchSpot returns the latest spot price per instance type, averaged across
-// availability zones.
+// fetchSpot returns the newest spot price per instance type, averaged across
+// availability zones. The newest-per-AZ winner must be picked across ALL
+// pages before averaging: history for one AZ spans page boundaries, so a
+// per-page "latest" would let stale prices leak into the average.
 func (s *Syncer) fetchSpot(ctx context.Context) (map[string]float64, error) {
 	start := time.Now().Add(-2 * time.Hour)
-	sums := map[string][]float64{}
+	latest := map[string]map[string]spotPoint{} // type → az → newest
 	var next *string
 	for {
 		resp, err := s.ec2.DescribeSpotPriceHistory(ctx, &ec2.DescribeSpotPriceHistoryInput{
@@ -250,14 +290,13 @@ func (s *Syncer) fetchSpot(ctx context.Context) (map[string]float64, error) {
 		if err != nil {
 			return nil, err
 		}
-		latest := map[string]map[string]spotPoint{} // type → az → newest
 		for _, h := range resp.SpotPriceHistory {
 			t := string(h.InstanceType)
 			if t == "" || h.SpotPrice == nil || h.Timestamp == nil {
 				continue
 			}
 			price, err := strconv.ParseFloat(*h.SpotPrice, 64)
-			if err != nil || price <= 0 {
+			if err != nil || price <= 0 || math.IsInf(price, 1) {
 				continue
 			}
 			az := str(h.AvailabilityZone)
@@ -268,23 +307,18 @@ func (s *Syncer) fetchSpot(ctx context.Context) (map[string]float64, error) {
 				latest[t][az] = spotPoint{price: price, at: *h.Timestamp}
 			}
 		}
-		for t, azs := range latest {
-			for _, pt := range azs {
-				sums[t] = append(sums[t], pt.price)
-			}
-		}
 		if resp.NextToken == nil || *resp.NextToken == "" {
 			break
 		}
 		next = resp.NextToken
 	}
 	out := map[string]float64{}
-	for t, prices := range sums {
+	for t, azs := range latest {
 		sum := 0.0
-		for _, p := range prices {
-			sum += p
+		for _, pt := range azs {
+			sum += pt.price
 		}
-		out[t] = sum / float64(len(prices))
+		out[t] = sum / float64(len(azs))
 	}
 	return out, nil
 }
