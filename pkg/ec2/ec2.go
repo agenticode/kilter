@@ -99,6 +99,20 @@ const (
 	TagAWSEKSCluster    = "aws:eks:cluster-name"
 	TagKilterMode       = "kilter.dev/mode"
 	TagName             = "Name"
+
+	// TagASGName marks an instance an Auto Scaling group launched. EC2 Auto
+	// Scaling "automatically adds a tag to instances with a key of
+	// aws:autoscaling:groupName and a value of the Auto Scaling group name"
+	// ([verified], see FINDINGS.md §Batch), and the `aws:` prefix is reserved
+	// — "You can't edit or delete tag names or values with this prefix" — so
+	// unlike a convention tag it can be neither forged nor stripped.
+	//
+	// It is the selector the Batch containment gate uses. AWS Batch "creates
+	// and manages ... Amazon EC2 Auto Scaling Groups" for its managed compute
+	// environments [verified], and no EC2 tag key that identifies a Batch
+	// instance *as Batch* is documented anywhere — see FINDINGS.md §Batch for
+	// what was checked and refuted.
+	TagASGName = "aws:autoscaling:groupName"
 )
 
 // Reason codes. They are stable strings meant to be stored, matched on and
@@ -107,6 +121,13 @@ const (
 	// Ownership and guardrails — the instance is not this domain's to size.
 	ReasonK8sTagged = "k8s-tagged"
 	ReasonModeOff   = "guardrail-mode-off"
+	// ReasonASGManaged fires on [TagASGName]. The instance's shape comes from
+	// a launch template, so the instance is not the resizable unit; and for an
+	// AWS-Batch-managed compute environment, resizing it at all is a manual
+	// modification of a fleet AWS documents itself as fully controlling. This
+	// is deliberately *not* named `batch-managed`: the selector is honest
+	// about detecting an ASG, not about detecting Batch. FINDINGS.md §Batch.
+	ReasonASGManaged = "asg-managed"
 
 	// Evidence quality — we were not shown enough to decide.
 	ReasonNoMetrics           = "no-metrics"
@@ -400,6 +421,29 @@ func (i Instance) K8sCluster() (string, bool) {
 	return "", false
 }
 
+// AutoScalingGroup returns the Auto Scaling group that launched this instance,
+// and true when one did. An ASG member's shape is set by a launch template,
+// not by the instance: a resize applied here is reverted by the next
+// scale-out, and on an AWS-Batch-managed group it is a manual modification of
+// a fleet AWS "assumes full control of". Sizing the group is a template-level
+// job this domain does not do, so membership is an ownership suppression
+// (§3.5, FINDINGS.md §5 and §Batch).
+//
+// The group name is returned unparsed. A Batch-created group carries Batch's
+// naming, but that naming is not documented and this package does not pattern
+// match on it — the suppression does not need to know which fleet manager it
+// is protecting, only that there is one.
+func (i Instance) AutoScalingGroup() (string, bool) {
+	v, ok := i.Tags[TagASGName]
+	if !ok {
+		return "", false
+	}
+	if v = strings.TrimSpace(v); v != "" {
+		return v, true
+	}
+	return "(unnamed)", true
+}
+
 // ModeOff reports the kilter.dev/mode=off tag guardrail.
 func (i Instance) ModeOff() bool {
 	return strings.EqualFold(strings.TrimSpace(i.Tags[TagKilterMode]), "off")
@@ -458,6 +502,12 @@ type Snapshot struct {
 	Stale bool `json:"stale,omitempty"`
 	// Warnings are human-readable collection problems, sorted and deduped.
 	Warnings []string `json:"warnings,omitempty"`
+	// Batch carries the optional AWS Batch enrichment (batchenrich.go). Nil
+	// whenever no Batch seam was configured, the account runs no Batch, or the
+	// describes failed — in all three cases the snapshot is otherwise exactly
+	// what it would have been, because Batch enriches the report and is never
+	// evidence for a sizing decision.
+	Batch *BatchInventory `json:"batch,omitempty"`
 }
 
 // sortWarnings deduplicates and sorts, so two collectors that hit the same

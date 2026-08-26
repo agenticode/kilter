@@ -258,9 +258,11 @@ func (a Assessment) SuppressionFor(code string) (Suppression, bool) {
 }
 
 // Excluded reports whether this instance belongs to another owner — a
-// Kubernetes cluster, or an operator who tagged it off.
+// Kubernetes cluster, a fleet manager such as an Auto Scaling group or an AWS
+// Batch compute environment, or an operator who tagged it off.
 func (a Assessment) Excluded() bool {
-	return a.Suppressed(ReasonK8sTagged) || a.Suppressed(ReasonModeOff)
+	return a.Suppressed(ReasonK8sTagged) || a.Suppressed(ReasonModeOff) ||
+		a.Suppressed(ReasonASGManaged)
 }
 
 // AdvisoryFor returns the advisory with the given code.
@@ -342,6 +344,10 @@ func (s *Sizer) Assess(now time.Time, snap *Snapshot, inv *commit.Inventory) *Re
 	sort.Slice(rep.Assessments, func(i, j int) bool {
 		return rep.Assessments[i].Target.ID < rep.Assessments[j].Target.ID
 	})
+	// AWS Batch insights (U15b). Report-scope, because they describe a compute
+	// environment's configuration rather than any one instance — and because
+	// U15a excludes Batch-managed instances, which may carry no advisories.
+	rep.Advisories = s.batchInsights(snap)
 	rep.Warnings = sortWarnings(rep.Warnings)
 	rep.Totals = rep.computeTotals()
 	return rep
@@ -430,6 +436,31 @@ func (s *Sizer) assess(now time.Time, snap *Snapshot, t Target, inv *commit.Inve
 		a.suppress(ReasonModeOff, fmt.Sprintf(
 			"tagged %s=off: the operator has opted this instance out, mirroring the Kubernetes annotation "+
 				"guardrail", TagKilterMode))
+		return a
+	}
+	// Fleet ownership (§3.5, §7 trap 14). An ASG member is not the resizable
+	// unit — its launch template is — and the fleet manager may be AWS Batch,
+	// which "creates and manages ... Amazon EC2 Auto Scaling Groups" and
+	// "assumes full control of the compute resources in a managed compute
+	// environment and can terminate instances ... at any time" [verified].
+	// A Batch compute environment with minvCpus > 0 keeps instances alive with
+	// an empty queue "even if the compute environment is DISABLED", so it
+	// presents as a long-lived, fully-covered, near-zero-CPU instance that
+	// clears every evidence gate below and reads as unambiguously oversized.
+	// Shrinking that floor is wrong in kind, not in degree: the floor is a
+	// deliberately bought job start latency, and this domain measures no
+	// latency at all. The insight AWS Batch operators actually want is priced
+	// against the compute environment, not the instance — see batchenrich.go.
+	if group, ok := in.AutoScalingGroup(); ok {
+		a.suppress(ReasonASGManaged, fmt.Sprintf(
+			"carries %s=%q: this instance was launched by an Auto Scaling group, so its shape comes from a launch "+
+				"template and a per-instance resize is reverted by the next scale-out. If that group is an AWS "+
+				"Batch managed compute environment, resizing is worse than useless — AWS assumes full control of "+
+				"those instances and warns that modifying them by hand causes INVALID compute environments and "+
+				"unexpected costs, and a minvCpus>0 idle floor looks exactly like an oversized instance from here. "+
+				"Sizing the launch template is a template-level job this domain does not do (FINDINGS.md §5); for "+
+				"Batch, the compute environment's minvCpus floor is reported as an advisory instead",
+			TagASGName, group))
 		return a
 	}
 

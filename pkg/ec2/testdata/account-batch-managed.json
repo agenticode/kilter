@@ -1,0 +1,67 @@
+{
+  "inventoryPages": [
+    {
+      "reservations": [
+        {
+          "reservationId": "r-batch-ce",
+          "instances": [
+            {
+              "instanceId": "i-0batchfloor",
+              "instanceType": "m5.2xlarge",
+              "architecture": "x86_64",
+              "platformDetails": "Linux/UNIX",
+              "tenancy": "default",
+              "availabilityZone": "us-east-1a",
+              "state": "running",
+              "launchTime": "2026-05-22T01:00:00Z",
+              "monitoringState": "disabled",
+              "tags": [
+                {"key": "aws:autoscaling:groupName", "value": "prod-batch-ce_Batch_9f2c7e1a3b"},
+                {"key": "Name", "value": "prod-batch-ce - Batch Instance"}
+              ]
+            }
+          ]
+        },
+        {
+          "reservationId": "r-eks-ng",
+          "instances": [
+            {
+              "instanceId": "i-1eksnode",
+              "instanceType": "m5.2xlarge",
+              "architecture": "x86_64",
+              "platformDetails": "Linux/UNIX",
+              "tenancy": "default",
+              "availabilityZone": "us-east-1b",
+              "state": "running",
+              "launchTime": "2026-05-22T01:00:00Z",
+              "monitoringState": "disabled",
+              "tags": [
+                {"key": "aws:autoscaling:groupName", "value": "eks-prod-ng-1-4ac2f0e1"},
+                {"key": "kubernetes.io/cluster/prod-eks", "value": "owned"}
+              ]
+            }
+          ]
+        },
+        {
+          "reservationId": "r-standalone",
+          "instances": [
+            {
+              "instanceId": "i-2plain",
+              "instanceType": "m5.2xlarge",
+              "architecture": "x86_64",
+              "platformDetails": "Linux/UNIX",
+              "tenancy": "default",
+              "availabilityZone": "us-east-1a",
+              "state": "running",
+              "launchTime": "2026-05-22T01:00:00Z",
+              "monitoringState": "disabled",
+              "tags": [
+                {"key": "Name", "value": "reporting-worker"}
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

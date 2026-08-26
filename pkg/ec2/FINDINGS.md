@@ -396,3 +396,163 @@ rendering for the CLI.
 - The `Domain.Recommend(now, ledger)` signature in §5.3 takes a `*commit.Ledger`.
   This package takes a `*commit.Inventory` (which is what `pkg/pricing/commit`
   actually exports) and does the account-wide before/after construction itself.
+
+---
+
+## 7. Batch — U15, containment without a domain
+
+Spec: `docs/design/rds-batch-assessment.md` §3, §5 U15, §7 trap 14. That
+document's verdict — **decline AWS Batch as a domain** — is unchanged here and
+is not relitigated. Batch has no bill of its own ("There is no additional
+charge for AWS Batch" [verified]) and its compute environment already
+autoscales `desiredvCpus` "between the minimum and maximum values based on job
+queue demand" [verified], so there is no target for a rightsizer to size. What
+it does have is a live footgun aimed at this package, which U15 closes.
+
+### 7.1 The wrong answer that was shipping
+
+`pkg/ec2` recognized three ownership tag keys, all Kubernetes. A Batch managed
+compute environment's container instances are ordinary EC2 instances that
+`DescribeInstances` returns, so they were assessed as standalone instances.
+
+The 7-day `MinWindow` gate accidentally protected most of them — and the
+exception was exactly the wrong one. `minvCpus` is "the minimum number of vCPUs
+that a compute environment should maintain **(even if the compute environment
+is `DISABLED`)**" [verified], so a `minvCpus > 0` floor with an empty queue is a
+long-lived instance at near-zero CPU with complete coverage. It clears every
+evidence gate here.
+
+Measured on this tree before the fix, against `testdata/account-batch-managed.json`
+plus 30 days of ~2 % CPU:
+
+```
+PROPOSE m5.2xlarge → r5.xlarge   net $96.36/mo   confidence 0.71   risk medium (stop-start)
+```
+
+A confident recommendation to **shrink an idle floor instead of questioning
+it**, against a resource AWS says it "can terminate ... at any time" and warns
+produces "unexpected costs" when modified by hand. Wrong in kind, not in
+degree. `TestMinVCpusFloorIsNotReadAsIdleDemand` pins it, and its counterfactual
+half re-derives that proposal from an untagged twin so the test fails loudly if
+the ownership gate is ever the *only* thing left standing between the fixture
+and a recommendation.
+
+### 7.2 The selector: what was checked, what was refuted, what shipped
+
+§5 U15a required a **verified** selector and marked the exact EC2 tag key AWS
+Batch applies `[unverified]`. All three candidates were checked against AWS
+documentation on **2026-08-26**. Two were refuted; the third does not exist.
+
+| Candidate | Verdict | Evidence |
+|---|---|---|
+| **Batch-propagated resource tags** (`ComputeResource.tags`) | **Refuted.** Not a selector. | The field is `Required: No` and entirely operator-supplied — "Key-value pair tags to be applied to Amazon EC2 resources that are launched in the compute environment ... for example, `{ "Name": "Batch Instance - C4OnDemand" }`. This is helpful for **recognizing your** AWS Batch instances in the Amazon EC2 console" [verified]. A tag the operator may simply not set cannot gate a suppression. |
+| **A Batch-applied system tag** (an `aws:batch:*` key) | **Not found.** Not claimed. | Neither the managed-compute-environment page nor the `ComputeResource` API reference documents any tag AWS Batch applies on its own behalf, and repeated targeted searches surfaced none. The nearest documented precedents belong to *other* services (search corroboration points to `aws:ecs:containerInstanceId` for ECS Managed Instances — [not re-verified], and not Batch either way). Absent documentation, this package does not pattern-match a key it cannot cite. |
+| **ECS container-instance membership** of the Batch-managed cluster | **Deferred**, not cheap. | Real and documented — a managed compute environment "registers [instances] with an Amazon ECS cluster" [verified] — but it costs a **third** cloud seam (`ecs:ListContainerInstances` + `ecs:DescribeContainerInstances`) plus the `ecsClusterArn` join. §5 U15b scopes the optional seam to `batch:Describe*`. See §7.5. |
+
+**So U15a took the fallback `pkg/ec2/FINDINGS.md` §5 already deferred**, which
+§5 U15a explicitly sanctions: suppress ASG members outright and leave the
+launch template to a template-level sizer.
+
+That fallback rests on two facts that *are* verified, which is the whole reason
+it is the honest choice:
+
+1. AWS Batch "creates and manages multiple AWS resources on your behalf ...
+   including Amazon EC2 Launch Templates, **Amazon EC2 Auto Scaling Groups**,
+   Amazon EC2 Spot Fleets, and Amazon ECS Clusters" [verified,
+   https://docs.aws.amazon.com/batch/latest/userguide/managed_compute_environments.html].
+2. "The Auto Scaling group **automatically adds a tag to instances with a key of
+   `aws:autoscaling:groupName`** and a value of the Auto Scaling group name",
+   and "Do not use the `aws:` prefix in your tag names or values, because it is
+   reserved for AWS use. **You can't edit or delete tag names or values with
+   this prefix**" [verified,
+   https://docs.aws.amazon.com/autoscaling/ec2/userguide/ec2-auto-scaling-tagging.html].
+
+Fact 2 is what makes `TagASGName` a better selector than any convention tag in
+this package: it is applied by AWS at instance creation, on every ASG member,
+and it can be neither forged by a workload nor stripped by an operator who
+wants a bigger number in the report.
+
+### 7.3 The suppression is named `asg-managed`, not `batch-managed`
+
+§5 U15a proposed the code `batch-managed`. That name belonged to the
+verified-Batch-selector branch, which §7.2 refuted. Reason codes here are
+"stable strings meant to be stored, matched on and asserted against", and this
+one fires on **every** ASG member — plain ASGs, EKS managed node groups that
+are not otherwise k8s-tagged, Spot Fleet-backed groups — not only on Batch. A
+code that claimed `batch-managed` on all of them would be a lie in the one
+field an operator is meant to filter on. The suppression *prose* names AWS
+Batch prominently, because Batch is why the gate exists.
+
+| Reason code | Fires when | Test |
+|---|---|---|
+| `asg-managed` | `aws:autoscaling:groupName` present. The instance's shape comes from a launch template, so the instance is not the resizable unit; and if the group is Batch's, resizing is a manual modification of a fleet AWS "assumes full control of". | `TestBatchManagedInstanceIsSuppressedFiresAlone`, `TestMinVCpusFloorIsNotReadAsIdleDemand`, `TestFleetSelectorIsTheReservedAWSTagOnly` |
+
+Ordering: `k8s-tagged` → `guardrail-mode-off` → `asg-managed`. An EKS managed
+node group tags its instances with **both** `kubernetes.io/cluster/*` and
+`aws:autoscaling:groupName`; the k8s routing is the more specific claim and
+keeps winning, so the hand-off to the k8s-nodes pipeline is unchanged. That
+precedence is asserted, not assumed
+(`TestBatchManagedInstanceIsSuppressedFiresAlone`, `i-1eksnode`).
+
+`Assessment.Excluded()` now includes `asg-managed`, so `Report.Validate()`
+enforces that these instances carry neither a proposal nor an advisory.
+
+**What this costs.** The gate is broader than Batch: a plain ASG whose members
+an operator genuinely wanted assessed individually is now refused. That is the
+§5 "ASG-level targets" decision being taken rather than deferred again, and it
+is the conservative direction — a stated refusal naming the launch template,
+instead of a per-instance recommendation the next scale-out reverts.
+
+### 7.4 U15b — three insights, no domain
+
+`batchenrich.go`. One **optional** seam (`BatchAPI`: `DescribeComputeEnvironments`,
+`DescribeJobQueues`), nil by default via `CollectorConfig.Batch`. No new
+`domain.Kind`, no `domain.Domain`, no actuator, no AWS SDK, no network.
+
+Findings are **report-scope** (`Report.Advisories`) rather than per-assessment,
+for a structural reason: they describe a compute environment's configuration,
+which no EC2 instance carries — and §7.2 means this package cannot map an
+instance to its compute environment anyway. `Report.Validate()` holds them to
+the same contract as an assessment's advisories: a caveat is mandatory and
+`Advisory.Actuatable()` must return false.
+
+| Advisory | Reports | Money | Test |
+|---|---|---|---|
+| `batch-minvcpus-floor` | `minvCpus > 0` on a MANAGED `EC2`/`SPOT` compute environment, priced per month, with the attached job queues named — or the fact that **none** is attached, which is the sharpest version of the finding. | Gross = the list-price cost of the floor. **Net = 0.** | `TestMinVCpusIdleFloorIsPricedAsAnInsight`, `TestUnpriceableFloorIsReportedWithoutANumber` |
+| `batch-best-fit` | `allocationStrategy == BEST_FIT`, **including when the field is empty** — "if this parameter isn't specified, the `BEST_FIT` allocation strategy is used by default" [verified]. Quotes both documented costs: "keeps costs lower but can limit scaling", and it "[doesn't] support infrastructure updates". | none | `TestBestFitAndBidPercentageAreReportedNeverChanged` |
+| `batch-bid-percentage` | A non-empty `bidPercentage` on a `SPOT` compute environment, against AWS's own "For most use cases, we recommend leaving this field empty" [verified]. | none | `TestBestFitAndBidPercentageAreReportedNeverChanged` |
+
+Three deliberate refusals inside the enrichment:
+
+- **`desiredvCpus` is never a finding.** AWS manages it; reporting it would be
+  reporting an autoscaler's current position as a defect.
+- **Net savings on the floor is zero, on purpose.** `minvCpus` buys job *start
+  latency*, and this package measures no latency at all. The gross figure is
+  carried so a UI can show the number; the net stays zero so the floor cannot
+  reach `Totals.AdvisoryNetSavingsMonthlyUSD` and be read as claimable money.
+  Same shape as `undersized`, where "growing an instance is not a saving and
+  must not claim one".
+- **The floor price is a stated lower bound.** It prices every floor vCPU at
+  the cheapest `$/vCPU-hour` among the compute environment's *declared*
+  instance types, so it under-states rather than over-states. AWS's own
+  `optimal` / `default_x86_64` / `default_arm64` bundles are **not** resolved —
+  they pick families that vary by region and that AWS "periodically updates" —
+  so a compute environment using only those gets an advisory that says it could
+  not be priced instead of a fabricated number.
+
+Degradation is a test, not a hope. `TestBatchEnrichmentIsOptional` asserts that
+a nil seam, a failing `DescribeComputeEnvironments`, a failing
+`DescribeJobQueues`, and an account with no Batch at all each leave the EC2
+report byte-for-byte decision-identical, still `Validate()`-clean, still
+renderable — with a warning naming what was lost. A Batch failure never marks
+the snapshot `Stale`: no target's evidence is affected by it.
+
+### 7.5 Deliberately deferred (Batch)
+
+| Deferred | Why, and what would close it |
+|---|---|
+| **Batch `SPOT` compute environments that use Spot Fleet rather than an ASG.** | AWS Batch manages "Amazon EC2 Spot Fleets" as well as Auto Scaling groups [verified], and a Spot Fleet member need not carry `aws:autoscaling:groupName`. Such an instance is **still assessed today** — the residual hole in §7.2's fallback. Closing it needs a *verified* Spot-Fleet-applied instance tag; a search for one (`aws:ec2spot:fleet-request-id`) returned no AWS documentation, so nothing is claimed and nothing is matched. |
+| **Mapping an instance to its compute environment.** | The ECS route in §7.2: join `ComputeEnvironmentDetail.ecsClusterArn` to `ecs:ListContainerInstances` → `ec2InstanceId`. It would narrow `asg-managed` back to a true `batch-managed`, and would let the floor advisory name the instances actually holding the floor. Costs a third seam and an IAM action outside U15's scope. |
+| **Job-definition rightsizing.** | Declined, and §3.4's reasoning stands: job CPU/memory needs paid Container Insights and is "collected only for jobs with a defined memory reservation" [not re-verified]; per-job series are far too short for any evidence gate here; and reservation → instance-hour runs through an allocation strategy packing a future queue. `pkg/lambda`'s rule transfers verbatim if it is ever built — no saving claimed without a measured instance-hour count at the proposed reservation. |
+| **Flipping `allocationStrategy` or clearing `bidPercentage`.** | Never. Both are infrastructure updates to a Batch-managed resource, and a `BEST_FIT` compute environment cannot receive an infrastructure update at all — so the "fix" is a create-migrate-delete of the compute environment. Reported, never actuated. |
+| **A Batch fixture in `Fixture`.** | `BatchFixture` is a separate replay type in `batchenrich.go`. An account recording that has never seen Batch should not grow two empty fields; if a recorded account ever needs both seams in one file, merge then. |

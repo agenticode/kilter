@@ -174,6 +174,12 @@ type CollectorConfig struct {
 	// {"running"}: a stopped instance bills nothing per hour and has no
 	// current CPU to size against.
 	IncludeStates []string
+	// Batch is the OPTIONAL AWS Batch seam (batchenrich.go). Nil — the zero
+	// value — is the supported default and produces exactly the snapshot this
+	// collector produced before the seam existed. When set, two read-only
+	// describes enrich the report with compute-environment advisories; a seam
+	// that errors degrades to a warning, never to a failed collection.
+	Batch BatchAPI
 }
 
 func (c CollectorConfig) window() time.Duration {
@@ -321,6 +327,17 @@ func (c *Collector) Collect(ctx context.Context, now time.Time) (*Snapshot, erro
 		targets[i].Blind = blindSpots(targets[i])
 	}
 	snap.Targets = targets
+
+	// The optional Batch enrichment, last and deliberately consequence-free:
+	// it adds report-scope advisories and cannot mark a target partial, mark
+	// the snapshot stale, or fail the collection. A permissions gap on
+	// batch:Describe* costs the operator three insights, not their EC2 report.
+	if c.cfg.Batch != nil {
+		bi, batchWarns := collectBatch(ctx, c.cfg.Batch, c.cfg.maxPages())
+		snap.Batch = bi
+		warns = append(warns, batchWarns...)
+	}
+
 	snap.Warnings = sortWarnings(warns)
 	return snap, nil
 }
