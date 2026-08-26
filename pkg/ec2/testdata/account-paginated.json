@@ -1,0 +1,371 @@
+{
+  "inventoryPages": [
+    {
+      "reservations": [
+        {
+          "reservationId": "r-001",
+          "instances": [
+            {
+              "instanceId": "i-0a00000000000000a",
+              "instanceType": "m5.xlarge",
+              "architecture": "x86_64",
+              "tenancy": "default",
+              "availabilityZone": "us-east-1a",
+              "state": "running",
+              "launchTime": "2026-01-05T09:30:00Z",
+              "monitoringState": "disabled",
+              "tags": [
+                {
+                  "key": "Name",
+                  "value": "billing-api"
+                },
+                {
+                  "key": "env",
+                  "value": "prod"
+                }
+              ]
+            },
+            {
+              "instanceId": "i-0b00000000000000b",
+              "instanceType": "t3.large",
+              "architecture": "x86_64",
+              "tenancy": "default",
+              "availabilityZone": "us-east-1a",
+              "state": "running",
+              "launchTime": "2026-01-05T09:30:00Z",
+              "monitoringState": "enabled",
+              "tags": [
+                {
+                  "key": "Name",
+                  "value": "queue-worker"
+                }
+              ],
+              "cpuCredits": "unlimited"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "reservations": [
+        {
+          "reservationId": "r-002",
+          "instances": [
+            {
+              "instanceId": "i-0c00000000000000c",
+              "instanceType": "m5.large",
+              "architecture": "x86_64",
+              "tenancy": "default",
+              "availabilityZone": "us-east-1a",
+              "state": "stopped",
+              "launchTime": "2026-01-05T09:30:00Z",
+              "monitoringState": "disabled",
+              "tags": [
+                {
+                  "key": "Name",
+                  "value": "parked"
+                }
+              ]
+            },
+            {
+              "instanceId": "i-0d00000000000000d",
+              "instanceType": "m5.2xlarge",
+              "architecture": "x86_64",
+              "tenancy": "default",
+              "availabilityZone": "us-east-1a",
+              "state": "running",
+              "launchTime": "2026-01-05T09:30:00Z",
+              "monitoringState": "disabled",
+              "tags": [
+                {
+                  "key": "kubernetes.io/cluster/prod-eks",
+                  "value": "owned"
+                },
+                {
+                  "key": "Name",
+                  "value": "eks-node"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "reservations": [
+        {
+          "reservationId": "r-003",
+          "instances": [
+            {
+              "instanceId": "i-0e00000000000000e",
+              "instanceType": "m5.large",
+              "architecture": "x86_64",
+              "tenancy": "default",
+              "availabilityZone": "us-east-1a",
+              "state": "running",
+              "launchTime": "2026-01-05T09:30:00Z",
+              "monitoringState": "enabled",
+              "tags": [
+                {
+                  "key": "kilter.dev/mode",
+                  "value": "off"
+                },
+                {
+                  "key": "Name",
+                  "value": "opted-out"
+                }
+              ],
+              "instanceStoreVolumes": 2
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "metrics": [
+    {
+      "instanceId": "i-0a00000000000000a",
+      "metric": "CPUUtilization",
+      "points": [
+        {
+          "at": "2026-08-20T00:00:00Z",
+          "value": 3.1
+        },
+        {
+          "at": "2026-08-20T00:05:00Z",
+          "value": 4.8
+        },
+        {
+          "at": "2026-08-20T00:10:00Z",
+          "value": 2.9
+        },
+        {
+          "at": "2026-08-20T00:15:00Z",
+          "value": 11.4
+        },
+        {
+          "at": "2026-08-20T00:20:00Z",
+          "value": 3.3
+        },
+        {
+          "at": "2026-08-20T00:25:00Z",
+          "value": 4.0
+        }
+      ]
+    },
+    {
+      "instanceId": "i-0b00000000000000b",
+      "metric": "CPUUtilization",
+      "points": [
+        {
+          "at": "2026-08-20T00:00:00Z",
+          "value": 41.0
+        },
+        {
+          "at": "2026-08-20T00:01:00Z",
+          "value": 55.5
+        },
+        {
+          "at": "2026-08-20T00:02:00Z",
+          "value": 38.2
+        },
+        {
+          "at": "2026-08-20T00:03:00Z",
+          "value": 62.1
+        },
+        {
+          "at": "2026-08-20T00:04:00Z",
+          "value": 47.7
+        },
+        {
+          "at": "2026-08-20T00:05:00Z",
+          "value": 51.0
+        }
+      ]
+    },
+    {
+      "instanceId": "i-0b00000000000000b",
+      "metric": "CPUCreditBalance",
+      "points": [
+        {
+          "at": "2026-08-20T00:00:00Z",
+          "value": 120.0
+        },
+        {
+          "at": "2026-08-20T00:01:00Z",
+          "value": 92.0
+        },
+        {
+          "at": "2026-08-20T00:02:00Z",
+          "value": 61.0
+        },
+        {
+          "at": "2026-08-20T00:03:00Z",
+          "value": 30.0
+        },
+        {
+          "at": "2026-08-20T00:04:00Z",
+          "value": 4.0
+        },
+        {
+          "at": "2026-08-20T00:05:00Z",
+          "value": 0.0
+        }
+      ]
+    },
+    {
+      "instanceId": "i-0b00000000000000b",
+      "metric": "CPUSurplusCreditsCharged",
+      "points": [
+        {
+          "at": "2026-08-20T00:00:00Z",
+          "value": 0.0
+        },
+        {
+          "at": "2026-08-20T00:01:00Z",
+          "value": 0.0
+        },
+        {
+          "at": "2026-08-20T00:02:00Z",
+          "value": 0.0
+        },
+        {
+          "at": "2026-08-20T00:03:00Z",
+          "value": 0.0
+        },
+        {
+          "at": "2026-08-20T00:04:00Z",
+          "value": 6.5
+        },
+        {
+          "at": "2026-08-20T00:05:00Z",
+          "value": 9.0
+        }
+      ]
+    },
+    {
+      "instanceId": "i-0b00000000000000b",
+      "metric": "CPUSurplusCreditBalance",
+      "points": [
+        {
+          "at": "2026-08-20T00:00:00Z",
+          "value": 0.0
+        },
+        {
+          "at": "2026-08-20T00:01:00Z",
+          "value": 0.0
+        },
+        {
+          "at": "2026-08-20T00:02:00Z",
+          "value": 0.0
+        },
+        {
+          "at": "2026-08-20T00:03:00Z",
+          "value": 0.0
+        },
+        {
+          "at": "2026-08-20T00:04:00Z",
+          "value": 12.0
+        },
+        {
+          "at": "2026-08-20T00:05:00Z",
+          "value": 21.0
+        }
+      ]
+    },
+    {
+      "instanceId": "i-0b00000000000000b",
+      "metric": "CPUCreditUsage",
+      "points": [
+        {
+          "at": "2026-08-20T00:00:00Z",
+          "value": 0.8
+        },
+        {
+          "at": "2026-08-20T00:01:00Z",
+          "value": 1.1
+        },
+        {
+          "at": "2026-08-20T00:02:00Z",
+          "value": 0.7
+        },
+        {
+          "at": "2026-08-20T00:03:00Z",
+          "value": 1.3
+        },
+        {
+          "at": "2026-08-20T00:04:00Z",
+          "value": 1.0
+        },
+        {
+          "at": "2026-08-20T00:05:00Z",
+          "value": 1.1
+        }
+      ]
+    },
+    {
+      "instanceId": "i-0d00000000000000d",
+      "metric": "CPUUtilization",
+      "points": [
+        {
+          "at": "2026-08-20T00:00:00Z",
+          "value": 66.0
+        },
+        {
+          "at": "2026-08-20T00:05:00Z",
+          "value": 71.2
+        },
+        {
+          "at": "2026-08-20T00:10:00Z",
+          "value": 58.4
+        },
+        {
+          "at": "2026-08-20T00:15:00Z",
+          "value": 80.1
+        },
+        {
+          "at": "2026-08-20T00:20:00Z",
+          "value": 64.9
+        },
+        {
+          "at": "2026-08-20T00:25:00Z",
+          "value": 69.0
+        }
+      ]
+    },
+    {
+      "instanceId": "i-0e00000000000000e",
+      "metric": "CPUUtilization",
+      "points": [
+        {
+          "at": "2026-08-20T00:00:00Z",
+          "value": 12.0
+        },
+        {
+          "at": "2026-08-20T00:01:00Z",
+          "value": 9.5
+        },
+        {
+          "at": "2026-08-20T00:02:00Z",
+          "value": 14.2
+        },
+        {
+          "at": "2026-08-20T00:03:00Z",
+          "value": 8.8
+        },
+        {
+          "at": "2026-08-20T00:04:00Z",
+          "value": 10.1
+        },
+        {
+          "at": "2026-08-20T00:05:00Z",
+          "value": 11.7
+        }
+      ]
+    }
+  ],
+  "metricPageSize": 3,
+  "messages": [
+    "recorded from a sandbox account on 2026-08-20"
+  ]
+}
