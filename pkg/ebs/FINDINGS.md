@@ -256,3 +256,170 @@ half-applied.
 - `Assessment.Observed.Floor` tells the operator whether a proposal is floored
   at gp2's baseline (and therefore whether waiting for a full week would save
   more).
+
+---
+
+## 7. K3 — `Learn` could not tell "not addressed to me" from "my collector found nothing"
+
+`cmd/FINDINGS.md` §5.1, fixed here. One production change (`Learn` gains an
+addressing test), one new test file, `go.mod`/`go.sum` untouched, no existing
+test modified.
+
+### 7.1 Root cause
+
+`Kind` is `domain.EC2`, and the ec2 kind covers instances as well as volumes.
+More than one collector therefore feeds it: `pkg/domain/ec2` composes an
+instance half beside this one, and that half ships its evidence as an opaque
+`Snapshot.Payload` rather than as generic targets.
+
+`Learn` had exactly one rule for a snapshot with nothing in `Targets` or
+`Samples`:
+
+```go
+if len(snap.Targets) == 0 && len(snap.Samples) == 0 {
+	d.stale = true
+	d.staleReason = "collector delivered no volumes"     // ← a claim about OUR collector
+	return nil
+}
+```
+
+That is right under this package's own contract — one collector, one domain,
+one snapshot — and wrong inside a composite. Handed the sibling's snapshot the
+domain concluded that **its** collector had found nothing and degraded itself.
+Health is last-write-wins over `d.stale`, so whichever snapshot arrived last
+decided it. The bug is not in the arithmetic; it is that the package treated
+*absence of its own data* as *evidence about its own collector*, without first
+asking whether the snapshot was addressed to it.
+
+### 7.2 The fix
+
+A new `addressedHere(snap)`, consulted before `Learn` touches any state:
+
+> A snapshot that carries content, none of it ours, was not addressed to us and
+> is a no-op. A snapshot that carries **nothing** is our own collector reporting
+> an empty account.
+
+"Ours" is `hasVolumeEvidence`: any target `isVolumeTarget` accepts, or any
+sample `isVolumeSample` accepts (`isVolumeSample` is the metric-side twin of
+the existing `isVolumeTarget` — one of this domain's three metric names, or a
+`vol-` target ID). Nothing decodes `Payload`; it stays opaque, which it must,
+and this package never writes one.
+
+**The distinction that matters is preserved, deliberately.** An EBS snapshot
+with genuinely zero volumes carries no payload, no targets and no samples, so
+it is still *addressed*, still degrades the domain, and still says
+`collector delivered no volumes` — distinct from the never-collected reason
+`no volume inventory learned yet`. Collapsing "we looked and found none" into
+"we never looked" would have been worse than the bug, and
+`TestEmptyAccountStaysDistinguishableFromNoCollection` pins both branches
+against each other so a later simplification cannot quietly merge them.
+
+The no-op is a full no-op, which matters: the old code wrote `d.scope`,
+`d.stale`, `d.staleReason`, `d.learned` and `d.lastAt` from the sibling's
+snapshot before it ever looked at a volume.
+
+### 7.3 Failing-first evidence
+
+The three tests in `addressing_test.go` were written and **run against the
+unfixed tree first**. All three failed. `TestSiblingSnapshotDoesNotDecideHealth`
+reported the two answers verbatim:
+
+```
+volumes first:   {"ready":false,"reportOnly":true,
+                  "reason":"partial collection: collector delivered no volumes","targets":1}
+                 refused: domain: report-only ...: partial collection: collector delivered no volumes
+instances first: {"ready":true,"reportOnly":false,"targets":1}
+                 2 steps
+```
+
+Same two snapshots, same clock, same fixture — a different health line and a
+different plan, decided by arrival order. That is §5.1 reproduced inside the
+package that owns it.
+
+| Test | What it holds |
+|---|---|
+| `TestSiblingSnapshotDoesNotDecideHealth` | the two-snapshot case, both orders, compared on health + report + plan; and pins *which* answer is correct by comparing against the volume snapshot alone |
+| `TestEmptyAccountStaysDistinguishableFromNoCollection` | an empty EBS collection still degrades and still says why; the sibling's snapshot can fake neither state |
+| `TestSiblingSnapshotsAreInertUnderShuffle` | 24 seeded shuffles of one volume snapshot against six sibling snapshots (one of them `Stale`) spread either side of it in time — every interleaving must equal the volume snapshot alone |
+| `FuzzSnapshotArrivalOrder` | arbitrary permutations, plus the degenerate shapes a shuffle test would not build: a nil snapshot, and an instance-only snapshot with no payload. 1.1 M executions, no failures |
+
+The oracle is `stateOf`: health JSON + report JSON + the plan (step count, or
+the refusal string). Comparing only the report would have missed this bug — the
+report was *identical* in both orders. Only health and the plan differed.
+
+### 7.4 Survey: the same class of defect elsewhere in `pkg/ebs`
+
+Looked for anywhere the package infers something about its collector from the
+absence of its own data.
+
+**(a) `d.lastAt` and `d.learned` advanced on a foreign snapshot — same class,
+also fixed, and NOT covered by `Part.Accepts`.** The composite guard is
+`len(s.Payload) == 0 || len(s.Targets) > 0`, so an instance-only snapshot with
+no payload passes it. Probed against the unfixed tree:
+
+```
+PROBE-A (before): learned=true lastAt=2026-08-06 scope="other-scope"
+                  health={Ready:true ReportOnly:false Reason: Targets:0}
+PROBE-A (after):  learned=false lastAt=zero scope="123456789012/us-east-1"
+                  health={Ready:false Reason:no volume inventory learned yet ...}
+```
+
+A domain tracking **zero volumes** reported itself freshly and cleanly
+collected, and rewrote `d.scope` — which is `Report.Scope` — to the other
+half's. This is the optimistic mirror image of §5.1: the reported bug made a
+healthy domain look broken; this made a blind one look healthy, which is the
+more dangerous direction because `PlanSteps` gates on `Health`. `addressedHere`
+closes it because it asks for *volume* evidence, not merely for targets.
+
+**(b) `Checkpoint`/`Restore` drops `stale`/`staleReason` — same shape, reported,
+not fixed.** `Restore` restores `learned` but not the degradation, so `Health`
+falls past `case d.stale` to the freshness check and reports ready. Probed, and
+still true on this tree:
+
+```
+PROBE-B before checkpoint: {Ready:false ReportOnly:true Reason:partial collection: us-east-1c timed out}
+PROBE-B after  restore:    {Ready:true  ReportOnly:false Reason:}
+```
+
+A partial collection is forgotten by a process restart, and the absence of the
+persisted flag is read as "the collection was clean" — the same missing-field-
+becomes-a-positive-claim shape as §7.1. The fix is two fields on the versioned
+`checkpoint` struct; old blobs unmarshal them as `false`, i.e. exactly today's
+behaviour, so no `checkpointVersion` bump is needed. Left out because it is a
+persisted-format change and not the ordering bug this unit was scoped to.
+
+**(c) The collector layer is clean, and is the model for the rest.**
+`collectMetrics` records an unanswered CloudWatch query as `StatusTruncated`
+rather than as an empty series, and `Collect` marks a volume type it never
+metered `Blind` — both exist precisely so the domain cannot read silence as
+"this volume does no I/O". `Collect` also returns a transport error on the
+first inventory call instead of an empty snapshot, "because a failed call is not
+evidence of an empty account". That sentence is the invariant §7.1 violated one
+layer up.
+
+**(d) `observe` refuses per volume, which is the right shape.** No IOPS series
+produces an `unmeasured` refusal on *that volume*, not a claim about the
+collector. Same for `insufficient-samples` / `insufficient-window`. A per-target
+refusal with a stable code is the honest way to say "we were not shown enough".
+
+**(e) Cooldown is permissive on absence, by design.** `lastModification`
+returning `ok == false` means no cooldown applies, so an unobserved modification
+does not block a step. That is why `RecordApplied`/`d.applied` exists (§6 item
+5), and it is documented rather than inferred. Noted, not a defect.
+
+### 7.5 Is `Part.Accepts` now redundant?
+
+**For this pairing, yes — strictly.** `volumeSnapshot` rejects exactly
+`len(Payload) > 0 && len(Targets) == 0`; `addressedHere` no-ops on that and on
+strictly more (see (a): payload-less instance targets, which `Accepts` lets
+through). Every snapshot `Accepts` rejects, `Learn` would now ignore anyway.
+
+**It should still stay.** It is a guard at a different layer and it is not this
+unit's to remove: `Part.Accepts` is `pkg/domain`'s answer for *any* half that
+cannot tell on its own what it is looking at, and only one of the two halves
+that exist today has been taught to. Deleting it would make the composite's
+correctness depend on every present and future part having done what `pkg/ebs`
+just did. If a later unit that owns `pkg/domain` does drop it, `volumeSnapshot`
+and the `Accepts` field on the volumes part in `pkg/domain/ec2/ec2.go` are the
+two things to delete, and `TestSiblingSnapshotsAreInertUnderShuffle` is the test
+that then carries the property alone.

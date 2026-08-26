@@ -439,12 +439,19 @@ func (d *Domain) Kind() domain.Kind { return Kind }
 // snapshot degrades the domain (Health goes report-only) and returns nil. Only
 // a snapshot addressed to another domain is an error, because that is a wiring
 // bug rather than an operational condition.
+//
+// A snapshot that was never addressed to this domain at all is neither: see
+// [addressedHere]. It is a no-op, because it is not evidence about this
+// domain's collector in any direction.
 func (d *Domain) Learn(snap *domain.Snapshot) error {
 	if snap == nil {
 		return nil
 	}
 	if snap.Domain != "" && snap.Domain != Kind {
 		return fmt.Errorf("%w: %q is not %q", domain.ErrWrongDomain, snap.Domain, Kind)
+	}
+	if !addressedHere(snap) {
+		return nil
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -738,6 +745,64 @@ func isVolumeTarget(t domain.Target) bool {
 
 // volumeIDPrefix is the EBS volume ID prefix.
 const volumeIDPrefix = "vol-"
+
+// isVolumeSample is [isVolumeTarget] for the metric half of a snapshot: a
+// sample is this domain's if it names one of the metrics this domain reads, or
+// if its target ID has the volume prefix.
+func isVolumeSample(s domain.Sample) bool {
+	switch s.Metric {
+	case SampleIOPS, SampleThroughputMBps, SampleBurstBalancePct:
+		return true
+	}
+	return strings.HasPrefix(s.Ref.ID, volumeIDPrefix)
+}
+
+// hasVolumeEvidence reports whether a snapshot says anything at all about
+// volumes.
+func hasVolumeEvidence(snap *domain.Snapshot) bool {
+	for _, t := range snap.Targets {
+		if isVolumeTarget(t) {
+			return true
+		}
+	}
+	for _, s := range snap.Samples {
+		if isVolumeSample(s) {
+			return true
+		}
+	}
+	return false
+}
+
+// addressedHere reports whether a snapshot is evidence about THIS domain's
+// collector.
+//
+// [Kind] is shared. The ec2 domain covers instances as well as volumes, and
+// more than one collector feeds it: pkg/domain/ec2 composes an instance half
+// beside this one, which ships an opaque Payload only that half can decode.
+// Read through this package's own one-collector contract, that snapshot is
+// indistinguishable from "my collector delivered no volumes", so the domain
+// degraded itself on someone else's collection — and whichever snapshot
+// arrived last decided its health. The same inputs in a different order
+// produced a different health line and a different plan refusal.
+// cmd/FINDINGS.md §5.1 is the report; TestSiblingSnapshotDoesNotDecideHealth
+// is the reproduction.
+//
+// The rule: a snapshot that carries content, none of it ours, was not
+// addressed to us and says nothing — about our volumes, our freshness or our
+// collector's health. A snapshot that carries NOTHING is our own collector
+// reporting an empty account. That is a real answer and it still degrades the
+// domain, because "we looked and found none" must stay distinguishable from
+// "we never looked" (Health separates the two by prose). Collapsing those two
+// would be worse than the bug this guards.
+//
+// It deliberately does not decode Payload: the field is opaque to everything
+// but the domain that wrote it, and this domain never writes one.
+func addressedHere(snap *domain.Snapshot) bool {
+	if hasVolumeEvidence(snap) {
+		return true
+	}
+	return len(snap.Payload) == 0 && len(snap.Targets) == 0 && len(snap.Samples) == 0
+}
 
 // modeOf resolves a volume's effective mode from its tags.
 func (d *Domain) modeOf(labels map[string]string) string {
