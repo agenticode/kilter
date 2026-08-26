@@ -6,6 +6,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/agenticode/kilter/pkg/confidence"
 	"github.com/agenticode/kilter/pkg/model"
 	"github.com/agenticode/kilter/pkg/pricing"
 	"github.com/agenticode/kilter/pkg/pricing/commit"
@@ -133,31 +134,18 @@ type Observation struct {
 }
 
 // ConfidenceFactor is one earned component of a confidence score.
-type ConfidenceFactor struct {
-	Name   string  `json:"name"`
-	Weight float64 `json:"weight"`
-	Earned float64 `json:"earned"` // 0..1
-	Why    string  `json:"why"`
-}
+//
+// Aliased rather than redeclared: the shape and its JSON are shared with
+// pkg/lambda, and an alias means a report cannot drift between them.
+type ConfidenceFactor = confidence.Factor
 
 // Confidence is a score built from nothing. It starts at zero and adds only
 // what the evidence earns, so a missing signal cannot be mistaken for a
 // present one; [Config.MinConfidence] is the bar it has to clear.
-type Confidence struct {
-	Score   float64            `json:"score"`
-	Factors []ConfidenceFactor `json:"factors,omitempty"`
-}
-
-func (c *Confidence) add(name string, weight, earned float64, why string) {
-	if earned < 0 {
-		earned = 0
-	}
-	if earned > 1 {
-		earned = 1
-	}
-	c.Factors = append(c.Factors, ConfidenceFactor{Name: name, Weight: weight, Earned: earned, Why: why})
-	c.Score += weight * earned
-}
+//
+// This domain adds its factors with [confidence.Confidence.AddBounded], not
+// Add: see pkg/confidence/FINDINGS.md §3.
+type Confidence = confidence.Confidence
 
 // Confidence weights. They sum to 1.
 const (
@@ -857,28 +845,27 @@ func (s *Sizer) gravitonAdvisory(in Instance, cur pricing.InstanceType, obs Obse
 // what it can demonstrate.
 func (s *Sizer) confidence(obs Observation) Confidence {
 	var c Confidence
-	c.add("sample-coverage", weightCoverage, obs.Coverage,
+	c.AddBounded("sample-coverage", weightCoverage, obs.Coverage,
 		fmt.Sprintf("%d of ~%d expected datapoints", obs.Samples, obs.ExpectedSamples))
 
-	windowEarned := 0.0
-	if s.cfg.MinWindow > 0 {
-		windowEarned = obs.Window.Duration().Seconds() / s.cfg.MinWindow.Seconds()
-	}
-	c.add("window", weightWindow, windowEarned,
-		fmt.Sprintf("observed %s against a %s minimum", obs.Window.String(), s.cfg.MinWindow.Round(time.Hour)))
+	// An EC2 minimum window is quoted in days, so the prose rounds to the
+	// hour. That argument is the domain fact pkg/confidence refuses to guess.
+	windowEarned, windowWhy := confidence.WindowFactor(
+		obs.Window.Duration(), s.cfg.MinWindow, obs.Window.String(), time.Hour)
+	c.AddBounded(confidence.FactorWindow, weightWindow, windowEarned, windowWhy)
 
 	memEarned, memWhy := 1.0, "memory observed via the CloudWatch agent"
 	if obs.MemoryBlind {
 		memEarned, memWhy = 0, "memory-blind: no CloudWatch agent, so no memory metric exists"
 	}
-	c.add("memory-signal", weightMemory, memEarned, memWhy)
+	c.AddBounded("memory-signal", weightMemory, memEarned, memWhy)
 
 	resEarned, resWhy := 1.0, fmt.Sprintf("%d-second datapoints", obs.PeriodSeconds)
 	if obs.PeriodSeconds > PeriodDetailedSeconds {
 		resEarned = 0.4
 		resWhy = fmt.Sprintf("%d-second datapoints hide shorter peaks", obs.PeriodSeconds)
 	}
-	c.add("metric-resolution", weightResolution, resEarned, resWhy)
+	c.AddBounded("metric-resolution", weightResolution, resEarned, resWhy)
 
 	burstEarned, burstWhy := 1.0, "not a credit-based instance type"
 	switch obs.Burst.Class {
@@ -889,24 +876,13 @@ func (s *Sizer) confidence(obs Observation) Confidence {
 	case BurstHealthy, BurstSurplus:
 		burstWhy = "credit metrics present and classified"
 	}
-	c.add("burst-evidence", weightBurst, burstEarned, burstWhy)
+	c.AddBounded("burst-evidence", weightBurst, burstEarned, burstWhy)
 	return c
 }
 
 // weakestFactor names the factor that cost the most confidence, so a
 // low-confidence refusal says what would fix it.
-func weakestFactor(c Confidence) string {
-	worst, lost := "", -1.0
-	for _, f := range c.Factors {
-		if l := f.Weight * (1 - f.Earned); l > lost {
-			worst, lost = f.Name+": "+f.Why, l
-		}
-	}
-	if worst == "" {
-		return "no single dominant factor"
-	}
-	return worst
-}
+func weakestFactor(c Confidence) string { return confidence.WeakestFactor(c) }
 
 func seriesStatus(t Target) string {
 	for _, s := range t.Series {

@@ -6,6 +6,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/agenticode/kilter/pkg/confidence"
 	"github.com/agenticode/kilter/pkg/domain"
 	"github.com/agenticode/kilter/pkg/pricing/commit"
 )
@@ -87,31 +88,18 @@ func (c Config) validate() error {
 }
 
 // ConfidenceFactor is one earned component of a confidence score.
-type ConfidenceFactor struct {
-	Name   string  `json:"name"`
-	Weight float64 `json:"weight"`
-	Earned float64 `json:"earned"` // 0..1
-	Why    string  `json:"why"`
-}
+//
+// Aliased rather than redeclared: the shape and its JSON are shared with
+// pkg/ec2, and an alias means a report cannot drift between them.
+type ConfidenceFactor = confidence.Factor
 
 // Confidence is a score built from nothing. It starts at zero and adds only
 // what the evidence earns, so a missing signal cannot be mistaken for a present
 // one; [Config.MinConfidence] is the bar it has to clear.
-type Confidence struct {
-	Score   float64            `json:"score"`
-	Factors []ConfidenceFactor `json:"factors,omitempty"`
-}
-
-func (c *Confidence) add(name string, weight, earned float64, why string) {
-	if !finite(earned) || earned < 0 {
-		earned = 0
-	}
-	if earned > 1 {
-		earned = 1
-	}
-	c.Factors = append(c.Factors, ConfidenceFactor{Name: name, Weight: weight, Earned: earned, Why: why})
-	c.Score += weight * earned
-}
+//
+// This domain adds its factors with [confidence.Confidence.Add], which treats
+// a non-finite earned value as no evidence: see pkg/confidence/FINDINGS.md §3.
+type Confidence = confidence.Confidence
 
 // Confidence weights. They sum to 1. measured-points carries the largest
 // weight on purpose: it is the factor this whole package is about.
@@ -745,9 +733,9 @@ func (s *Sizer) confidence(obs Observation, usable []MemoryPoint) Confidence {
 	case len(usable) == 2:
 		pointsEarned = 0.8
 	}
-	c.add("measured-points", weightMeasuredPoints, pointsEarned, pointsWhy)
+	c.Add("measured-points", weightMeasuredPoints, pointsEarned, pointsWhy)
 
-	c.add("report-coverage", weightReportCoverage, obs.ReportCoverage,
+	c.Add("report-coverage", weightReportCoverage, obs.ReportCoverage,
 		fmt.Sprintf("%d REPORT lines parsed for %.0f invocations (source: %s)",
 			obs.Records, obs.Invocations, obs.InvocationSource))
 
@@ -759,14 +747,14 @@ func (s *Sizer) confidence(obs Observation, usable []MemoryPoint) Confidence {
 		warmEarned = 1 - obs.ColdShare
 		warmWhy = fmt.Sprintf("%.1f%% of invocations were cold starts", obs.ColdShare*100)
 	}
-	c.add("warm-share", weightWarmShare, warmEarned, warmWhy)
+	c.Add("warm-share", weightWarmShare, warmEarned, warmWhy)
 
-	windowEarned := 0.0
-	if s.cfg.MinWindow > 0 {
-		windowEarned = obs.Window.Duration().Seconds() / s.cfg.MinWindow.Seconds()
-	}
-	c.add("window", weightWindow, windowEarned,
-		fmt.Sprintf("observed %s against a %s minimum", obs.Window.String(), s.cfg.MinWindow.Round(time.Minute)))
+	// A Lambda log window is a slice of hours, not days, so the prose rounds
+	// to the minute. That argument is the domain fact pkg/confidence refuses
+	// to guess: rounding this minimum to the hour would print a wrong number.
+	windowEarned, windowWhy := confidence.WindowFactor(
+		obs.Window.Duration(), s.cfg.MinWindow, obs.Window.String(), time.Minute)
+	c.Add(confidence.FactorWindow, weightWindow, windowEarned, windowWhy)
 
 	headEarned, headWhy := 0.0, "max memory used is at the configured ceiling: possibly truncated"
 	if cur, ok := obs.Current(); ok && cur.MemoryMB > 0 && !cur.AtCeiling {
@@ -775,24 +763,13 @@ func (s *Sizer) confidence(obs Observation, usable []MemoryPoint) Confidence {
 		headWhy = fmt.Sprintf("%s used of %s configured (%.0f%% margin)",
 			fmtMB(cur.MaxMemoryUsedMB), fmtMB(cur.MemoryMB), margin*100)
 	}
-	c.add("memory-headroom", weightHeadroom, headEarned, headWhy)
+	c.Add("memory-headroom", weightHeadroom, headEarned, headWhy)
 	return c
 }
 
 // weakestFactor names the factor that cost the most confidence, so a
 // low-confidence refusal says what would fix it.
-func weakestFactor(c Confidence) string {
-	worst, lost := "", -1.0
-	for _, f := range c.Factors {
-		if l := f.Weight * (1 - f.Earned); l > lost {
-			worst, lost = f.Name+": "+f.Why, l
-		}
-	}
-	if worst == "" {
-		return "no single dominant factor"
-	}
-	return worst
-}
+func weakestFactor(c Confidence) string { return confidence.WeakestFactor(c) }
 
 // memoryPointsValue renders the measured settings as evidence prose.
 func memoryPointsValue(points []MemoryPoint) string {
