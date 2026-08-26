@@ -1,0 +1,256 @@
+{
+  "cluster": "prod-eks-1",
+  "subject": {
+    "cluster": "prod-eks-1",
+    "kind": "container",
+    "key": "Deployment/payments/api/server"
+  },
+  "from": "2026-03-01T00:00:00Z",
+  "to": "2026-03-02T06:00:00Z",
+  "action": "recommend-only",
+  "sizing": {
+    "container": "server",
+    "currentRequest": {
+      "milliCPU": 1000,
+      "memoryBytes": 536870912
+    },
+    "targetRequest": {
+      "milliCPU": 700,
+      "memoryBytes": 536870912
+    },
+    "currentLimit": {
+      "milliCPU": 2000,
+      "memoryBytes": 1073741824
+    },
+    "targetLimit": {
+      "milliCPU": 1400,
+      "memoryBytes": 1073741824
+    },
+    "deltaRequest": {
+      "milliCPU": 300,
+      "memoryBytes": 0
+    },
+    "class": "steady",
+    "reason": "p95 cpu 690m with 20% headroom; memory held at the OOM floor",
+    "samples": 120,
+    "windowHours": 30,
+    "oomCount": 1,
+    "savingsMonthlyUSD": 18.42
+  },
+  "confidence": {
+    "score": 0.38,
+    "basis": [
+      {
+        "name": "history-depth",
+        "value": 0.6,
+        "weight": 1,
+        "note": "120/200 samples"
+      },
+      {
+        "name": "window-span",
+        "value": 0.625,
+        "weight": 1,
+        "note": "30.0h/48.0h"
+      },
+      {
+        "name": "post-change-soak",
+        "value": 1,
+        "weight": 1,
+        "note": "24.0h/6.0h since change"
+      }
+    ]
+  },
+  "usage": {
+    "from": "2026-03-01T00:00:00Z",
+    "to": "2026-03-02T06:00:00Z",
+    "tier": 1,
+    "samples": 116,
+    "windows": 3,
+    "cpu": {
+      "p50": 685,
+      "p95": 695,
+      "p99": 695,
+      "max": 695
+    },
+    "mem": {
+      "p50": 297795584,
+      "p95": 297795584,
+      "p99": 297795584,
+      "max": 297795584
+    },
+    "throttleRatio": 0.12000000000000005,
+    "restarts": 0,
+    "ooms": 1
+  },
+  "drivers": [
+    {
+      "kind": "oom-floor",
+      "detail": "1 OOMKill in the window holds the memory request at or above its floor",
+      "evidence": [
+        "dig/1/prod-eks-1/container/Deployment%2Fpayments%2Fapi%2Fserver@1772366400000000000",
+        "evt/prod-eks-1/container/Deployment%2Fpayments%2Fapi%2Fserver/oomkill@1772366400000000000"
+      ]
+    },
+    {
+      "kind": "cpu-throttled",
+      "detail": "CFS throttling averaged 12.0% of periods; shrinking CPU here would make it worse",
+      "value": 0.12000000000000005,
+      "evidence": [
+        "dig/1/prod-eks-1/container/Deployment%2Fpayments%2Fapi%2Fserver@1772323200000000000",
+        "dig/1/prod-eks-1/container/Deployment%2Fpayments%2Fapi%2Fserver@1772366400000000000",
+        "dig/1/prod-eks-1/container/Deployment%2Fpayments%2Fapi%2Fserver@1772370000000000000",
+        "evt/prod-eks-1/container/Deployment%2Fpayments%2Fapi%2Fserver/throttle-high@1772395200000000000"
+      ]
+    },
+    {
+      "kind": "confidence",
+      "name": "history-depth",
+      "detail": "120/200 samples",
+      "value": 0.6,
+      "evidence": [
+        "dig/1/prod-eks-1/container/Deployment%2Fpayments%2Fapi%2Fserver@1772323200000000000",
+        "dig/1/prod-eks-1/container/Deployment%2Fpayments%2Fapi%2Fserver@1772366400000000000",
+        "dig/1/prod-eks-1/container/Deployment%2Fpayments%2Fapi%2Fserver@1772370000000000000"
+      ]
+    },
+    {
+      "kind": "confidence",
+      "name": "post-change-soak",
+      "detail": "24.0h/6.0h since change",
+      "value": 1,
+      "evidence": [
+        "dig/1/prod-eks-1/container/Deployment%2Fpayments%2Fapi%2Fserver@1772323200000000000",
+        "dig/1/prod-eks-1/container/Deployment%2Fpayments%2Fapi%2Fserver@1772366400000000000",
+        "dig/1/prod-eks-1/container/Deployment%2Fpayments%2Fapi%2Fserver@1772370000000000000",
+        "evt/prod-eks-1/workload/Deployment%2Fpayments%2Fapi/deploy@1772344800000000000",
+        "evt/prod-eks-1/workload/Deployment%2Fpayments%2Fapi/hpa-scale@1772398800000000000"
+      ]
+    },
+    {
+      "kind": "confidence",
+      "name": "window-span",
+      "detail": "30.0h/48.0h",
+      "value": 0.625,
+      "evidence": [
+        "dig/1/prod-eks-1/container/Deployment%2Fpayments%2Fapi%2Fserver@1772323200000000000",
+        "dig/1/prod-eks-1/container/Deployment%2Fpayments%2Fapi%2Fserver@1772366400000000000",
+        "dig/1/prod-eks-1/container/Deployment%2Fpayments%2Fapi%2Fserver@1772370000000000000"
+      ]
+    },
+    {
+      "kind": "behavior-class",
+      "name": "steady",
+      "detail": "behavior class \"steady\" selects the sizing policy applied",
+      "evidence": [
+        "dig/1/prod-eks-1/container/Deployment%2Fpayments%2Fapi%2Fserver@1772323200000000000",
+        "dig/1/prod-eks-1/container/Deployment%2Fpayments%2Fapi%2Fserver@1772366400000000000",
+        "dig/1/prod-eks-1/container/Deployment%2Fpayments%2Fapi%2Fserver@1772370000000000000"
+      ]
+    },
+    {
+      "kind": "usage-history",
+      "detail": "116 samples over 30h0m0s: cpu p95 695m / max 695m, memory p95 284.0MiB / max 284.0MiB",
+      "value": 695,
+      "evidence": [
+        "dig/1/prod-eks-1/container/Deployment%2Fpayments%2Fapi%2Fserver@1772323200000000000",
+        "dig/1/prod-eks-1/container/Deployment%2Fpayments%2Fapi%2Fserver@1772366400000000000",
+        "dig/1/prod-eks-1/container/Deployment%2Fpayments%2Fapi%2Fserver@1772370000000000000"
+      ]
+    },
+    {
+      "kind": "recent-change",
+      "detail": "2 change events (deploy, HPA or regime change) fall inside the window",
+      "evidence": [
+        "evt/prod-eks-1/workload/Deployment%2Fpayments%2Fapi/deploy@1772344800000000000",
+        "evt/prod-eks-1/workload/Deployment%2Fpayments%2Fapi/hpa-scale@1772398800000000000"
+      ]
+    },
+    {
+      "kind": "prior-decision",
+      "detail": "1 earlier decision for this subject is on record",
+      "evidence": [
+        "dec/prod-eks-1/container/Deployment%2Fpayments%2Fapi%2Fserver@1772409600000000000"
+      ]
+    }
+  ],
+  "events": [
+    {
+      "at": "2026-03-01T21:00:00Z",
+      "kind": "hpa-scale",
+      "subject": {
+        "cluster": "prod-eks-1",
+        "kind": "workload",
+        "key": "Deployment/payments/api"
+      },
+      "severity": "info",
+      "attrs": {
+        "replicas": "14"
+      }
+    },
+    {
+      "at": "2026-03-01T20:00:00Z",
+      "kind": "throttle-high",
+      "subject": {
+        "cluster": "prod-eks-1",
+        "kind": "container",
+        "key": "Deployment/payments/api/server"
+      },
+      "severity": "warning",
+      "attrs": {
+        "ratio": "0.12"
+      }
+    },
+    {
+      "at": "2026-03-01T12:00:00Z",
+      "kind": "oomkill",
+      "subject": {
+        "cluster": "prod-eks-1",
+        "kind": "container",
+        "key": "Deployment/payments/api/server"
+      },
+      "severity": "critical",
+      "attrs": {
+        "container": "server"
+      }
+    },
+    {
+      "at": "2026-03-01T06:00:00Z",
+      "kind": "deploy",
+      "subject": {
+        "cluster": "prod-eks-1",
+        "kind": "workload",
+        "key": "Deployment/payments/api"
+      },
+      "severity": "info",
+      "attrs": {
+        "replicas": "12"
+      }
+    }
+  ],
+  "decisions": [
+    {
+      "at": "2026-03-02T00:00:00Z",
+      "subject": {
+        "cluster": "prod-eks-1",
+        "kind": "container",
+        "key": "Deployment/payments/api/server"
+      },
+      "kind": "recommendation",
+      "summary": "hold memory at the OOM floor",
+      "fingerprint": "f00dcafe",
+      "payload": {
+        "target": "512Mi"
+      }
+    }
+  ],
+  "citations": [
+    "dec/prod-eks-1/container/Deployment%2Fpayments%2Fapi%2Fserver@1772409600000000000",
+    "dig/1/prod-eks-1/container/Deployment%2Fpayments%2Fapi%2Fserver@1772323200000000000",
+    "dig/1/prod-eks-1/container/Deployment%2Fpayments%2Fapi%2Fserver@1772366400000000000",
+    "dig/1/prod-eks-1/container/Deployment%2Fpayments%2Fapi%2Fserver@1772370000000000000",
+    "evt/prod-eks-1/container/Deployment%2Fpayments%2Fapi%2Fserver/oomkill@1772366400000000000",
+    "evt/prod-eks-1/container/Deployment%2Fpayments%2Fapi%2Fserver/throttle-high@1772395200000000000",
+    "evt/prod-eks-1/workload/Deployment%2Fpayments%2Fapi/deploy@1772344800000000000",
+    "evt/prod-eks-1/workload/Deployment%2Fpayments%2Fapi/hpa-scale@1772398800000000000"
+  ]
+}

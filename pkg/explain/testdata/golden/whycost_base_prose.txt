@@ -1,0 +1,11 @@
+Between 2026-03-01 00:00Z and 2026-03-08 00:00Z the hourly cost of cluster "prod-eks-1" rose by +$0.120000/h (+$87.60/mo), from $1.000000 to $1.120000.
+Attribution order: node-count → spot-ratio → instance-mix → pricing-catalog (see package doc).
+  spot-ratio         -$0.240000/h    -$175.20/mo  a larger share of the fleet runs on spot capacity [evt/prod-eks-1/node/ip-10-0-3-14/spot-interrupt@1772431200000000000 tl/prod-eks-1@1772323200000000000 tl/prod-eks-1@1772924400000000000]
+  node-count         +$0.200000/h    +$146.00/mo  2 more nodes at the window's starting average price of $0.100000/node-hour [tl/prod-eks-1@1772323200000000000 tl/prod-eks-1@1772924400000000000]
+      of which kilter-action      -$0.200000/h    -$146.00/mo  Kilter removed 2 nodes across 1 applied plan [act/prod-eks-1/a1b2c3d4e5f6@1772539200000000000]
+      of which workload-set       +$0.369231/h    +$269.54/mo  1 new namespace [evt/prod-eks-1/workload/Deployment%2Fml-batch%2Ftrainer/deploy@1772467200000000000 tl/prod-eks-1@1772323200000000000 tl/prod-eks-1@1772924400000000000]
+      of which workload-scaling   +$0.030769/h     +$22.46/mo  existing namespaces requested more capacity [evt/prod-eks-1/workload/Deployment%2Fpayments%2Fapi/deploy@1772503200000000000 tl/prod-eks-1@1772323200000000000 tl/prod-eks-1@1772924400000000000]
+      of which unattributed       +$0.000000/h      +$0.00/mo  every node added or removed is accounted for [tl/prod-eks-1@1772323200000000000 tl/prod-eks-1@1772924400000000000]
+  pricing-catalog    +$0.160000/h    +$116.80/mo  catalog prices rose for 1 node group [evt/prod-eks-1/cluster/prod-eks-1/pricing-change@1772330400000000000 tl/prod-eks-1@1772323200000000000 tl/prod-eks-1@1772924400000000000]
+  instance-mix       +$0.000000/h      +$0.00/mo  the instance-type mix did not move the bill [tl/prod-eks-1@1772323200000000000 tl/prod-eks-1@1772924400000000000]
+  residual           +$0.000000/h      +$0.00/mo  nothing unexplained [tl/prod-eks-1@1772323200000000000 tl/prod-eks-1@1772924400000000000]
