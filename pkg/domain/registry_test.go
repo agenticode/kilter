@@ -109,7 +109,7 @@ func TestRegisterRejectsWiringBugs(t *testing.T) {
 	if err := r.Register(nil); err == nil {
 		t.Error("Register(nil) accepted")
 	}
-	if err := r.Register(&fakeDomain{kind: "rds"}); err == nil {
+	if err := r.Register(&fakeDomain{kind: "quantum-annealer"}); err == nil {
 		t.Error("Register accepted an unknown kind")
 	}
 	if err := r.Register(ready(K8sFargate)); err != nil {

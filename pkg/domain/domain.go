@@ -44,10 +44,16 @@ const (
 	EC2        Kind = "ec2"         // plain EC2, non-Kubernetes
 	ECSFargate Kind = "ecs-fargate"
 	Lambda     Kind = "lambda"
+	// RDS is managed relational database: a billable domain of its own, not a
+	// flavour of EC2. pkg/rds declares `const Kind = domain.Kind("rds")` and
+	// could not be registered until this line existed; pkg/rds/FINDINGS.md §6.1
+	// specifies the change and pkg/rds's TestKindIsHonestAboutRegistration
+	// asserts the property that holds either side of it.
+	RDS Kind = "rds"
 )
 
 // kinds is the closed set of known domains, in canonical (sorted) order.
-var kinds = []Kind{EC2, ECSFargate, K8sFargate, K8sNodes, Lambda}
+var kinds = []Kind{EC2, ECSFargate, K8sFargate, K8sNodes, Lambda, RDS}
 
 // Kinds returns a copy of the known domain kinds in canonical order.
 func Kinds() []Kind {

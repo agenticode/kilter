@@ -235,7 +235,7 @@ func TestReportValidateCatchesEachViolation(t *testing.T) {
 		{"total recs disagree", func(r *Report) { r.Totals.Recommendations = 2; r.Totals.Applicable = 2 }},
 		{"domain count disagrees", func(r *Report) { r.Totals.Domains = 7 }},
 		{"duplicate domain", func(r *Report) { r.Domains = append(r.Domains, r.Domains[0]); r.Totals.Domains = 2 }},
-		{"unknown kind", func(r *Report) { r.Domains[0].Kind = "rds" }},
+		{"unknown kind", func(r *Report) { r.Domains[0].Kind = "quantum-annealer" }},
 		{"invalid recommendation", func(r *Report) { r.Recommendations[0].Evidence = nil }},
 		{"refusal with no code", func(r *Report) {
 			r.Refusals = []Refusal{{Target: TargetRef{ID: "x"}, Reason: "why"}}
