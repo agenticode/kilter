@@ -1,0 +1,213 @@
+{
+  "cluster": "demo-bursty",
+  "window": [
+    "2026-01-05T00:00:00Z",
+    "2026-01-12T00:00:00Z"
+  ],
+  "horizonHours": 24,
+  "baselinePolicy": {
+    "recommend": {
+      "CPUPercentile": 0.95,
+      "CPUHeadroom": 1.15,
+      "MemoryPercentile": 0.99,
+      "MemoryHeadroom": 1.2,
+      "OOMBumpRatio": 1.5,
+      "MinMilliCPU": 10,
+      "MinMemoryBytes": 33554432,
+      "MinSamples": 30,
+      "MinWindow": 21600000000000,
+      "MinChangeRatio": 0.1,
+      "SkipCPUForHPA": true
+    },
+    "plan": {
+      "MinNodeUtilization": 0.5,
+      "MinConfidence": 0.6,
+      "MaxNodeRemovals": 3,
+      "ApplyRecommendations": true,
+      "MinClusterHeadroom": 0.1,
+      "RespectManagedNodes": true,
+      "DefaultMode": "apply"
+    },
+    "decision": {
+      "MinSamples": 30,
+      "MinWindow": 21600000000000,
+      "BaseSoak": 21600000000000,
+      "ClassFlipWindow": 86400000000000,
+      "MinClassStability": 0.7,
+      "MaxHPAThrashPerHour": 2,
+      "MaxForecastDivergence": 0.35,
+      "ActConfidence": 0.6
+    }
+  },
+  "candidatePolicy": {
+    "recommend": {
+      "CPUPercentile": 0.95,
+      "CPUHeadroom": 1.05,
+      "MemoryPercentile": 0.99,
+      "MemoryHeadroom": 1.2,
+      "OOMBumpRatio": 1.5,
+      "MinMilliCPU": 10,
+      "MinMemoryBytes": 33554432,
+      "MinSamples": 30,
+      "MinWindow": 21600000000000,
+      "MinChangeRatio": 0.1,
+      "SkipCPUForHPA": true
+    },
+    "plan": {
+      "MinNodeUtilization": 0.5,
+      "MinConfidence": 0.6,
+      "MaxNodeRemovals": 3,
+      "ApplyRecommendations": true,
+      "MinClusterHeadroom": 0.1,
+      "RespectManagedNodes": true,
+      "DefaultMode": "apply"
+    },
+    "decision": {
+      "MinSamples": 30,
+      "MinWindow": 21600000000000,
+      "BaseSoak": 21600000000000,
+      "ClassFlipWindow": 86400000000000,
+      "MinClassStability": 0.7,
+      "MaxHPAThrashPerHour": 2,
+      "MaxForecastDivergence": 0.35,
+      "ActConfidence": 0.6
+    }
+  },
+  "changes": [
+    {
+      "axis": "cpu-headroom",
+      "from": 1.15,
+      "to": 1.05,
+      "text": "cpu-headroom 1.15 → 1.05"
+    }
+  ],
+  "baseline": {
+    "policy": "69955a2cdd2004fd",
+    "cluster": "demo-bursty",
+    "window": [
+      "2026-01-05T00:00:00Z",
+      "2026-01-12T00:00:00Z"
+    ],
+    "horizonHours": 24,
+    "decisionIntervalHours": 24,
+    "starvationFactor": 1,
+    "snapshots": 2016,
+    "instants": 7,
+    "scored": 14,
+    "decisions": 12,
+    "refusals": {
+      "insufficient-history": 2
+    },
+    "memViolations": 0,
+    "cpuStarvation": 0,
+    "memOOMKills": 0,
+    "oracleGapPct": 92.89006,
+    "oracleGapPctApplied": 23.4255,
+    "policyCostUSD": 6.027429,
+    "oracleCostUSD": 3.1248,
+    "claimedSavingsUSD": 13.023771,
+    "realizedSavingsUSD": 13.023771,
+    "claimedVsRealized": 1,
+    "forgoneSavingsUSD": 2.2752,
+    "refusalsGood": 0,
+    "refusalsIdle": 2,
+    "flipRate": 0,
+    "flips": 0,
+    "resourceRegretUSD": 2.902629,
+    "riskRegretUSD": 0,
+    "regretUSD": 2.902629,
+    "skipped": {
+      "noHorizon": 1,
+      "noSnapshot": 0,
+      "noFutureSamples": 0,
+      "eventQueryErrors": 0
+    },
+    "cost": {
+      "cpuUSDPerCoreHour": 0.024,
+      "memUSDPerGiBHour": 0.006,
+      "incidentUSD": 50
+    }
+  },
+  "candidate": {
+    "policy": "f8e7e12e930bfae8",
+    "cluster": "demo-bursty",
+    "window": [
+      "2026-01-05T00:00:00Z",
+      "2026-01-12T00:00:00Z"
+    ],
+    "horizonHours": 24,
+    "decisionIntervalHours": 24,
+    "starvationFactor": 1,
+    "snapshots": 2016,
+    "instants": 7,
+    "scored": 14,
+    "decisions": 12,
+    "refusals": {
+      "insufficient-history": 2
+    },
+    "memViolations": 0,
+    "cpuStarvation": 0,
+    "memOOMKills": 0,
+    "oracleGapPct": 88.761028,
+    "oracleGapPctApplied": 18.608296,
+    "policyCostUSD": 5.898405,
+    "oracleCostUSD": 3.1248,
+    "claimedSavingsUSD": 13.152795,
+    "realizedSavingsUSD": 13.152795,
+    "claimedVsRealized": 1,
+    "forgoneSavingsUSD": 2.2752,
+    "refusalsGood": 0,
+    "refusalsIdle": 2,
+    "flipRate": 0,
+    "flips": 0,
+    "resourceRegretUSD": 2.773605,
+    "riskRegretUSD": 0,
+    "regretUSD": 2.773605,
+    "skipped": {
+      "noHorizon": 1,
+      "noSnapshot": 0,
+      "noFutureSamples": 0,
+      "eventQueryErrors": 0
+    },
+    "cost": {
+      "cpuUSDPerCoreHour": 0.024,
+      "memUSDPerGiBHour": 0.006,
+      "incidentUSD": 50
+    }
+  },
+  "delta": {
+    "memViolations": 0,
+    "cpuStarvation": 0,
+    "regretUSD": -0.129024,
+    "regretPct": -4.445074,
+    "resourceRegretUSD": -0.129024,
+    "riskRegretUSD": 0,
+    "policyCostUSD": -0.129024,
+    "forgoneSavingsUSD": 0,
+    "oracleGapPct": -4.129032,
+    "oracleGapPctApplied": -4.817204,
+    "decisions": 0,
+    "refusals": 0,
+    "refusalsIdle": 0,
+    "flipRate": 0,
+    "flips": 0,
+    "projectedMonthlyUSD": -0.56064,
+    "windowHours": 168
+  },
+  "gate": {
+    "passed": true,
+    "wins": [
+      "regret $2.9026 → $2.7736",
+      "oracle gap 92.890% → 88.761%"
+    ],
+    "requiredRegretImprovementUSD": 0.029026,
+    "baselinePolicy": "69955a2cdd2004fd",
+    "candidatePolicy": "f8e7e12e930bfae8",
+    "tolerance": {
+      "minRegretImprovementUSD": 0.01,
+      "minRegretImprovementPct": 1,
+      "maxFlipRateIncrease": 0,
+      "maxOracleGapIncreasePct": 0
+    }
+  }
+}

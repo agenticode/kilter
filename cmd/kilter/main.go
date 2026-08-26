@@ -11,6 +11,8 @@
 //	kilter backtest    score a policy against history (falsifiability harness)
 //	kilter explain     the full explain payload behind one recommendation
 //	kilter why-cost    an additive decomposition of a cluster's cost change
+//	kilter whatif      replay history under a candidate policy and gate the delta
+//	kilter proposals   list, inspect and reject closed-loop policy proposals
 //	kilter version     build information
 package main
 
@@ -47,6 +49,8 @@ Commands:
   backtest    Score a policy against history: oracle gap, regret, safety, gate
   explain     Why the engine would resize a container, with citations
   why-cost    Additive, individually-citable decomposition of a cost change
+  whatif      Replay history under a candidate policy: delta, gate, proposal
+  proposals   Closed-loop policy proposals: list, show, reject (approve is refused)
   version     Print version
 
 Run "kilter <command> -h" for command flags.
@@ -91,6 +95,10 @@ func main() {
 		err = runExplain(args)
 	case "why-cost":
 		err = runWhyCost(args)
+	case "whatif":
+		err = runWhatIf(args)
+	case "proposals":
+		err = runProposals(args)
 	case "version", "--version", "-v":
 		fmt.Printf("kilter %s (%s)\n", version, commit)
 	case "help", "-h", "--help":
