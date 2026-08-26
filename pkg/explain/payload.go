@@ -108,6 +108,15 @@ type Explanation struct {
 	// dossier the payload was built from hit a cap.
 	Truncated *evidence.Truncation `json:"truncated,omitempty"`
 	Notes     []string             `json:"notes,omitempty"`
+
+	// VerdictOrigin says which kind of absence Action == unknown is, and is
+	// present only when the verdict was not computed. See [VerdictState].
+	VerdictOrigin *VerdictOrigin `json:"verdictOrigin,omitempty"`
+	// Grounding is the evidence arithmetic behind the payload, present only
+	// when the payload is not grounded — i.e. exactly when a caller needs to
+	// act on it. See [Explanation.GroundingState] and
+	// [Explanation.GroundingError].
+	Grounding *Grounding `json:"grounding,omitempty"`
 }
 
 // ActionUnknown is the Action of an explanation built without a Verdict —
@@ -126,8 +135,21 @@ type ExplainRequest struct {
 	From, To time.Time
 	Store    evidence.Store
 
-	Rec     *recommend.Recommendation
+	Rec *recommend.Recommendation
+	// Verdict is the decision-quality verdict the operational path reached,
+	// copied into the payload unchanged. This package never computes one:
+	// see verdict.go's file comment for why a second evaluation here would
+	// be a fabricated audit trail.
 	Verdict *decision.Verdict
+	// RecVerdict is the production recommendation path's readout for this
+	// subject — one element of recommend.Recommender.Verdicts. It supplies
+	// the verdict when the path reached one (Decision()'s comma-ok, copied
+	// verbatim) and the typed "not computed" state when it did not, which is
+	// every readout the recommender produces today.
+	//
+	// Supply this OR Verdict, never both: two sources for one disposition is
+	// how a payload ends up reporting a verdict nobody reached.
+	RecVerdict *recommend.Verdict
 
 	// SavingsMonthlyUSD is priced by the caller (pkg/plan owns that math).
 	// Reported only when SavingsKnown is set — an explicit flag beats a zero
@@ -172,6 +194,56 @@ func (r *ExplainRequest) validate() error {
 	if r.SavingsKnown && (math.IsNaN(r.SavingsMonthlyUSD) || math.IsInf(r.SavingsMonthlyUSD, 0)) {
 		return fmt.Errorf("explain: savings %v is not a usable amount", r.SavingsMonthlyUSD)
 	}
+	return r.validateVerdict()
+}
+
+// validateVerdict enforces that the payload has exactly one source for its
+// disposition, and that the source is one a verdict could actually come from.
+// Every rule here refuses a fabrication rather than a typo.
+func (r *ExplainRequest) validateVerdict() error {
+	if r.Verdict != nil && r.RecVerdict != nil {
+		return fmt.Errorf("explain: Verdict and RecVerdict are two sources for one disposition; " +
+			"supply exactly one, because the payload cannot report both and must not pick")
+	}
+	if v := r.Verdict; v != nil {
+		switch v.Action {
+		case decision.ActionAct, decision.ActionRecommendOnly, decision.ActionRefuse:
+		default:
+			// A zero decision.Verdict has Action "", which used to render as
+			// a blank verdict — a payload asserting a disposition that is
+			// not one. decision.Decide cannot produce it, so this is a bug
+			// at the call site and says so rather than degrading quietly.
+			return fmt.Errorf("explain: verdict action %q is not one of %q, %q or %q; "+
+				"a verdict with no action is not a verdict",
+				v.Action, decision.ActionAct, decision.ActionRecommendOnly, decision.ActionRefuse)
+		}
+	}
+	rv := r.RecVerdict
+	if rv == nil {
+		return nil
+	}
+	// The readout names a container. Attributing one container's disposition
+	// to another subject is the same fabrication as inventing it.
+	if r.Subject.Kind != evidence.SubjectContainer {
+		return fmt.Errorf("explain: RecVerdict is a container readout but the subject is %q; "+
+			"a workload has no single disposition to report", r.Subject.Kind)
+	}
+	if got := rv.Key.String(); got != r.Subject.Key {
+		return fmt.Errorf("explain: RecVerdict is about %s but the subject is %s; "+
+			"a readout may only explain the container it is about", got, r.Subject.Key)
+	}
+	if r.Rec == nil {
+		return nil
+	}
+	if rv.Rec == nil {
+		return fmt.Errorf("explain: RecVerdict reports disposition %q, which carries no recommendation, "+
+			"but Rec was supplied; the sizing and the disposition would come from different answers",
+			rv.Disposition)
+	}
+	if *r.Rec != *rv.Rec {
+		return fmt.Errorf("explain: Rec and RecVerdict.Rec size %s differently; "+
+			"one of them is stale and the payload must not choose", rv.Key)
+	}
 	return nil
 }
 
@@ -207,7 +279,12 @@ func BuildExplain(req ExplainRequest) (*Explanation, error) {
 	// container template inside it, so a container's case file is missing
 	// exactly the events that explain a post-change refusal. Pull the parent
 	// workload's change events in as well, under their own bound.
+	// ownEvents is fixed before the parent workload's events are folded in:
+	// everything after this point can tell the subject's own record from a
+	// borrowed one, which is what makes "absent" a statement about the
+	// subject rather than about its workload. See grounding.go.
 	events := dos.Events
+	ownEvents := len(dos.Events)
 	if parent, ok := parentWorkload(subject); ok && req.MaxEvents > 0 {
 		pe, err := req.Store.Events(parent, req.From, req.To,
 			evidence.EventDeploy, evidence.EventHPAScale, evidence.EventRegimeChange)
@@ -228,14 +305,38 @@ func BuildExplain(req ExplainRequest) (*Explanation, error) {
 		Decisions: dos.Decisions,
 		Truncated: dos.Truncated,
 	}
-	if req.Verdict != nil {
-		ex.Action = string(req.Verdict.Action)
-		ex.Refusal = req.Verdict.Refusal
-		conf := req.Verdict.Confidence
+	// The verdict. There is exactly one source for it and this package is
+	// never that source: whichever of the two inputs the caller supplied, the
+	// decision.Verdict below is COPIED, never derived. Nothing in this
+	// function calls decision.Evaluate, decision.Decide or decision.Compose.
+	verdict := req.Verdict
+	rec := req.Rec
+	if rv := req.RecVerdict; rv != nil {
+		if d, ok := rv.Decision(); ok {
+			// The production path reached a verdict. Report that one.
+			verdict = &d
+		} else {
+			// It did not. "Not computed" is the fact, and it is a different
+			// fact from a refusal — Action stays unknown, Refusal stays nil,
+			// and the origin says which of the four branches produced the
+			// silence.
+			ex.VerdictOrigin = originOf(rv)
+			ex.Notes = append(ex.Notes, ex.VerdictOrigin.notComputedNote())
+		}
+		if rec == nil {
+			// Byte-for-byte the Recommendation the production path served
+			// for this container, or nil for the three silent dispositions.
+			rec = rv.Rec
+		}
+	}
+	if verdict != nil {
+		ex.Action = string(verdict.Action)
+		ex.Refusal = verdict.Refusal
+		conf := verdict.Confidence
 		ex.Confidence = &conf
 	}
-	if req.Rec != nil {
-		ex.Sizing = sizingOf(req.Rec, req.SavingsMonthlyUSD, req.SavingsKnown)
+	if rec != nil {
+		ex.Sizing = sizingOf(rec, req.SavingsMonthlyUSD, req.SavingsKnown)
 	}
 
 	// Citation pools, computed once and shared by the drivers below.
@@ -282,20 +383,20 @@ func BuildExplain(req ExplainRequest) (*Explanation, error) {
 				confidenceCitations(t.Name, digestIDs, changeIDs, decisionIDs))
 		}
 	}
-	if req.Rec != nil {
-		if req.Rec.OOMCount > 0 {
+	if rec != nil {
+		if rec.OOMCount > 0 {
 			push(Driver{Kind: DriverOOMFloor, Detail: fmt.Sprintf(
 				"%d OOMKill%s in the window %s the memory request at or above its floor",
-				req.Rec.OOMCount, pluralS(req.Rec.OOMCount),
-				pluralVerb(req.Rec.OOMCount, "holds", "hold"))}, oomIDs)
+				rec.OOMCount, pluralS(rec.OOMCount),
+				pluralVerb(rec.OOMCount, "holds", "hold"))}, oomIDs)
 		}
-		if req.Rec.CPUSkipped {
+		if rec.CPUSkipped {
 			push(Driver{Kind: DriverHPAGuard,
 				Detail: "an HPA scales this workload on CPU, so the CPU request is left alone"}, hpaIDs, decisionIDs)
 		}
-		if req.Rec.Class != "" {
-			push(Driver{Kind: DriverClass, Name: string(req.Rec.Class), Detail: fmt.Sprintf(
-				"behavior class %q selects the sizing policy applied", req.Rec.Class)}, digestIDs)
+		if rec.Class != "" {
+			push(Driver{Kind: DriverClass, Name: string(rec.Class), Detail: fmt.Sprintf(
+				"behavior class %q selects the sizing policy applied", rec.Class)}, digestIDs)
 		}
 	}
 	if dos.Usage.Samples > 0 {
@@ -343,10 +444,62 @@ func BuildExplain(req ExplainRequest) (*Explanation, error) {
 			"%d driver%s were computed but dropped for want of a resolvable evidence id; an ungrounded reason is worse than a missing one",
 			ex.Ungrounded, pluralS(ex.Ungrounded)))
 	}
-	if len(ex.Citations) == 0 {
-		ex.Notes = append(ex.Notes, "no evidence is stored for this subject in this window; the payload states the decision but grounds none of it")
-	}
+	ex.noteGrounding(groundingOf(dos, ownEvents, len(events), len(ex.Citations)))
 	return ex, nil
+}
+
+// groundingOf counts what the store returned for the subject and resolves the
+// state from it. The counts are witnesses, not an inventory: digests appear
+// in both Digests and UsageWindows, because the usage summary runs its own
+// query across every stored tier and is the one section a caller's caps
+// cannot suppress.
+func groundingOf(dos *evidence.Dossier, ownEvents, allEvents, citations int) *Grounding {
+	g := &Grounding{
+		Digests:      len(dos.Digests),
+		Events:       ownEvents,
+		Decisions:    len(dos.Decisions),
+		UsageWindows: dos.Usage.Windows,
+		Samples:      dos.Usage.Samples,
+		ParentEvents: allEvents - ownEvents,
+		Citations:    citations,
+	}
+	// A cap that dropped records is proof records exist. Without this the
+	// caller who asks for MaxEvents < 0 gets told the subject does not exist.
+	if t := dos.Truncated; t != nil {
+		g.Withheld = t.Digests + t.Events + t.Decisions
+	}
+	g.State = g.stateFor(citations)
+	return g
+}
+
+// noteGrounding attaches the report and the sentence that goes with it. The
+// report is dropped for a grounded payload: Citations already prove it, and
+// every field would be redundant with the drivers above.
+func (e *Explanation) noteGrounding(g *Grounding) {
+	switch g.State {
+	case GroundingGrounded:
+		return
+	case GroundingAbsent:
+		// The leading clause is the same sentence this payload has always
+		// carried for an empty store, because it is still exactly true.
+		note := "no evidence is stored for this subject in this window; the payload states the decision but grounds none of it"
+		if g.Citations > 0 {
+			// It cites something anyway: the parent workload's change
+			// events, which describe the workload and not this subject.
+			note = fmt.Sprintf("no evidence is stored for this subject in this window; "+
+				"the %d citation%s below %s the parent workload's change event%s, which describe%s the workload, not this subject",
+				g.Citations, pluralS(g.Citations), pluralVerb(g.Citations, "is", "are"),
+				pluralS(g.ParentEvents), pluralVerb(g.ParentEvents, "s", ""))
+		}
+		e.Notes = append(e.Notes, note)
+	case GroundingThin:
+		e.Notes = append(e.Notes, fmt.Sprintf(
+			"evidence is stored for this subject in this window (%d digest%s, %d event%s, %d decision%s, %d usage window%s) "+
+				"but no driver could be grounded in it; the payload states the decision and cites nothing",
+			g.Digests, pluralS(g.Digests), g.Events, pluralS(g.Events),
+			g.Decisions, pluralS(g.Decisions), g.UsageWindows, pluralS(g.UsageWindows)))
+	}
+	e.Grounding = g
 }
 
 // parentWorkload maps a container subject to the workload subject that owns
@@ -599,6 +752,15 @@ func (e *Explanation) Prose() string {
 		}
 		b.WriteString("\n")
 	case e.Action == ActionUnknown:
+		// Two absences, two sentences. "None recorded" for a payload nobody
+		// told anything; "not computed" for one where the engine considered
+		// the subject and reached no verdict. Neither may read as a refusal.
+		if o := e.VerdictOrigin; o != nil && o.State == VerdictNotComputed {
+			fmt.Fprintf(&b, "Verdict: not computed — the recommendation path reported disposition %q "+
+				"(%d sample%s over %s). That is an absent verdict, not a negative one.\n",
+				o.Disposition, o.Samples, pluralS(o.Samples), o.Window)
+			break
+		}
 		b.WriteString("Verdict: none recorded.\n")
 	default:
 		fmt.Fprintf(&b, "Verdict: %s", e.Action)
