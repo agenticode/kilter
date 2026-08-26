@@ -25,8 +25,9 @@ var (
 	bucketPlans       = []byte("plans")       // cluster/timestamp → Plan
 )
 
-// Two more buckets live in their own files, next to the code that owns them:
-// bucketSnapHistory (history.go) and bucketEvidence (evidence.go).
+// Four more buckets live in their own files, next to the code that owns them:
+// bucketSnapHistory (history.go), bucketEvidence (evidence.go),
+// bucketProposals (proposals.go) and bucketRDSCheckpoints (rdscheckpoint.go).
 
 // PlanHistoryLimit bounds retained plans per cluster. Pruning keeps the newest
 // PlanHistoryLimit by Plan.CreatedAt, not by insertion order.
@@ -59,7 +60,10 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("store: open %s: %w", path, err)
 	}
 	err = db.Update(func(tx *bolt.Tx) error {
-		for _, b := range [][]byte{bucketRecommender, bucketSnapshots, bucketPlans, bucketSnapHistory, bucketEvidence} {
+		for _, b := range [][]byte{
+			bucketRecommender, bucketSnapshots, bucketPlans,
+			bucketSnapHistory, bucketEvidence, bucketProposals, bucketRDSCheckpoints,
+		} {
 			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
 				return err
 			}
