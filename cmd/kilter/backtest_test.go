@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/agenticode/kilter/pkg/backtest"
 )
@@ -106,25 +107,38 @@ func TestOracleGapIsRenderedInTheUnitsTheScorecardUses(t *testing.T) {
 
 // TestBacktestLiveHistoryRefusesRatherThanScoringOneSnapshot.
 //
-// This is the honest half of the command. pkg/store keeps only the LATEST
-// snapshot per cluster, so a live replay has no history to replay. Running the
-// harness against that one snapshot would yield a scorecard with the same
-// shape, the same field names and the same confident tone as a real one — the
-// worst possible failure, because the number looks fine.
+// This is the honest half of the command, and it survives the wiring: the
+// refusal MOVED, it was not removed. When this was written pkg/store kept only
+// the latest snapshot per cluster, so a live replay had no history at all and
+// the command refused by naming the missing seam. pkg/store now keeps a
+// time-keyed history and `--cluster` reaches api.Brain.Backtest — which
+// refuses, with api.ErrHistoryTooShort, in exactly the case this test has
+// always been about: a cluster whose retained history holds one snapshot.
+//
+// Running the harness against that one snapshot would yield a scorecard with
+// the same shape, the same field names and the same confident tone as a real
+// one — the worst possible failure, because the number looks fine. The
+// assertion that no scorecard is printed is therefore unchanged and is still
+// the point of the test.
 func TestBacktestLiveHistoryRefusesRatherThanScoringOneSnapshot(t *testing.T) {
+	// A brain that has ingested exactly once: a real database, a real cluster,
+	// one retained snapshot. This is the state a freshly started brain is in.
+	db := brainDB(t, 10, fleetSnapshot(whyCostT0, 4, 0, 500))
+
 	var b strings.Builder
-	err := runBacktestTo(&b, []string{"--cluster", "prod"})
+	err := runBacktestTo(&b, []string{
+		"--cluster", "why-cost-demo", "--db", db,
+		"--from", rfc(whyCostT0), "--to", rfc(whyCostT0.Add(48 * time.Hour)),
+	})
 	if err == nil {
 		t.Fatalf("a live backtest was accepted:\n%s", b.String())
 	}
 	msg := err.Error()
 	for _, want := range []string{
-		"snapshot history is not persisted",
-		"pkg/store",
-		"SaveSnapshotAt",
-		"Snapshots(cluster, from, to)",
-		"backtest.SnapshotSource",
-		"--demo",
+		"refused",
+		"1 snapshot(s)",
+		"scorecard shaped exactly like a real one",
+		"empty replay",
 	} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("the refusal does not mention %q:\n%s", want, msg)
