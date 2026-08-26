@@ -11,28 +11,27 @@ import (
 	krds "github.com/agenticode/kilter/pkg/rds"
 )
 
-// The RDS wiring, and the exact line where it stops.
+// The RDS wiring over a RECORDED account.
 //
 // pkg/rds/FINDINGS.md §6 owes cmd/ four things: the domain kind (landed in
-// pkg/domain), an SDK adapter over three read seams, the collection loop, and
-// the rate override. Three of the four are here. The fourth — the adapter over
-// `*rds.Client` and `*cloudwatch.Client` — is NOT, and cannot be in this
-// build: `github.com/aws/aws-sdk-go-v2/service/rds` and `.../service/cloudwatch`
-// are not in go.mod, and adding them is a go.mod/go.sum change this unit may
-// not make. See cmd/WIRING-FINDINGS.md.
+// pkg/domain), an SDK adapter over the read seams, the collection loop, and
+// the rate override. All four are now wired — the adapter landed in
+// pkg/provider (PR#45) and cmd/kilter/rdslive.go drives it — and this file
+// keeps the half that needs no account.
 //
-// What replaces it is not a stub. `rds.Fixture` implements all three seams
-// with real pagination, real truncation and real empty-account behaviour, and
-// it is exported for exactly this reason — "the seams are the contract, and a
-// contract nobody outside the package can exercise is not a contract". So
-// --rds-fixture drives the REAL collector: rds.NewCollector over the recorded
-// account, rds.Collector.Collect, the real window clamp, the real GetMetricData
-// batching and ID routing. Every line of pkg/rds/collect.go that a live
-// credential would exercise is exercised here, and the only thing missing is
-// the field copy between an SDK struct and a struct with the same field names.
+// It is not a stub and it never was. `rds.Fixture` implements the three
+// collection seams with real pagination, real truncation and real
+// empty-account behaviour, and it is exported for exactly this reason — "the
+// seams are the contract, and a contract nobody outside the package can
+// exercise is not a contract". So --rds-fixture drives the REAL collector:
+// rds.NewCollector over the recorded account, rds.Collector.Collect, the real
+// window clamp, the real GetMetricData batching and ID routing. `rds`'s
+// EnvelopeFixture does the same for the U13 modification seam, so --rds-parity
+// is exercisable without an AWS account too.
 //
 // No credential is read, no ~/.aws is opened, and no network call is made on
-// this path — the same guarantee `kilter domains` already gives.
+// THIS path. `--rds-region` is the path that does, and it is a sibling rather
+// than a replacement: every test in this package drives the recorded one.
 
 // rdsFixtureFile is the on-disk shape of a recorded RDS account.
 //
@@ -73,26 +72,59 @@ type rdsFixtureFile struct {
 	// rds:DescribeReservedDBInstances. §6.2: nil ⇒ net == gross, which
 	// under-claims and can never invent a saving.
 	NoCommitmentAPI bool `json:"noCommitmentAPI,omitempty"`
+
+	// --- the U13 modification seam, read only under --rds-parity ----------
+
+	// StorageOptions is the recorded rds:DescribeValidDBInstanceModifications
+	// answer per DBInstanceIdentifier: the ranges AWS says this instance can
+	// be provisioned within. An instance absent from this map has an UNKNOWN
+	// envelope, not an unlimited one, and every provisioning proposal for it
+	// is refused by name.
+	StorageOptions map[string][]krds.ValidStorageOptionRecord `json:"storageOptions,omitempty"`
+	// Events is the recorded rds:DescribeEvents answer per
+	// DBInstanceIdentifier. It is what the four-storage-modifications-per-24-
+	// hours limit is evaluated from, and an instance absent from this map has
+	// an empty history that WAS read — which is not the same as a history that
+	// could not be read (NoEnvelopeAPI).
+	Events map[string][]krds.EventRecord `json:"events,omitempty"`
+	// NoEnvelopeAPI models a caller holding rds:Describe* and NOT
+	// rds:DescribeValidDBInstanceModifications. nil ⇒ every envelope is
+	// unknown and every provisioning proposal refuses with
+	// provisioning-envelope-unknown. That is a complete report, not a failed
+	// one, and it is a DIFFERENT report from one where the seam answered and
+	// named no ceiling.
+	NoEnvelopeAPI bool `json:"noEnvelopeAPI,omitempty"`
 }
 
 // collectRDS runs the real collector over a recorded account and returns the
-// native snapshot.
+// native snapshot. It is collectRDSFixture without the U13 envelope, kept as
+// the narrow entry point the generic-seam test drives.
+func collectRDS(ctx context.Context, path, scope, region string, now time.Time, span time.Duration) (*krds.Snapshot, []string, error) {
+	snap, _, warns, err := collectRDSFixture(ctx, path,
+		rdsCollectOptions{Scope: scope, Region: region, Now: now, Span: span})
+	return snap, warns, err
+}
+
+// collectRDSFixture runs the real collector — and, under --rds-parity, the
+// real envelope collector — over a recorded account.
 //
 // The window is [now-span, now] and is then CLAMPED by the collector, because
 // 1-minute CloudWatch datapoints live 15 days: a snapshot that claims a 30-day
 // window and holds 15 days of data is a lie told by omission, and every
 // downstream "insufficient window" gate reads the claim rather than the data.
 // The clamp is why c.Window() is rendered and the request is not.
-func collectRDS(ctx context.Context, path, scope, region string, now time.Time, span time.Duration) (*krds.Snapshot, []string, error) {
+func collectRDSFixture(ctx context.Context, path string, opts rdsCollectOptions) (
+	*krds.Snapshot, []krds.Envelope, []string, error) {
+
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		return nil, nil, fmt.Errorf("--rds-fixture: %w", err)
+		return nil, nil, nil, fmt.Errorf("--rds-fixture: %w", err)
 	}
 	var ff rdsFixtureFile
 	dec := json.NewDecoder(strings.NewReader(string(raw)))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&ff); err != nil {
-		return nil, nil, fmt.Errorf("%s: %w", path, err)
+		return nil, nil, nil, fmt.Errorf("%s: %w", path, err)
 	}
 
 	fx := &krds.Fixture{
@@ -105,8 +137,8 @@ func collectRDS(ctx context.Context, path, scope, region string, now time.Time, 
 		DropResults:  ff.DropResults,
 	}
 
-	cfg := krds.DefaultCollectorConfig(krds.Window{Start: now.Add(-span), End: now})
-	cfg.Scope, cfg.Region = scope, region
+	cfg := krds.DefaultCollectorConfig(krds.Window{Start: opts.Now.Add(-opts.Span), End: opts.Now})
+	cfg.Scope, cfg.Region = opts.Scope, opts.Region
 
 	// The three seams. Two of them are optional and their absence is a
 	// DIFFERENT report rather than a failure — that is the whole reason
@@ -122,11 +154,11 @@ func collectRDS(ctx context.Context, path, scope, region string, now time.Time, 
 
 	c, err := krds.NewCollector(fx, metrics, reserved, cfg)
 	if err != nil {
-		return nil, nil, fmt.Errorf("%s: %w", path, err)
+		return nil, nil, nil, fmt.Errorf("%s: %w", path, err)
 	}
 	snap, err := c.Collect(ctx)
 	if err != nil {
-		return nil, nil, fmt.Errorf("%s: %w", path, err)
+		return nil, nil, nil, fmt.Errorf("%s: %w", path, err)
 	}
 
 	var warnings []string
@@ -138,7 +170,23 @@ func collectRDS(ctx context.Context, path, scope, region string, now time.Time, 
 	for _, w := range snap.Warnings {
 		warnings = append(warnings, path+": "+w)
 	}
-	return snap, warnings, nil
+
+	// The fourth seam, read only when --rds-parity asked for it. NoEnvelopeAPI
+	// hands the collector a nil interface, which is legal and yields a wholly
+	// unknown envelope set — the recorded form of a caller who holds
+	// rds:Describe* and not rds:DescribeValidDBInstanceModifications.
+	var envAPI krds.ModificationEnvelopeAPI
+	if !ff.NoEnvelopeAPI {
+		envAPI = &krds.EnvelopeFixture{
+			Options: ff.StorageOptions, Events: ff.Events, PageSize: ff.PageSize,
+		}
+	}
+	envs, ewarns, err := collectRDSEnvelopes(ctx, opts, envAPI, rdsIdentifiers(snap), path)
+	warnings = append(warnings, ewarns...)
+	if err != nil {
+		return nil, nil, warnings, fmt.Errorf("%s: %w", path, err)
+	}
+	return snap, envs, warnings, nil
 }
 
 // loadRDSRates resolves the rate card.
