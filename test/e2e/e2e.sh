@@ -135,11 +135,28 @@ KC get node "$CLUSTER-worker3" >/dev/null || FAIL "emergency drain must NOT dele
 PASS "spot interruption: worker3 cordoned and drained, node left for cloud reclamation"
 
 echo "==> 4b) consolidation of underutilized on-demand workers"
-for i in $(seq 1 60); do
+# Patience must exceed the controller's own drain budget, or the test and the
+# thing it tests race each other. The actuator gives WaitNodeEmpty
+# NodeDrainTimeout (default 5m) before it reports the drain as failed, and only
+# the *next* reconcile (--interval above) retries. A 5m wait here therefore
+# ties with the controller's 5m and the test always loses: it kills the
+# controller mid-drain and reports "never removed a node" for what is really a
+# slow-but-healthy drain. Seen as a ~1-in-3 CI flake, always the same symptom,
+# with the failing runs sitting the full budget while green runs finish in ~2m.
+# 10m covers a worst-case drain plus one retry.
+for i in $(seq 1 120); do
   NODES_NOW=$(KC get nodes --no-headers | wc -l | tr -d ' ')
   [[ "$NODES_NOW" -lt "$NODES_BEFORE" ]] && break
+  (( i % 12 == 0 )) && echo "     still $NODES_NOW nodes after $((i * 5))s..."
   sleep 5
-  [[ $i == 60 ]] && FAIL "controller never removed a node"
+  if [[ $i == 120 ]]; then
+    # A bare "never removed a node" says nothing about *why*. Dump the state
+    # the next reader will want: who is cordoned, and what still pins the node.
+    echo "--- nodes ---" >&2; KC get nodes -o wide >&2 || true
+    echo "--- non-DaemonSet pods by node ---" >&2
+    KC get pods -A -o wide --no-headers >&2 || true
+    FAIL "controller never removed a node"
+  fi
 done
 PASS "node removed: $NODES_BEFORE → $NODES_NOW"
 KC get node "$CLUSTER-worker3" >/dev/null 2>&1 || FAIL "karpenter-managed node was consolidated"
