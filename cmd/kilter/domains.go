@@ -28,13 +28,15 @@ import (
 // `kilter domains` is where eight packages of decision logic become reachable
 // from the binary.
 //
-// Everything it reads is a RECORDED SNAPSHOT. No AWS SDK is linked on this
-// path, no network call is made, and no clock is read inside a decision: the
-// decision time comes from --now (defaulting to the wall clock once, at the
-// top) and is threaded through every domain. That is not a testing
-// convenience; it is design invariant 2 — the brain's decision path stays
-// stdlib-and-intra-repo, and the SDK collectors that fill these snapshots run
-// elsewhere.
+// Everything it reads is a RECORDED SNAPSHOT, with exactly one exception:
+// --rds-region dials AWS through pkg/provider's read-only SDK adapters to fill
+// the RDS snapshot that would otherwise come from --rds-fixture. Without that
+// flag no network call is made and no credential is read. No clock is read
+// inside a decision either way: the decision time comes from --now (defaulting
+// to the wall clock once, at the top) and is threaded through every domain.
+// That is not a testing convenience; it is design invariant 2 — the brain's
+// DECISION path stays stdlib-and-intra-repo, and collection is the only place
+// an SDK appears.
 //
 // The command prints refusals as prominently as recommendations. On a real
 // account most of the output IS refusals — every Lambda function on a
@@ -57,8 +59,12 @@ Flags:
   --snapshot PATH        domain snapshot JSON; repeatable, routed by its "domain" field
   --kube-snapshot PATH   cluster snapshot JSON (kilter analyze --dump-snapshot) for k8s-fargate
   --rds-fixture PATH     recorded RDS account; runs the real rds collector (repeatable)
+  --rds-region REGION    collect RDS LIVE from this region (needs AWS credentials; repeatable)
   --rds-rates PATH       RDS rate override JSON; layered over the shipped unverified table
   --rds-window DUR       RDS observation window (default 336h); clamped to CloudWatch retention
+  --rds-parity           also assess gp2/gp3 storage parity (reads the modification envelope)
+  --rds-parity-rates P   verified provisioned-IOPS/throughput rates; without it parity refuses
+                         to call its arithmetic a saving
   --commitments PATH     RI/Savings-Plan inventory JSON (kilter pricing sync-commitments)
   --catalog PATH         pricing catalog JSON (default: embedded)
   --domain KIND          restrict to one domain; repeatable (%s)
@@ -116,16 +122,22 @@ type domainFlags struct {
 	snapshots   repeatedFlag
 	kubeSnaps   repeatedFlag
 	rdsFixtures repeatedFlag
-	kinds       repeatedFlag
-	rdsRates    string
-	rdsWindow   time.Duration
-	rdsDetail   bool
-	commitments string
-	catalog     string
-	scope       string
-	region      string
-	now         string
-	jsonOut     bool
+	// rdsRegions is the LIVE sibling of rdsFixtures: one collector, one
+	// RDSAPI and one CloudWatchAPI per region, merged into one domain.
+	rdsRegions repeatedFlag
+	kinds      repeatedFlag
+	rdsRates   string
+	// rdsParityRates prices the two gp3 knobs the rate card does not cover.
+	rdsParityRates string
+	rdsWindow      time.Duration
+	rdsDetail      bool
+	rdsParity      bool
+	commitments    string
+	catalog        string
+	scope          string
+	region         string
+	now            string
+	jsonOut        bool
 
 	maxSteps    int
 	window      string
@@ -146,9 +158,12 @@ func (df *domainFlags) bind(fs *flag.FlagSet, withPlan bool) {
 	fs.Var(&df.snapshots, "snapshot", "domain snapshot JSON (repeatable)")
 	fs.Var(&df.kubeSnaps, "kube-snapshot", "cluster snapshot JSON for k8s-fargate (repeatable)")
 	fs.Var(&df.rdsFixtures, "rds-fixture", "recorded RDS account JSON, run through the real collector (repeatable)")
+	fs.Var(&df.rdsRegions, "rds-region", "collect RDS live from this region (requires AWS credentials; repeatable)")
 	fs.StringVar(&df.rdsRates, "rds-rates", "", "RDS rate override JSON (pkg/rds LoadRates format)")
 	fs.DurationVar(&df.rdsWindow, "rds-window", 14*24*time.Hour, "RDS observation window")
 	fs.BoolVar(&df.rdsDetail, "rds-detail", false, "also print pkg/rds's own refusals-first report")
+	fs.BoolVar(&df.rdsParity, "rds-parity", false, "assess gp2/gp3 storage parity (reads the RDS modification envelope)")
+	fs.StringVar(&df.rdsParityRates, "rds-parity-rates", "", "verified provisioned-IOPS/throughput rates JSON")
 	fs.Var(&df.kinds, "domain", "restrict to one domain kind (repeatable)")
 	fs.StringVar(&df.commitments, "commitments", "", "RI/Savings-Plan inventory JSON")
 	fs.StringVar(&df.catalog, "catalog", "", "pricing catalog JSON (default: embedded)")
@@ -253,20 +268,22 @@ func buildRuntime(df *domainFlags) (*runtime, error) {
 	// is and changing it is a failover, allocated storage cannot shrink, and
 	// FreeableMemory is MemAvailable. Its Recommend() is empty by construction,
 	// so the whole output arrives through the Refuser seam.
+	//
+	// --rds-parity additionally fills pkg/rds's StorageParity seam, which is
+	// nil by default. Nil is not a hole: the sizer then refuses every
+	// instance's storage with no-storage-performance-model, so a report that
+	// did not assess parity SAYS it did not on every line.
 	var rdsDomain *domrds.Domain
+	var rdsParity *rdsParitySeam
 	if wanted[domain.RDS] {
-		card, err := loadRDSRates(df.rdsRates)
-		if err != nil {
-			return nil, err
-		}
-		d, err := domrds.New(domrds.Config{Scope: df.scope, Region: df.region, Rates: card})
+		d, seam, err := newRDSDomain(df, now)
 		if err != nil {
 			return nil, err
 		}
 		if err := rt.Registry.Register(d); err != nil {
 			return nil, err
 		}
-		rdsDomain, rt.rds = d, d
+		rdsDomain, rt.rds, rdsParity = d, d, seam
 	}
 
 	// Feed it. A snapshot that cannot be read is fatal (a path the operator
@@ -314,30 +331,47 @@ func buildRuntime(df *domainFlags) (*runtime, error) {
 	// flattened into samples arrives looking complete, and a truncated
 	// DatabaseConnections series that looks complete is an idle verdict
 	// manufactured out of silence.
+	//
+	// §6.5 (in absorbRDS): snap.Reservations is already
+	// []commit.ReservedDBInstance and goes straight into the account-wide
+	// inventory. An RDS line is absorbed by a Reserved DB Instance and by
+	// nothing else — no Savings Plan of any type covers RDS — so appending
+	// cannot disturb what --commitments contributed for the other domains.
 	for _, path := range df.rdsFixtures {
 		if rdsDomain == nil {
 			rt.Warnings = append(rt.Warnings,
 				fmt.Sprintf("%s: RDS fixture supplied, but the rds domain is not registered here", path))
 			continue
 		}
-		snap, warns, err := collectRDS(context.Background(), path, df.scope, df.region, now, df.rdsWindow)
+		snap, envs, warns, err := collectRDSFixture(context.Background(), path, rdsOptions(df, df.region, now))
 		if err != nil {
-			return nil, err
+			return nil, rdsFailure(err, warns)
 		}
 		rt.Warnings = append(rt.Warnings, warns...)
-		if err := rdsDomain.Observe(snap); err != nil {
-			return nil, fmt.Errorf("%s: %w", path, err)
+		if inv, err = absorbRDS(rdsDomain, rdsParity, snap, envs, inv, path); err != nil {
+			return nil, err
 		}
-		// §6.5: snap.Reservations is already []commit.ReservedDBInstance and
-		// goes straight into the account-wide inventory. An RDS line is
-		// absorbed by a Reserved DB Instance and by nothing else — no Savings
-		// Plan of any type covers RDS — so appending cannot disturb what
-		// --commitments contributed for the other domains.
-		if len(snap.Reservations) > 0 {
-			if inv == nil {
-				inv = &kcommit.Inventory{}
-			}
-			inv.ReservedDBs = append(inv.ReservedDBs, snap.Reservations...)
+	}
+	// The LIVE sibling of the loop above (cmd/WIRING-FINDINGS.md §6.1). One
+	// RDSAPI, one CloudWatchAPI and one collector per region, merged into the
+	// same domain — and everything downstream is identical, because a live
+	// snapshot is the same type as a recorded one.
+	for _, region := range df.rdsRegions {
+		if rdsDomain == nil {
+			rt.Warnings = append(rt.Warnings,
+				fmt.Sprintf("--rds-region %s: supplied, but the rds domain is not registered here", region))
+			continue
+		}
+		snap, envs, warns, err := collectRDSLive(context.Background(), rdsOptions(df, region, now))
+		if err != nil {
+			// A collection that failed halfway still learned which region and
+			// which permission. buildRuntime returns nil on error, so the only
+			// channel that survives is the error itself.
+			return nil, rdsFailure(err, warns)
+		}
+		rt.Warnings = append(rt.Warnings, warns...)
+		if inv, err = absorbRDS(rdsDomain, rdsParity, snap, envs, inv, "rds "+region); err != nil {
+			return nil, err
 		}
 	}
 
