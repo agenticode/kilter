@@ -196,6 +196,12 @@ func (a *Attribution) Prose() string {
 		signedUSD(a.DeltaMicro), signedMonthly(a.DeltaMicro),
 		formatUSD(a.FromUSDPerHour), formatUSD(a.ToUSDPerHour))
 	fmt.Fprintf(&b, "Attribution order: %s (see package doc).\n", strings.Join(a.Order, " → "))
+	// The charges dimension has its own order and its own argument for it; an
+	// answer that states one convention and hides the other is half an audit
+	// record. Printed only when charges were actually decomposed.
+	if len(a.ChargeOrder) > 0 {
+		fmt.Fprintf(&b, "Charge attribution order: %s (see charges.go).\n", strings.Join(a.ChargeOrder, " → "))
+	}
 
 	ordered := append([]Term(nil), a.Terms...)
 	sort.SliceStable(ordered, func(i, j int) bool {

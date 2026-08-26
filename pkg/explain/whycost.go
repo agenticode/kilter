@@ -110,6 +110,21 @@ type CostBasis struct {
 	At         time.Time         `json:"at"`
 	Groups     []NodeGroup       `json:"groups,omitempty"`
 	Namespaces []NamespaceDemand `json:"namespaces,omitempty"`
+
+	// Charges is the second dimension: cost billed per line item rather than
+	// per node — Fargate pods above all, and anything else with the same
+	// `Σ units × unit rate` shape. See charges.go for the decomposition and
+	// its order. Groups deliberately excludes Fargate "nodes", so without
+	// this dimension their whole cost lands in the residual.
+	Charges []Charge `json:"charges,omitempty"`
+	// ChargesKnown states that Charges is the complete non-node charge set at
+	// this edge. It is a flag rather than a nil check because an empty slice
+	// has to be able to mean "we looked, there were none" — the same
+	// empty-is-not-missing distinction the nil-ness of *CostBasis draws for
+	// the fleet. Charges are attributed only when BOTH edges set it: a
+	// missing edge is not a zero, and treating it as one would report a
+	// cluster's entire Fargate bill as having appeared or vanished.
+	ChargesKnown bool `json:"chargesKnown,omitempty"`
 }
 
 func (b *CostBasis) supplied() bool { return b != nil }
@@ -185,12 +200,24 @@ type Attribution struct {
 	FromNodes int64 `json:"fromNodes"`
 	ToNodes   int64 `json:"toNodes"`
 
+	// ChargesKnown reports that both window edges stated their non-node
+	// charges, so the `charges` term below is a decomposition rather than a
+	// gap in the residual. When it is false the three Charge* amounts are
+	// meaningless and are omitted.
+	ChargesKnown     bool  `json:"chargesKnown,omitempty"`
+	ChargeFromMicro  Micro `json:"chargeFromMicroUSDPerHour,omitempty"`
+	ChargeToMicro    Micro `json:"chargeToMicroUSDPerHour,omitempty"`
+	ChargeDeltaMicro Micro `json:"chargeDeltaMicroUSDPerHour,omitempty"`
+
 	Terms    []Term `json:"terms"`
 	Residual Term   `json:"residual"`
 
 	// Order is the attribution order actually used, echoed into the payload
 	// so a stored answer states the convention it was computed under.
 	Order []string `json:"order"`
+	// ChargeOrder is the order inside the charges dimension, echoed for the
+	// same reason. Empty when no charges were supplied at both edges.
+	ChargeOrder []string `json:"chargeOrder,omitempty"`
 	// Notes record every degradation, guard trip and disagreement between
 	// the observed timeline and the supplied composition. An empty Notes is
 	// a claim that nothing was approximated.
@@ -288,7 +315,7 @@ func (b *CostBasis) validate() error {
 			return fmt.Errorf("explain: namespace %q has negative demand", ns.Namespace)
 		}
 	}
-	return nil
+	return b.validateCharges()
 }
 
 // gkey identifies a node group. Comparable, so it is a safe map key; the
@@ -467,6 +494,14 @@ func WhyCost(in Input) (*Attribution, error) {
 	events := gatherEvents(pts, in.Events, in.From, in.To)
 	actions := actionsInWindow(in.Actions, in.Cluster, in.From, in.To)
 
+	// The charges dimension is folded in first only so the composition notes
+	// below can compare the *whole* modelled cost — nodes plus charges —
+	// against the observed one. Its term is appended last, in chain order.
+	chA, chB, chargesKnown, err := chargeEdges(in, att)
+	if err != nil {
+		return nil, err
+	}
+
 	var terms []Term
 	var nodeTerm *Term
 	// pbarA is the reference unit price (µUSD per node-hour) the node-count
@@ -492,15 +527,27 @@ func WhyCost(in Input) (*Attribution, error) {
 			att.Notes = append(att.Notes, fmt.Sprintf(
 				"end composition holds %d nodes but the observed timeline point holds %d; the difference lands in the residual", b.nodes, end.Nodes))
 		}
-		if a.total != cFrom {
-			att.Notes = append(att.Notes, fmt.Sprintf(
-				"start composition prices at %.6f USD/h but the observed cost is %.6f USD/h; the unpriced difference lands in the residual",
-				a.total.USD(), cFrom.USD()))
+		// The modelled cost is the fleet plus whatever charges were supplied.
+		// Comparing the fleet alone against an observed cost that includes
+		// Fargate would report an unpriced gap that the charges dimension has
+		// in fact just priced.
+		modelA, err := add(a.total, chA.sum())
+		if err != nil {
+			return nil, err
 		}
-		if b.total != cTo {
+		modelB, err := add(b.total, chB.sum())
+		if err != nil {
+			return nil, err
+		}
+		if modelA != cFrom {
 			att.Notes = append(att.Notes, fmt.Sprintf(
-				"end composition prices at %.6f USD/h but the observed cost is %.6f USD/h; the unpriced difference lands in the residual",
-				b.total.USD(), cTo.USD()))
+				"%s prices at %.6f USD/h but the observed cost is %.6f USD/h; the unpriced difference lands in the residual",
+				modelSubject("start", chargesKnown), modelA.USD(), cFrom.USD()))
+		}
+		if modelB != cTo {
+			att.Notes = append(att.Notes, fmt.Sprintf(
+				"%s prices at %.6f USD/h but the observed cost is %.6f USD/h; the unpriced difference lands in the residual",
+				modelSubject("end", chargesKnown), modelB.USD(), cTo.USD()))
 		}
 		composed, ref, err := decomposeComposition(a, b, anchors, events, att)
 		if err != nil {
@@ -538,6 +585,28 @@ func WhyCost(in Input) (*Attribution, error) {
 		if err := attributeNodeCount(nodeTerm, pbarA, in, actions, events, anchors, att); err != nil {
 			return nil, err
 		}
+	}
+
+	// The charges dimension is the last link of the top-level chain, and it
+	// is appended after attributeNodeCount so no pointer into `terms` is
+	// invalidated. Its own chain lives in Term.Of; see charges.go.
+	if chargesKnown {
+		chargeTerm, err := decomposeCharges(chA, chB, anchors, events, att)
+		if err != nil {
+			return nil, err
+		}
+		// Recomputed here rather than read off the term: check() compares the
+		// two, so a future change to how the parent is built has something to
+		// disagree with.
+		chargeDelta, err := sub(chB.total, chA.total)
+		if err != nil {
+			return nil, err
+		}
+		terms = append(terms, chargeTerm)
+		att.Order = append(att.Order, TermCharges)
+		att.ChargeOrder = append([]string(nil), chargeChainOrder...)
+		att.ChargesKnown = true
+		att.ChargeFromMicro, att.ChargeToMicro, att.ChargeDeltaMicro = chA.total, chB.total, chargeDelta
 	}
 
 	// Terms are emitted in chain order, and only when they carry a number or
@@ -603,6 +672,55 @@ func (a *Attribution) check() error {
 		if sum != t.Micro {
 			return fmt.Errorf("explain: BUG: sub-terms of %q sum to %d µUSD/h, parent is %d µUSD/h", t.Kind, sum, t.Micro)
 		}
+	}
+	return a.checkCharges()
+}
+
+// checkCharges enforces the charges dimension's own arithmetic identity, in
+// the same place and the same way as the central one:
+//
+//	charges.Micro == ChargeDeltaMicro   (the exact repriced difference)
+//
+// The companion identity, sum(charges.Of) == charges.Micro, is enforced by
+// the sub-term loop above — the charges chain is deliberately a
+// sub-attribution so that it inherits it rather than reimplementing it.
+//
+// The first identity is what stops the second from being vacuous. Without it
+// the parent could be any number at all and charge-unattributed would dutifully
+// absorb the difference, which is precisely the failure this package exists to
+// refuse: error hidden inside a confidently-labelled term instead of reported.
+func (a *Attribution) checkCharges() error {
+	var charges *Term
+	for i := range a.Terms {
+		if a.Terms[i].Kind == TermCharges {
+			if charges != nil {
+				return fmt.Errorf("explain: BUG: two %q terms in one attribution", TermCharges)
+			}
+			charges = &a.Terms[i]
+		}
+	}
+	if !a.ChargesKnown {
+		if charges != nil {
+			return fmt.Errorf("explain: BUG: a %q term was emitted without a charges dimension at both window edges", TermCharges)
+		}
+		if a.ChargeDeltaMicro != 0 || a.ChargeFromMicro != 0 || a.ChargeToMicro != 0 {
+			return fmt.Errorf("explain: BUG: charge amounts reported without a charges dimension at both window edges")
+		}
+		return nil
+	}
+	if charges == nil {
+		return fmt.Errorf("explain: BUG: charges are known at both edges but no %q term was emitted", TermCharges)
+	}
+	stated, err := sub(a.ChargeToMicro, a.ChargeFromMicro)
+	if err != nil {
+		return err
+	}
+	if stated != a.ChargeDeltaMicro {
+		return fmt.Errorf("explain: BUG: charge endpoints differ by %d µUSD/h but ChargeDelta is %d µUSD/h", stated, a.ChargeDeltaMicro)
+	}
+	if charges.Micro != a.ChargeDeltaMicro {
+		return fmt.Errorf("explain: BUG: the %q term is %d µUSD/h but the supplied charges differ by %d µUSD/h",
+			TermCharges, charges.Micro, a.ChargeDeltaMicro)
 	}
 	return nil
 }
