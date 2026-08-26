@@ -1,0 +1,239 @@
+{
+  "cluster": "prod-eks-1",
+  "from": "2026-03-01T00:00:00Z",
+  "to": "2026-03-08T00:00:00Z",
+  "windowHours": 168,
+  "fromMicroUSDPerHour": 1000000,
+  "toMicroUSDPerHour": 1120000,
+  "deltaMicroUSDPerHour": 120000,
+  "fromUSDPerHour": 1,
+  "toUSDPerHour": 1.12,
+  "deltaUSDPerHour": 0.12,
+  "deltaMonthlyUSD": 87.6,
+  "fromNodes": 10,
+  "toNodes": 12,
+  "terms": [
+    {
+      "kind": "node-count",
+      "label": "2 more nodes at the window's starting average price of $0.100000/node-hour",
+      "microUSDPerHour": 200000,
+      "usdPerHour": 0.2,
+      "monthlyUSD": 146,
+      "facts": [
+        {
+          "key": "fromNodes",
+          "value": "10"
+        },
+        {
+          "key": "toNodes",
+          "value": "12"
+        },
+        {
+          "key": "referenceUnitUSDPerHour",
+          "value": "$0.100000"
+        },
+        {
+          "key": "source",
+          "value": "start composition (mix and prices held at the window start)"
+        }
+      ],
+      "evidence": [
+        "tl/prod-eks-1@1772323200000000000",
+        "tl/prod-eks-1@1772924400000000000"
+      ],
+      "of": [
+        {
+          "kind": "kilter-action",
+          "label": "Kilter removed 2 nodes across 1 applied plan",
+          "microUSDPerHour": -200000,
+          "usdPerHour": -0.2,
+          "monthlyUSD": -146,
+          "facts": [
+            {
+              "key": "appliedPlans",
+              "value": "1"
+            },
+            {
+              "key": "nodesRemoved",
+              "value": "2"
+            },
+            {
+              "key": "nodesAdded",
+              "value": "0"
+            },
+            {
+              "key": "resizes",
+              "value": "7"
+            },
+            {
+              "key": "observedAcrossActionWindowsUSDPerHour",
+              "value": "$0.050000"
+            },
+            {
+              "key": "observedCaveat",
+              "value": "the observed move across the action windows, not an attribution: anything else that happened at the same time is inside it"
+            }
+          ],
+          "evidence": [
+            "act/prod-eks-1/a1b2c3d4e5f6@1772539200000000000"
+          ]
+        },
+        {
+          "kind": "workload-set",
+          "label": "1 new namespace",
+          "microUSDPerHour": 369231,
+          "usdPerHour": 0.369231,
+          "monthlyUSD": 269.53862999999996,
+          "facts": [
+            {
+              "key": "namespacesAdded",
+              "value": "1"
+            },
+            {
+              "key": "namespacesRemoved",
+              "value": "0"
+            },
+            {
+              "key": "added",
+              "value": "ml-batch"
+            },
+            {
+              "key": "demandDimension",
+              "value": "memory"
+            }
+          ],
+          "evidence": [
+            "evt/prod-eks-1/workload/Deployment%2Fml-batch%2Ftrainer/deploy@1772467200000000000",
+            "tl/prod-eks-1@1772323200000000000",
+            "tl/prod-eks-1@1772924400000000000"
+          ]
+        },
+        {
+          "kind": "workload-scaling",
+          "label": "existing namespaces requested more capacity",
+          "microUSDPerHour": 30769,
+          "usdPerHour": 0.030769,
+          "monthlyUSD": 22.461370000000002,
+          "evidence": [
+            "evt/prod-eks-1/workload/Deployment%2Fpayments%2Fapi/deploy@1772503200000000000",
+            "tl/prod-eks-1@1772323200000000000",
+            "tl/prod-eks-1@1772924400000000000"
+          ]
+        },
+        {
+          "kind": "unattributed",
+          "label": "every node added or removed is accounted for",
+          "microUSDPerHour": 0,
+          "usdPerHour": 0,
+          "monthlyUSD": 0,
+          "facts": [
+            {
+              "key": "method",
+              "value": "the part of the node-count change no supplied driver accounts for"
+            }
+          ],
+          "evidence": [
+            "tl/prod-eks-1@1772323200000000000",
+            "tl/prod-eks-1@1772924400000000000"
+          ]
+        }
+      ]
+    },
+    {
+      "kind": "spot-ratio",
+      "label": "a larger share of the fleet runs on spot capacity",
+      "microUSDPerHour": -240000,
+      "usdPerHour": -0.24,
+      "monthlyUSD": -175.2,
+      "facts": [
+        {
+          "key": "fromSpotNodes",
+          "value": "0"
+        },
+        {
+          "key": "toSpotNodes",
+          "value": "4"
+        },
+        {
+          "key": "fromSpotShare",
+          "value": "0.0%"
+        },
+        {
+          "key": "toSpotShare",
+          "value": "33.3%"
+        }
+      ],
+      "evidence": [
+        "evt/prod-eks-1/node/ip-10-0-3-14/spot-interrupt@1772431200000000000",
+        "tl/prod-eks-1@1772323200000000000",
+        "tl/prod-eks-1@1772924400000000000"
+      ]
+    },
+    {
+      "kind": "instance-mix",
+      "label": "the instance-type mix did not move the bill",
+      "microUSDPerHour": 0,
+      "usdPerHour": 0,
+      "monthlyUSD": 0,
+      "facts": [
+        {
+          "key": "m5.large/spot",
+          "value": "+4 nodes"
+        },
+        {
+          "key": "m5.large/on-demand",
+          "value": "-2 nodes"
+        }
+      ],
+      "evidence": [
+        "tl/prod-eks-1@1772323200000000000",
+        "tl/prod-eks-1@1772924400000000000"
+      ]
+    },
+    {
+      "kind": "pricing-catalog",
+      "label": "catalog prices rose for 1 node group",
+      "microUSDPerHour": 160000,
+      "usdPerHour": 0.16,
+      "monthlyUSD": 116.8,
+      "facts": [
+        {
+          "key": "groupsRepriced",
+          "value": "1"
+        },
+        {
+          "key": "moved",
+          "value": "m5.large/on-demand $0.100000→$0.120000"
+        }
+      ],
+      "evidence": [
+        "evt/prod-eks-1/cluster/prod-eks-1/pricing-change@1772330400000000000",
+        "tl/prod-eks-1@1772323200000000000",
+        "tl/prod-eks-1@1772924400000000000"
+      ]
+    }
+  ],
+  "residual": {
+    "kind": "residual",
+    "label": "nothing unexplained",
+    "microUSDPerHour": 0,
+    "usdPerHour": 0,
+    "monthlyUSD": 0,
+    "facts": [
+      {
+        "key": "method",
+        "value": "ΔCost minus the sum of the terms above; never folded into a term"
+      }
+    ],
+    "evidence": [
+      "tl/prod-eks-1@1772323200000000000",
+      "tl/prod-eks-1@1772924400000000000"
+    ]
+  },
+  "order": [
+    "node-count",
+    "spot-ratio",
+    "instance-mix",
+    "pricing-catalog"
+  ]
+}
