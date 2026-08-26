@@ -431,6 +431,7 @@ func (b *Brain) Handler() http.Handler {
 	}))
 	b.registerTrustRoutes(mux)
 	b.registerExplainRoutes(mux)
+	b.registerWhatIfRoutes(mux)
 	mux.HandleFunc("GET /api/v1/clusters/{id}/cost", b.auth(func(w http.ResponseWriter, r *http.Request) {
 		snap := b.snapshotFor(r.PathValue("id"))
 		if snap == nil {
