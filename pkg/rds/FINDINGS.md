@@ -404,3 +404,348 @@ Stated as evidence, in the style §6 of the design doc uses.
    actuation weakens, and U10's "decline" verdict is worth revisiting. Note that
    the *availability* arguments (replica promotion capacity, Multi-AZ posture)
    and the *evidence* argument (trap 9) survive it independently.
+
+---
+
+# U13 — storage-performance parity: the tables are the deliverable
+
+`pkg/rds/parity.go`, `parity_envelope.go`, `parity_assess.go` implement
+`docs/design/rds-batch-assessment.md` §5 **U13**: the engine-keyed gp2/gp3
+regime tables, the 400 / 200 / never striping thresholds, measured-parity
+conversion, provisioned IOPS and throughput reduction toward the non-reducible
+baseline, the refusal band, and the provisioning envelope read live from
+`rds:DescribeValidDBInstanceModifications`.
+
+**2,008 production lines, 1,596 test lines, 18 tests, 1 fuzz target, 13 new
+reason codes.** Green under `gofmt -l ./pkg/rds`, `go vet ./...`,
+`go build ./...`, `go test -race -count=1 ./pkg/rds/...` and
+`go test -race -short ./...` (34 packages, all `ok`). `go.mod` and `go.sum` are
+**untouched**; the only non-stdlib import anywhere in the unit is intra-repo
+(`pkg/domain` in production, `pkg/ebs` in the trap-11 test).
+
+**`sizer.go` was not edited.** U11 typed the seam correctly: `StorageParity`
+takes exactly the four arguments this unit needs, the `if s.cfg.Parity != nil`
+branch is the whole wiring, and `DefaultConfig().Parity` is still nil — so
+`TestStoragePerformanceIsRefusedNotBorrowed` passes unchanged and the parity
+engine is opt-in. `AssessParity` always returns `ok=true` and at least one
+suppression, which is what makes the reserved `else` branch unnecessary rather
+than merely unused.
+
+## 1. What is here
+
+| File | Role |
+|---|---|
+| `parity.go` | The tables. Striping thresholds, the published gp2 band table, the gp3 regimes, `GP3Config` + its `Validate` gate, `Demand`, `PerformanceRates`, and `SumUSD`. Pure: no clock, no I/O, no package-level `var` at all. |
+| `parity_envelope.go` | The fourth read seam. `ModificationEnvelopeAPI` (`DescribeValidDBInstanceModifications` + `DescribeEvents`), `Envelope`/`Envelopes`, `CooldownVerdict`, `EnvelopeCollector`, and `EnvelopeFixture`. |
+| `parity_assess.go` | The decision path. `Parity` (the `StorageParity` implementation), `MeasureIO`, `PlanParity`, `ParityPlan`, and the earned-not-lost `ParityConfidence`. |
+
+There is **no** `actuate.go`. U14 owns it, and §5 below is what it inherits.
+
+## 2. The tables, and where each number came from
+
+Every table below is transcribed a **second** time, by hand, in
+`TestRDSGP2TableMatchesPublishedBands`, `TestStripingThresholdIsEngineDependent`
+and `TestGP3IsNotProvisionableBelowTheThreshold` — the
+`TestRDSNormalizationTableMatchesPublishedUnits` discipline, because a test that
+reads the constant it is checking proves nothing.
+
+### 2.1 Striping thresholds [verified: CHAP_Storage.html, via §2.4]
+
+| Engine | Threshold | Encoded as |
+|---|---|---|
+| Db2, MariaDB, MySQL, PostgreSQL | 400 GiB | `StripingThresholdGiB` |
+| Oracle | 200 GiB | `StripingThresholdOracleGiB` |
+| SQL Server | never (one volume) | `NeverStripes` = −1 |
+
+`NeverStripes` is −1 rather than 0 deliberately: zero would read as "threshold
+of zero", which puts every SQL Server instance in the *striped* regime — the
+exact inversion of the published fact.
+
+### 2.2 The gp3 regimes [verified, same page]
+
+| | below threshold | at/above threshold | SQL Server, any size |
+|---|---|---|---|
+| baseline | 3,000 IOPS / 125 MiB/s | 12,000 / 500 | 3,000 / 125 |
+| provisionable | **no** | yes | **yes** |
+
+The `Provisionable` column is the load-bearing one and comes from one sentence:
+*"For every DB engine except RDS for SQL Server, you can provision additional
+IOPS and storage throughput when storage size is at or above the threshold
+value."* SQL Server is the exception in both directions — it never stripes and
+it can always provision — and that asymmetry is why a single "RDS gp3 baseline"
+constant cannot exist.
+
+### 2.3 The published gp2 band table [verified, same page]
+
+Transcribed verbatim into `gp2Bands`:
+
+| Engine / size | Baseline IOPS | Throughput | Burst |
+|---|---|---|---|
+| MariaDB/MySQL/PostgreSQL 5–399 GiB | 100–1,197 | 128–250 | 3,000 |
+| … 400–1,335 GiB | 1,200–4,005 | 512–1,000 | 12,000 |
+| … 1,336–3,999 GiB | 4,008–11,997 | 1,000 | 12,000 |
+| … 4,000–65,536 GiB | 12,000–64,000 | 1,000 | N/A |
+| SQL Server 334–999 GiB | 1,002–2,997 | 250 | 3,000 |
+
+Three decisions inside that transcription, each of which a reviewer should be
+able to disagree with in one place:
+
+**(a) Baseline IOPS is interpolated at 3 per GiB inside a band; throughput is
+not interpolated at all.** Every published IOPS endpoint is exactly 3× its size
+edge (399×3 = 1,197; 400×3 = 1,200; 3,999×3 = 11,997; 4,000×3 = 12,000), which
+is the corroboration that makes interpolation a reproduction of the table rather
+than an extension of it. Throughput has no such structure — the table gives a
+range per band and never says which size gets which number — so both endpoints
+are carried and nothing between them is invented.
+
+**(b) Parity is measured against the band's throughput MAXIMUM.** §2.4's own
+falsifiable example reasons from the *floor* ("at least 512 MiB/s"), and the
+floor is the right number for describing what a volume is guaranteed. It is the
+wrong number for deciding what a conversion must preserve: the table permits the
+volume to be delivering the top of its band, and provisioning below that is
+exactly the silent degradation this unit exists to prevent. So
+`GP2PerformanceRDS` carries `MinThroughputMBps` for the report and
+`ParityThroughputMBps` (= the band maximum) for the arithmetic. **This is the
+single most consequential judgement call in the unit** — it is what puts the
+refusal band at 400–1,739 GiB rather than at 400–1,057 — and §7 below states
+what would falsify it.
+
+**(c) Oracle and Db2 have NO gp2 row, and neither does SQL Server outside
+334–999 GiB, so they refuse.** They appear in the striping table and not in the
+gp2 table. Borrowing MySQL's bands for an engine that stripes at 200 GiB is trap
+11 committed against a second engine, so `ReasonParityGP2BandUnpublished` fires
+by name. `TestRDSGP2TableMatchesPublishedBands` asserts the absence
+structurally.
+
+### 2.4 What is deliberately NOT transcribed
+
+The two contradictory SQL Server gp3 ceilings (80,000 vs 64,000/16,000).
+`TestProvisioningEnvelopeIsReadNeverHardcoded` asserts this **structurally**: it
+re-parses every non-test file in the package and fails if the literal `80000` or
+`16000` appears anywhere outside a comment. The ceiling comes from
+`DescribeValidDBInstanceModifications` or the proposal is refused.
+
+## 3. Trap 11, as a number
+
+`TestRDSGP2ModelIsNotTheEBSModel` runs one 500 GiB MySQL volume through both
+models and logs both answers:
+
+```
+500 GiB MySQL: pkg/ebs says 1500 baseline IOPS, 3000 burst IOPS, 250 MiB/s;
+               pkg/rds says 1500 baseline IOPS, 12000 burst IOPS, 512–1000 MiB/s
+```
+
+The IOPS baselines agree — 3 IOPS/GiB is the one thing the two products share —
+and everything that decides a dollar disagrees. The test then asserts the
+consequence §2.4 states: converting lands on 12,000 / 500, so IOPS rises ~8×
+and throughput **falls** below what gp2 guaranteed.
+
+`TestThroughputParityRefusalBand` is the same fact at fleet scale. Sweeping
+300–2,000 GiB of MySQL gp2 at the nameplate floor:
+
+| size | pkg/ebs | pkg/rds |
+|---|---|---|
+| 334–375 GiB | refuses (`no-cheaper-config`) | refuses — `gp3-not-provisionable-below-striping-threshold` |
+| 300–399 GiB | converts (outside its band) | refuses — throughput cannot be bought below 400 GiB **at any price** |
+| **400–1,739 GiB** | converts | **refuses — `storage-parity-not-cheaper`** |
+| 1,740+ GiB | converts | converts |
+
+The two `no-cheaper-config` bands — 334–375 and 400–1,739 — are asserted
+disjoint. At 1,000 GiB the test logs the trap in its own words: *pkg/ebs
+converts at parity; RDS needs 12,000 IOPS / 1,000 MiB/s costing $132.00/mo
+against gp2's $115.00/mo and refuses.* That is "claims a saving in the band
+where RDS loses money", reproduced.
+
+The band's edges are recomputed in the test from the rate arithmetic
+(`0.115·G − (0.092·G + 500×0.08) > 0`) rather than read from the model, so a
+change to either side fails.
+
+## 4. Every refusal predicate, and where it is tested
+
+A proposal is produced only when **all** of these hold. Each failure is a named
+refusal; none is a silent skip.
+
+| Code | Predicate | Tested by |
+|---|---|---|
+| `storage-type-not-modelled` | gp2 or gp3 | `TestParityRefusesWhatItDoesNotModel`, `TestParityReportIsShuffleInvariant` |
+| `storage-size-unusable` | 1–65,536 GiB | `TestParityRefusesWhatItDoesNotModel`, `FuzzRDSParityNeverUnderProvisions` |
+| `gp2-band-unpublished` | the engine/size has a published nameplate | `TestRDSGP2TableMatchesPublishedBands`, `TestParityRefusesWhatItDoesNotModel` |
+| `gp3-not-provisionable-below-striping-threshold` | provisioning only at/above the threshold (or SQL Server) | `TestGP3IsNotProvisionableBelowTheThreshold`, `TestThroughputParityRefusalBand` |
+| `provisioning-envelope-unknown` | `DescribeValidDBInstanceModifications` was read | `TestProvisioningEnvelopeIsReadNeverHardcoded` |
+| `storage-demand-exceeds-envelope` | the config is inside the LIVE envelope | `TestProvisioningEnvelopeIsReadNeverHardcoded` |
+| `storage-parity-not-cheaper` | strictly cheaper than today | `TestThroughputParityRefusalBand`, `TestShippedParityRatesCannotClaim` |
+| `provisioned-performance-floors-at-baseline` | the tail above 12,000/500 is non-empty | `TestGP3ReductionFloorsAtTheBaseline` |
+| `no-io-measurement` | all four I/O series delivered in full, and usable arithmetic | `TestNoMeasurementFallsBackToNameplateAndNeverToZero`, `TestParityRefusesWhatItDoesNotModel` |
+| `io-window-too-short` | the series span clears `MinWindow` | `TestParityConfidenceIsEarnedNotLost` |
+| `storage-optimization-blocks-modification` | not `storage-optimization` / `modifying` | `TestStorageOptimizationStateBlocks` |
+| `storage-modification-cooldown` | fewer than four modifications in 24 h | `TestFourModificationsPer24HoursIsACooldown` |
+| `storage-parity-low-confidence` | confidence ≥ 0.6, earned | `TestParityConfidenceIsEarnedNotLost` |
+| `unverified-rate` (**U11's, reused**) | the rate behind the saving is claimable | `TestShippedParityRatesCannotClaim` |
+
+`TestParityReasonCodesAreDistinct` pins all thirteen new codes against each
+other **and against all twenty-two U11 codes**, because two codes with one value
+silently merge two findings in every roll-up.
+
+Two of these fire **alone**: `storage-optimization-blocks-modification` and
+`storage-modification-cooldown`. A change AWS will reject is the whole finding,
+and pricing it alongside would present an impossibility as an opportunity.
+
+## 5. What U14 inherits — the typed surface it actuates against
+
+This is the contract. Nothing below needs to be re-derived.
+
+**5.1 The proposal.** `Assessment.Proposal` carries `StorageType` (always
+`gp3`), `IOPS` and `StorageThroughputMBps` as **EFFECTIVE TOTALS**, and
+`AllocatedStorageGiB` set to the *observed* allocation as the trap-8 ratchet
+guard. Effective totals, not deltas, because `ModifyDBInstance` takes absolute
+values. U14 decides whether to *send* `--iops` / `--storage-throughput` by
+calling `GP3RegimeFor(engine, sizeGiB)`: a value equal to `BaselineIOPS` /
+`BaselineThroughputMBps` is what the volume delivers for free and needs no API
+argument, and below the threshold sending one at all is an error
+(`GP3Config.Validate` states it).
+
+**5.2 The envelope, re-read live.** `ModificationEnvelopeAPI` is the seam;
+`EnvelopeCollector.Collect(ctx, identifiers)` returns an immutable, sorted
+`Envelopes`. U14 must re-read it at execution time and re-validate with
+`GP3Config.Validate(regime, env.For("gp3"))` — the envelope in a stored plan is
+a snapshot, and an instance whose class changed between plan and apply has a
+different envelope. `EnvelopeFixture` implements the seam for tests.
+
+**5.3 The cooldown, re-checked live.** `Envelope.Cooldown(now)` returns
+`CooldownVerdict{Known, Recent, Blocked, ClearsAt}`. `Known=false` (the event
+seam did not answer) **never clears** the cooldown — U14 must treat unknown as
+blocking, not as permitting, which is the opposite of what a zero count would
+suggest. `ClearsAt` is when the oldest of the four leaves the window and is the
+right value for a `ValidFrom` on a deferred step.
+
+**5.4 The in-flight gate.** `DBInstance.StateUnstable()` (U11) already covers
+`storage-optimization` and `modifying`; this unit refuses on the same two
+statuses in `AssessParity`. U14 re-checks at execute time, because the state
+U13 observed is minutes to hours old.
+
+**5.5 The mutate input.** U14's `TestMutateInputCannotChangeClassStorageOrAZ`
+has three fields to expose and no more: `iops`, `storageThroughput`,
+`storageType`. Nothing in this unit produces a class, a topology, an engine
+version or a shrunk allocation, so a mutate struct with only those three fields
+can express every proposal U13 can make. `Proposal` already has no field for the
+others (U11, `TestProposalCannotNameAnInstanceClass`).
+
+**5.6 Revert.** `ParityPlan.Current` is the configuration observed before the
+change, expressed in the same `GP3Config` shape as `ParityPlan.Config`. It is
+the recorded `from` a revert restores, and `Current.IOPS`/`ThroughputMBps` are
+already floored at the regime baseline, so a revert can never be talked below
+one.
+
+**5.7 Downtime.** *"Downtime doesn't occur during this change"* holds for
+Provisioned IOPS and storage throughput [verified], which is why every proposal
+here is `domain.ActionAdvisory` and U14's is `ActionInPlace`. The four-per-24-h
+limit and the storage-optimization state are the two things that make it fail,
+and both are already typed above.
+
+## 6. Decisions a reviewer should know about
+
+**6.1 Storage net == gross, by construction.** *"The price for a reserved DB
+instance doesn't provide a discount for the costs associated with storage,
+backups, and I/O"* [verified], so no Reserved DB Instance can absorb any part of
+a storage-line saving. `AssessParity` therefore sets `Net = Gross` rather than
+leaving a ledger unapplied, and `TestParityWiresIntoTheReservedSeam` asserts the
+equality. This is why the seam needs no `domain.Netter`.
+
+**6.2 Demand sums two percentiles rather than two series.** `MeasureIO` takes
+p99 of `ReadIOPS` and p99 of `WriteIOPS` and adds them, and likewise for
+throughput. That **over-states** demand — p99(read) + p99(write) ≥ p99(read +
+write) — and over-stating is the only safe direction here. A point-by-point
+join would be more accurate and would require the two series to share
+timestamps, which CloudWatch does not guarantee.
+
+**6.3 All four series or none.** A demand figure missing its write half is not
+a smaller demand, it is an unknown one, so `IOMeasurement.Known` is false unless
+all four arrived complete. Without measurement the arithmetic falls back to the
+nameplate floor (which cannot degrade anything) and **no reduction is considered
+at all**: cutting a number nobody measured is a guess wearing a decimal point.
+
+**6.4 A fifth read seam, and a second CloudWatch-shaped one.** §5.8 above
+records that this package is the fifth independent copy of the CloudWatch seam.
+`ModificationEnvelopeAPI` is not that — it is `rds:`-side — but it does repeat
+the pagination idiom for a third time inside this package. Lifting
+`offsetOf`/`paginate` was possible and was not done: they are eight lines and
+they live in `fixture.go`, which this unit may not edit.
+
+**6.5 `DescribeEvents` is a judgement call.** §2.4 names the four-per-24-hours
+limit and no API for observing it. `rds:DescribeEvents` is the only read
+operation that reports storage modifications, and `IsStorageModificationEvent`
+matches **broadly** on purpose: over-counting delays a proposal by hours,
+under-counting proposes a change AWS rejects, and only one of those is visible
+to an operator as a failure. The recogniser is exported so U14 and a future
+verification pass can tighten it in one place.
+
+**6.6 No package-level `var`.** `TestNoUnexpectedPackageState` carries an
+allowlist this unit may not edit, so every table here is a function returning a
+fresh value (`gp2Bands`, `DefaultPerformanceRates`). That is stricter than the
+test requires and is the better property anyway: no caller can mutate another's
+numbers.
+
+**6.7 Money is summed in name order.** `SumUSD` sorts `[]CostPart` by name
+before adding. `TestParityCostSumIsShuffleInvariant` walks all 24 permutations
+of a four-part bill, asserts one bit-identical total, and asserts the premise —
+that naive accumulation really does produce several distinct totals over the
+same 24 permutations. `TestParityReportIsShuffleInvariant` does the same end to
+end: instances, metric datapoints and collected envelopes all permuted, four
+proposals totalling $639.05/mo, report bytes identical.
+
+## 7. Deliberately deferred, and what would falsify this unit
+
+**7.1 The band-maximum parity floor (§2.3(b)).** If AWS publishes a per-size
+gp3/gp2 throughput *formula* rather than a per-band range, this unit is
+conservative by up to the width of a band and the 400–1,739 GiB refusal band
+narrows. One constant moves: `ParityThroughputMBps` becomes the interpolated
+value instead of `Band.MaxThroughputMBps`. **This is the highest-value thing to
+verify next in this unit.**
+
+**7.2 The gp3 IOPS:throughput coupling is not modelled.** EBS gp3 caps
+throughput at 0.25 MiB/s per provisioned IOPS; §2.4 states no such rule for RDS,
+and the published RDS ranges (12,000–64,000 IOPS against 500–4,000 MiB/s) are
+not in that ratio. Inventing it would refuse configurations AWS sells. The live
+envelope is the only ceiling applied. If RDS does enforce a ratio, a proposal
+here can be rejected at apply time — U14's `TestApplyRecordsFailures` is where
+that surfaces, and the fix is one clause in `GP3Config.Validate`.
+
+**7.3 io1/io2 → gp3 is not modelled.** A different product with a different
+price function; `ReasonParityStorageTypeNotModelled` refuses by name. `pkg/ebs`
+defers the same conversion for the same reason.
+
+**7.4 Allocated-storage growth is never proposed.** The envelope carries
+`MinAllocatedStorageGiB`/`MaxAllocatedStorageGiB` and nothing reads them for a
+proposal. Growing storage to reach a striping threshold is a *permanent* cost
+increase (trap 8: the floor only ratchets up) traded for a *reversible*
+performance one, and this package does not make that trade on an operator's
+behalf.
+
+**7.5 The performance rates are unverified, like every other RDS rate.**
+`DefaultPerformanceRates()` ships $0.02/IOPS-month and $0.08/MiB/s-month as
+`RateUnverified`. On the **shipped** card gp2 and gp3 cost the same per GiB, so
+no conversion is ever cheaper and every reduction refuses with
+`unverified-rate` — `TestShippedParityRatesCannotClaim` pins both. The refusal
+still *sizes* the opportunity in dollars, which is the whole point of U11 §5.1's
+rule. There is no `LoadPerformanceRates` file loader: `PerformanceRates` is a
+three-field struct a caller fills directly, and adding a JSON loader for three
+numbers before anyone has the numbers would be the wrong order.
+
+**7.6 Wiring is not done.** §6 above still describes everything `cmd/` owes, and
+this unit adds exactly one more thing to that list:
+
+```go
+ec := rds.NewEnvelopeCollector(envAdapter, rds.EnvelopeCollectorConfig{Window: w})
+envs, err := ec.Collect(ctx, identifiersFrom(snap))     // rds:DescribeValidDBInstanceModifications
+par, err := rds.NewParity(rds.ParityConfig{             // + rds:DescribeEvents
+    Now: now, Envelopes: envs, Performance: perfRates,
+})
+cfg := rds.DefaultConfig()
+cfg.Rates, cfg.Parity = card, par                       // the seam is OPT-IN
+```
+
+Two IAM actions are added: `rds:DescribeValidDBInstanceModifications` and
+`rds:DescribeEvents`. Both are optional — a nil `ModificationEnvelopeAPI` is
+legal and yields a report in which every provisioning proposal is refused by
+name, which is the intended loud failure mode. Leaving `cfg.Parity` nil keeps
+U11's `no-storage-performance-model` refusal, unchanged.
