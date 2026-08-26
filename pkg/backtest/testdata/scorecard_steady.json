@@ -1,0 +1,47 @@
+{
+  "policy": "69955a2cdd2004fd",
+  "cluster": "backtest",
+  "window": [
+    "2026-03-01T00:00:00Z",
+    "2026-03-08T00:00:00Z"
+  ],
+  "horizonHours": 24,
+  "decisionIntervalHours": 24,
+  "starvationFactor": 1,
+  "snapshots": 2016,
+  "instants": 7,
+  "scored": 14,
+  "decisions": 12,
+  "refusals": {
+    "insufficient-history": 2
+  },
+  "memViolations": 0,
+  "cpuStarvation": 0,
+  "memOOMKills": 2,
+  "oracleGapPct": 104.370624,
+  "oracleGapPctApplied": 17.278549,
+  "policyCostUSD": 5.356145,
+  "oracleCostUSD": 2.6208,
+  "claimedSavingsUSD": 13.695055,
+  "realizedSavingsUSD": 13.695055,
+  "claimedVsRealized": 1,
+  "forgoneSavingsUSD": 2.3472,
+  "refusalsGood": 0,
+  "refusalsIdle": 2,
+  "flipRate": 0,
+  "flips": 0,
+  "resourceRegretUSD": 2.735345,
+  "riskRegretUSD": 0,
+  "regretUSD": 2.735345,
+  "skipped": {
+    "noHorizon": 1,
+    "noSnapshot": 0,
+    "noFutureSamples": 0,
+    "eventQueryErrors": 0
+  },
+  "cost": {
+    "cpuUSDPerCoreHour": 0.024,
+    "memUSDPerGiBHour": 0.006,
+    "incidentUSD": 50
+  }
+}
