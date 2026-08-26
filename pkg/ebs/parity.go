@@ -38,6 +38,8 @@ import (
 	"fmt"
 	"io"
 	"math"
+
+	"github.com/agenticode/kilter/pkg/pricing"
 )
 
 // Volume types, as DescribeVolumes reports them.
@@ -107,13 +109,18 @@ const eps = 1e-9
 
 // HoursPerMonth converts monthly to hourly cost. It is the billing-average
 // month and MUST equal pricing.HoursPerMonth and commit.HoursPerMonth —
-// asserted by TestHoursPerMonthMatchesPricing.
-const HoursPerMonth = 730
+// asserted by TestHoursPerMonthMatchesPricing, and now structurally: it is
+// defined from pricing's, so the two cannot drift apart.
+const HoursPerMonth = pricing.HoursPerMonth
 
-// Rates are the EBS price points, us-east-1, USD — [verified:
-// https://aws.amazon.com/ebs/pricing/, fetched 2026-08-25]. They ship embedded
-// and are overridable by a synced or hand-written file ([LoadRates]): relative
-// math must work offline, exact billing belongs to the invoice.
+// Rates are the EBS price points, us-east-1, USD. They ship embedded and are
+// overridable by a synced or hand-written file ([LoadRates]): relative math
+// must work offline, exact billing belongs to the invoice.
+//
+// The embedded numbers live in pkg/pricing as [pricing.EBSRates], one source
+// of truth for every domain; [DefaultRates] reads them. The free-allowance and
+// performance fields below are NOT prices — they are gp3 device behaviour, and
+// stay in this package.
 type Rates struct {
 	GP2GBMonthUSD float64 `json:"gp2GBMonthUSD"`
 	GP3GBMonthUSD float64 `json:"gp3GBMonthUSD"`
@@ -131,17 +138,21 @@ type Rates struct {
 	IO2GBMonthUSD float64 `json:"io2GBMonthUSD"`
 }
 
-// DefaultRates returns the embedded us-east-1 rates.
+// DefaultRates returns the embedded us-east-1 rates. The money comes from
+// pkg/pricing; the two free-allowance fields come from this package's gp3
+// device model, because "gp3 includes 3,000 IOPS and 125 MiB/s" is what the
+// hardware delivers, not what it costs — see [GP3BaseIOPS].
 func DefaultRates() Rates {
+	p := pricing.DefaultEBSRates()
 	return Rates{
-		GP2GBMonthUSD:         0.10,
-		GP3GBMonthUSD:         0.08,
-		GP3IOPSMonthUSD:       0.005,
-		GP3ThroughputMonthUSD: 0.06,
+		GP2GBMonthUSD:         p.GP2GBMonthUSD,
+		GP3GBMonthUSD:         p.GP3GBMonthUSD,
+		GP3IOPSMonthUSD:       p.GP3IOPSMonthUSD,
+		GP3ThroughputMonthUSD: p.GP3ThroughputMonthUSD,
 		GP3FreeIOPS:           GP3BaseIOPS,
 		GP3FreeThroughputMBps: GP3BaseThroughputMBps,
-		IO1GBMonthUSD:         0.125,
-		IO2GBMonthUSD:         0.125,
+		IO1GBMonthUSD:         p.IO1GBMonthUSD,
+		IO2GBMonthUSD:         p.IO2GBMonthUSD,
 	}
 }
 

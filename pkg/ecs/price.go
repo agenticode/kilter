@@ -72,13 +72,17 @@ func (p Platform) Valid() bool {
 // String renders the platform for reports and spec attributes.
 func (p Platform) String() string { return string(p.Arch) + "/" + string(p.Market) }
 
-// ARM Fargate rates, us-east-1, Linux, on-demand
-// [verified: https://aws.amazon.com/fargate/pricing/ — $0.0000089944/vCPU-s and
-// $0.0000009889/GB-s, expressed here per hour]: −20 % vCPU and −19.9 % GB
+// ARM Fargate rates, us-east-1, Linux, on-demand: −20 % vCPU and −19.9 % GB
 // against x86.
+//
+// The numbers live in pkg/pricing beside the x86 Fargate rates, as
+// [pricing.FargateARMRates] — a type EKS code cannot reach, so consolidating
+// them did not merge the products: pricing.FargateRates still has no ARM field
+// and TestEKSFargateStillRefusesSpotAndARM still fails if it grows one. These
+// names are kept, and kept constant, so nothing that referenced them changes.
 const (
-	ARMVCPUHourlyUSD = 0.03238
-	ARMGBHourlyUSD   = 0.00356
+	ARMVCPUHourlyUSD = pricing.FargateARMVCPUHourlyUSD
+	ARMGBHourlyUSD   = pricing.FargateARMGBHourlyUSD
 )
 
 // DefaultSpotDiscount is the Fargate Spot discount this package assumes.
@@ -108,15 +112,19 @@ type Rates struct {
 	SpotDiscount float64 `json:"spotDiscount"`
 }
 
-// DefaultRates returns the embedded baseline. The x86 rates come from
-// pkg/pricing rather than from constants here: one rate table, two domains.
+// DefaultRates returns the embedded baseline. Every rate comes from
+// pkg/pricing — the x86 pair from [pricing.DefaultFargateRates], the ARM pair
+// from [pricing.DefaultFargateARMRates]: one rate table, two domains. Only
+// SpotDiscount originates here, because it is not an AWS rate (see
+// [DefaultSpotDiscount]).
 func DefaultRates() Rates {
 	base := pricing.DefaultFargateRates()
+	arm := pricing.DefaultFargateARMRates()
 	return Rates{
 		VCPUHourlyUSD:    base.VCPUHourlyUSD,
 		GBHourlyUSD:      base.GBHourlyUSD,
-		ArmVCPUHourlyUSD: ARMVCPUHourlyUSD,
-		ArmGBHourlyUSD:   ARMGBHourlyUSD,
+		ArmVCPUHourlyUSD: arm.VCPUHourlyUSD,
+		ArmGBHourlyUSD:   arm.GBHourlyUSD,
 		SpotDiscount:     DefaultSpotDiscount,
 	}
 }

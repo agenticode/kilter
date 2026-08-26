@@ -5,6 +5,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/agenticode/kilter/pkg/pricing"
 )
 
 // Burstable (T-family) credit analysis — docs/design/compute-domains.md §4.6,
@@ -28,17 +30,26 @@ import (
 // SurplusCreditUSDPerVCPUHour is the Linux unlimited-mode surplus rate
 // ([verified] §4.6). One CPU credit is one vCPU-minute, so a credit costs
 // this divided by 60.
-const SurplusCreditUSDPerVCPUHour = 0.05
+//
+// It is a price, so the number lives in pkg/pricing with every other rate
+// ([pricing.EC2SurplusCreditUSDPerVCPUHour], region-aware via
+// [pricing.EC2CreditRatesFor]); this name is kept, and kept constant, so
+// nothing that referenced it changes.
+const SurplusCreditUSDPerVCPUHour = pricing.EC2SurplusCreditUSDPerVCPUHour
 
 // SurplusUSDPerCredit is the per-credit price of surplus.
-const SurplusUSDPerCredit = SurplusCreditUSDPerVCPUHour / 60
+const SurplusUSDPerCredit = SurplusCreditUSDPerVCPUHour / CreditsPerVCPUHour
 
 // CreditsPerVCPUHour is the credit accrual identity: an instance earns
 // baseline × vCPUs credits per minute, i.e. this many per vCPU-hour at 100 %
 // baseline. Every earn rate and accrual cap in [BurstSpec] is derived from it
 // rather than transcribed, and TestBurstTableMatchesPublishedRates pins the
 // derivation against AWS's published table.
-const CreditsPerVCPUHour = 60
+//
+// It is also what converts the surplus rate above into a per-credit charge, so
+// it is defined once in pkg/pricing and read here: a divisor that drifted
+// between the accrual model and the price would silently misreport both.
+const CreditsPerVCPUHour = pricing.CreditsPerVCPUHour
 
 // MaxAccrualHours is how many hours of accrual a T3-generation instance may
 // bank (24 × the hourly earn rate).
@@ -371,6 +382,7 @@ func AnalyzeBurst(in Instance, t Target, vcpus int, stickerHourlyUSD float64, wi
 }
 
 // HoursPerMonth is the billing-average month, matching pricing.HoursPerMonth
-// and commit.HoursPerMonth. Duplicated rather than imported for the same
-// reason pkg/pricing/commit duplicates it: no import edge for one constant.
-const HoursPerMonth = 730
+// and commit.HoursPerMonth. This package already depends on pkg/pricing for
+// the instance catalog, so there is no import edge to save by duplicating it:
+// it is defined from pricing's and structurally cannot drift.
+const HoursPerMonth = pricing.HoursPerMonth

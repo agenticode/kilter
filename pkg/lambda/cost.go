@@ -5,24 +5,29 @@ import (
 	"math"
 
 	"github.com/agenticode/kilter/pkg/domain"
+	"github.com/agenticode/kilter/pkg/pricing"
 	"github.com/agenticode/kilter/pkg/pricing/commit"
 )
 
-// Embedded Lambda rates, us-east-1, on-demand
-// [verified: https://aws.amazon.com/lambda/pricing/ fetched 2026-08-25]:
-// $0.20 per 1M requests; $0.0000166667 per GB-second on x86_64 and
-// $0.0000133334 per GB-second on arm64 — a 20 % lower RATE, not a 20 % lower
-// bill (see [Rates.ArmRateDelta]).
+// Embedded Lambda rates, us-east-1, on-demand: $0.20 per 1M requests;
+// $0.0000166667 per GB-second on x86_64 and $0.0000133334 per GB-second on
+// arm64 — a 20 % lower RATE, not a 20 % lower bill (see [Rates.ArmRateDelta]).
+//
+// The numbers themselves now live in pkg/pricing beside the Fargate and
+// instance rate tables (FINDINGS.md §10 asked for this move; U9 could not make
+// it because it may not edit that package). These names are kept, and kept
+// constant, so nothing that referenced them has to change; they are one
+// definition away from the single source of truth, and
+// pricing.TestNoRateLiteralsInDomainPackages fails if a literal reappears here.
 //
 // Like pkg/pricing's instance catalog these are a baseline for relative math;
-// exact billing belongs to the invoice. They live here rather than in
-// pkg/pricing/catalog.json only because this unit may not edit that package;
-// FINDINGS.md records the move a later unit should make.
+// exact billing belongs to the invoice. Region-aware lookup is
+// [pricing.LambdaRatesFor]; [DefaultRates] is the us-east-1 baseline.
 const (
-	RequestUSDPerMillion   = 0.20
-	X86GBSecondUSD         = 0.0000166667
-	ARMGBSecondUSD         = 0.0000133334
-	FreeEphemeralStorageMB = 512
+	RequestUSDPerMillion   = pricing.LambdaRequestUSDPerMillion
+	X86GBSecondUSD         = pricing.LambdaX86GBSecondUSD
+	ARMGBSecondUSD         = pricing.LambdaARMGBSecondUSD
+	FreeEphemeralStorageMB = pricing.LambdaFreeEphemeralStorageMB
 )
 
 // Rates prices Lambda usage. There is no spot rate and no reserved rate:
@@ -36,12 +41,17 @@ type Rates struct {
 	ArmGBSecondUSD float64 `json:"armGBSecondUSD"`
 }
 
-// DefaultRates returns the embedded baseline rates.
+// DefaultRates returns the embedded baseline rates, read from pkg/pricing's
+// us-east-1 Lambda table.
 func DefaultRates() Rates {
+	p := pricing.DefaultLambdaRates()
 	return Rates{
-		RequestUSD:     RequestUSDPerMillion / 1e6,
-		GBSecondUSD:    X86GBSecondUSD,
-		ArmGBSecondUSD: ARMGBSecondUSD,
+		// The exact constant, not p.RequestUSD(): the two differ by one ULP
+		// (see pricing.LambdaRequestUSD) and the baseline should be the exact
+		// one wherever it is available.
+		RequestUSD:     pricing.LambdaRequestUSD,
+		GBSecondUSD:    p.X86GBSecondUSD,
+		ArmGBSecondUSD: p.ARMGBSecondUSD,
 	}
 }
 
@@ -175,7 +185,13 @@ func usageLines(ref domain.TargetRef, region, arch string, r Rates,
 			Region:   region,
 			Unit:     "Requests-Millions",
 			Quantity: invocationsPerHour / 1e6,
-			ODRate:   RequestUSDPerMillion,
+			// From r, NOT from the RequestUSDPerMillion constant. The
+			// duration line above already prices from r, so quoting the
+			// constant here made an operator-supplied Config.Rates.RequestUSD
+			// honoured by [Rates.InvocationUSD] and ignored by the commitment
+			// waterfall — the same requests priced two ways in one report.
+			// Pinned by TestLambdaRequestLineHonoursOverriddenRates.
+			ODRate: r.RequestUSD * 1e6,
 		},
 	}
 }
