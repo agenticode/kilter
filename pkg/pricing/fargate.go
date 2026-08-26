@@ -73,15 +73,22 @@ const (
 type FargateRates struct {
 	// Platform is always EKSLinuxX86; it is set by the constructors and is not
 	// part of the override file's JSON.
-	Platform      Platform `json:"-"`
-	VCPUHourlyUSD float64  `json:"vcpuHourlyUSD"`
-	GBHourlyUSD   float64  `json:"gbHourlyUSD"`
+	Platform Platform `json:"-"`
+	// Region is the region these numbers are quoted in, matching every other
+	// rate table in this package (see rates.go). It is a label, not a gate:
+	// pricing works without it. An override file cannot set it — the file
+	// states rates, not which region they came from — so rates loaded from
+	// one carry the empty Region, which is the honest answer.
+	Region        Region  `json:"-"`
+	VCPUHourlyUSD float64 `json:"vcpuHourlyUSD"`
+	GBHourlyUSD   float64 `json:"gbHourlyUSD"`
 }
 
 // DefaultFargateRates returns the embedded baseline rates.
 func DefaultFargateRates() FargateRates {
 	return FargateRates{
 		Platform:      EKSLinuxX86,
+		Region:        DefaultRegion,
 		VCPUHourlyUSD: FargateVCPUHourlyUSD,
 		GBHourlyUSD:   FargateGBHourlyUSD,
 	}
