@@ -6,8 +6,11 @@
 //	kilter controller  executes brain plans under the safety envelope
 //	kilter plan        fetch & print the current plan from a brain
 //	kilter insights    predictive findings (OOM risk, saturation, capacity)
-//	kilter domains     compute domains: ec2/ebs, ecs-fargate, lambda, k8s-fargate
+//	kilter domains     compute domains: ec2/ebs, ecs-fargate, lambda, k8s-fargate, rds
 //	kilter simulate    replay a recorded snapshot through the decision engine
+//	kilter backtest    score a policy against history (falsifiability harness)
+//	kilter explain     the full explain payload behind one recommendation
+//	kilter why-cost    an additive decomposition of a cluster's cost change
 //	kilter version     build information
 package main
 
@@ -35,12 +38,15 @@ Commands:
   controller  Execute brain plans (dry-run by default)
   plan        Fetch and print the current plan from a brain
   insights    Predictive findings: OOM risk, saturation, capacity exhaustion
-  domains     Run every compute domain (ec2/ebs, ecs-fargate, lambda, k8s-fargate)
+  domains     Run every compute domain (ec2/ebs, ecs-fargate, lambda, k8s-fargate, rds)
   pricing     Sync live cloud prices into a catalog (sync-aws)
   ledger      Audit trail: executed plans + measured cost curve (verifiable savings)
   approve     Approve a plan fingerprint for --require-approval controllers
   undo        Revert the most recent applied plan (resizes + cordons)
   simulate    Replay a snapshot file through the decision engine
+  backtest    Score a policy against history: oracle gap, regret, safety, gate
+  explain     Why the engine would resize a container, with citations
+  why-cost    Additive, individually-citable decomposition of a cost change
   version     Print version
 
 Run "kilter <command> -h" for command flags.
@@ -79,6 +85,12 @@ func main() {
 		err = runUndo(args)
 	case "simulate":
 		err = runSimulate(args)
+	case "backtest":
+		err = runBacktest(args)
+	case "explain":
+		err = runExplain(args)
+	case "why-cost":
+		err = runWhyCost(args)
 	case "version", "--version", "-v":
 		fmt.Printf("kilter %s (%s)\n", version, commit)
 	case "help", "-h", "--help":

@@ -1,11 +1,13 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"sort"
 	"strings"
@@ -16,9 +18,11 @@ import (
 	domecs "github.com/agenticode/kilter/pkg/domain/ecs"
 	"github.com/agenticode/kilter/pkg/domain/fargate"
 	domlambda "github.com/agenticode/kilter/pkg/domain/lambda"
+	domrds "github.com/agenticode/kilter/pkg/domain/rds"
 	"github.com/agenticode/kilter/pkg/guard"
 	"github.com/agenticode/kilter/pkg/model"
 	kcommit "github.com/agenticode/kilter/pkg/pricing/commit"
+	krds "github.com/agenticode/kilter/pkg/rds"
 )
 
 // `kilter domains` is where eight packages of decision logic become reachable
@@ -52,6 +56,9 @@ Input is recorded snapshots; this command makes no cloud call.
 Flags:
   --snapshot PATH        domain snapshot JSON; repeatable, routed by its "domain" field
   --kube-snapshot PATH   cluster snapshot JSON (kilter analyze --dump-snapshot) for k8s-fargate
+  --rds-fixture PATH     recorded RDS account; runs the real rds collector (repeatable)
+  --rds-rates PATH       RDS rate override JSON; layered over the shipped unverified table
+  --rds-window DUR       RDS observation window (default 336h); clamped to CloudWatch retention
   --commitments PATH     RI/Savings-Plan inventory JSON (kilter pricing sync-commitments)
   --catalog PATH         pricing catalog JSON (default: embedded)
   --domain KIND          restrict to one domain; repeatable (%s)
@@ -59,6 +66,7 @@ Flags:
   --region REGION        region label for commitment usage lines
   --now RFC3339          decision time (default: now)
   --json                 machine-readable output
+  --rds-detail           also print pkg/rds's own refusals-first report
 
 plan-only flags:
   --max-steps N          cap the plan
@@ -107,7 +115,11 @@ func kindNames() []string {
 type domainFlags struct {
 	snapshots   repeatedFlag
 	kubeSnaps   repeatedFlag
+	rdsFixtures repeatedFlag
 	kinds       repeatedFlag
+	rdsRates    string
+	rdsWindow   time.Duration
+	rdsDetail   bool
 	commitments string
 	catalog     string
 	scope       string
@@ -133,6 +145,10 @@ func (r *repeatedFlag) Set(v string) error {
 func (df *domainFlags) bind(fs *flag.FlagSet, withPlan bool) {
 	fs.Var(&df.snapshots, "snapshot", "domain snapshot JSON (repeatable)")
 	fs.Var(&df.kubeSnaps, "kube-snapshot", "cluster snapshot JSON for k8s-fargate (repeatable)")
+	fs.Var(&df.rdsFixtures, "rds-fixture", "recorded RDS account JSON, run through the real collector (repeatable)")
+	fs.StringVar(&df.rdsRates, "rds-rates", "", "RDS rate override JSON (pkg/rds LoadRates format)")
+	fs.DurationVar(&df.rdsWindow, "rds-window", 14*24*time.Hour, "RDS observation window")
+	fs.BoolVar(&df.rdsDetail, "rds-detail", false, "also print pkg/rds's own refusals-first report")
 	fs.Var(&df.kinds, "domain", "restrict to one domain kind (repeatable)")
 	fs.StringVar(&df.commitments, "commitments", "", "RI/Savings-Plan inventory JSON")
 	fs.StringVar(&df.catalog, "catalog", "", "pricing catalog JSON (default: embedded)")
@@ -159,6 +175,10 @@ type runtime struct {
 	// registered lands here rather than being dropped: silently discarding
 	// collected data is indistinguishable from a broken collector.
 	Warnings []string
+	// rds is kept only so --rds-detail can render pkg/rds's own report, whose
+	// layout puts refusals first. Every other consumer goes through the
+	// registry.
+	rds *domrds.Domain
 }
 
 // buildRuntime wires the registry, feeds it every recorded snapshot, and
@@ -228,6 +248,26 @@ func buildRuntime(df *domainFlags) (*runtime, error) {
 			return nil, err
 		}
 	}
+	// RDS. It registers like any other domain and then refuses everything,
+	// which is the deliverable rather than a gap: the class is where the money
+	// is and changing it is a failover, allocated storage cannot shrink, and
+	// FreeableMemory is MemAvailable. Its Recommend() is empty by construction,
+	// so the whole output arrives through the Refuser seam.
+	var rdsDomain *domrds.Domain
+	if wanted[domain.RDS] {
+		card, err := loadRDSRates(df.rdsRates)
+		if err != nil {
+			return nil, err
+		}
+		d, err := domrds.New(domrds.Config{Scope: df.scope, Region: df.region, Rates: card})
+		if err != nil {
+			return nil, err
+		}
+		if err := rt.Registry.Register(d); err != nil {
+			return nil, err
+		}
+		rdsDomain, rt.rds = d, d
+	}
 
 	// Feed it. A snapshot that cannot be read is fatal (a path the operator
 	// typed is wrong); a snapshot for a domain nobody registered is a warning
@@ -268,7 +308,42 @@ func buildRuntime(df *domainFlags) (*runtime, error) {
 		}
 	}
 
-	rt.Ledger = buildLedger(rt.Registry, inv, now)
+	// The RDS collection loop (pkg/rds/FINDINGS.md §6.3), over a recorded
+	// account. Observe() takes the native snapshot rather than the generic
+	// projection because domain.Sample has no truncation flag: a series
+	// flattened into samples arrives looking complete, and a truncated
+	// DatabaseConnections series that looks complete is an idle verdict
+	// manufactured out of silence.
+	for _, path := range df.rdsFixtures {
+		if rdsDomain == nil {
+			rt.Warnings = append(rt.Warnings,
+				fmt.Sprintf("%s: RDS fixture supplied, but the rds domain is not registered here", path))
+			continue
+		}
+		snap, warns, err := collectRDS(context.Background(), path, df.scope, df.region, now, df.rdsWindow)
+		if err != nil {
+			return nil, err
+		}
+		rt.Warnings = append(rt.Warnings, warns...)
+		if err := rdsDomain.Observe(snap); err != nil {
+			return nil, fmt.Errorf("%s: %w", path, err)
+		}
+		// §6.5: snap.Reservations is already []commit.ReservedDBInstance and
+		// goes straight into the account-wide inventory. An RDS line is
+		// absorbed by a Reserved DB Instance and by nothing else — no Savings
+		// Plan of any type covers RDS — so appending cannot disturb what
+		// --commitments contributed for the other domains.
+		if len(snap.Reservations) > 0 {
+			if inv == nil {
+				inv = &kcommit.Inventory{}
+			}
+			inv.ReservedDBs = append(inv.ReservedDBs, snap.Reservations...)
+		}
+	}
+
+	ledger, ledgerWarnings := buildLedger(rt.Registry, inv, now)
+	rt.Ledger = ledger
+	rt.Warnings = append(rt.Warnings, ledgerWarnings...)
 	sort.Strings(rt.Warnings)
 	return rt, nil
 }
@@ -287,17 +362,65 @@ func buildRuntime(df *domainFlags) (*runtime, error) {
 // what it currently costs — a figure that does not depend on any commitment,
 // because it is the on-demand rate of what is running today. The second nets
 // every domain's proposed change against that whole picture.
-func buildLedger(reg *domain.Registry, inv *kcommit.Inventory, now time.Time) *domain.Ledger {
+func buildLedger(reg *domain.Registry, inv *kcommit.Inventory, now time.Time) (*domain.Ledger, []string) {
 	var lines []kcommit.UsageLine
+	var warnings []string
+	seen := map[string]domain.Kind{}
 	for _, k := range reg.Kinds() {
 		d, ok := reg.Get(k)
 		if !ok {
 			continue
 		}
-		lines = append(lines, usageLinesOf(d, now)...)
+		for _, l := range usageLinesOf(d, now) {
+			if why, bad := badBaselineLine(l, seen); bad {
+				warnings = append(warnings, fmt.Sprintf(
+					"%s: dropped a usage line from the account-wide baseline (%s)", k, why))
+				continue
+			}
+			seen[l.ID] = k
+			lines = append(lines, l)
+		}
 	}
 	sort.Slice(lines, func(i, j int) bool { return lines[i].ID < lines[j].ID })
-	return domain.NewLedger(inv, kcommit.Usage{Lines: lines})
+	return domain.NewLedger(inv, kcommit.Usage{Lines: lines}), warnings
+}
+
+// badBaselineLine is the output check on the usage-line seam.
+//
+// It is the same hole j1-wire closed one level down. Registry.PlanSteps
+// filtered its INPUT and not its output, so a domain could return a step
+// labelled with another domain's name and borrow that domain's actuator; here
+// a domain returns lines that go straight into the ACCOUNT-WIDE commitment
+// baseline, which is what every OTHER domain's net savings are computed
+// against. Three ways that goes wrong, all silent:
+//
+//   - An EMPTY ID never matches in domain.Ledger's splice and is always
+//     appended, so two anonymous lines for one resource double-count the usage
+//     available to absorb a commitment — which OVERSTATES absorption and
+//     therefore overstates savings.
+//   - A DUPLICATE ID from a second domain replaces the first domain's line
+//     rather than adding to it, so one domain silently rewrites another's
+//     contribution.
+//   - A non-positive or non-finite rate or quantity prices real usage at
+//     nothing, which again makes a commitment look more absorbed than it is.
+//
+// Dropping is the conservative direction: fewer baseline lines means less
+// usage to absorb a commitment, means more apparent stranding, means a
+// smaller claimed saving. A drop is never silent — it lands in the collection
+// warnings the CLI prints.
+func badBaselineLine(l kcommit.UsageLine, seen map[string]domain.Kind) (string, bool) {
+	switch {
+	case l.ID == "":
+		return fmt.Sprintf("no ID (%s %s); an anonymous line cannot be spliced and would double-count",
+			l.Kind, l.InstanceType), true
+	case seen[l.ID] != "":
+		return fmt.Sprintf("ID %q already contributed by domain %q", l.ID, seen[l.ID]), true
+	case math.IsNaN(l.ODRate) || math.IsInf(l.ODRate, 0) || l.ODRate <= 0:
+		return fmt.Sprintf("ID %q has rate %v", l.ID, l.ODRate), true
+	case math.IsNaN(l.Quantity) || math.IsInf(l.Quantity, 0) || l.Quantity <= 0:
+		return fmt.Sprintf("ID %q has quantity %v", l.ID, l.Quantity), true
+	}
+	return "", false
 }
 
 // usageLiner is any domain (or composite part) that can project its priced
@@ -347,6 +470,7 @@ func wantedKinds(sel []string) (map[domain.Kind]bool, error) {
 		domain.ECSFargate: true,
 		domain.Lambda:     true,
 		domain.K8sFargate: true,
+		domain.RDS:        true,
 	}
 	if len(sel) == 0 {
 		return buildable, nil
@@ -532,13 +656,40 @@ func runDomainsReport(w io.Writer, args []string) error {
 		// somebody might put in a business case.
 		return fmt.Errorf("aggregate report failed validation (this is a bug): %w", err)
 	}
+	// --rds-detail adds pkg/rds's own report. It is a SECOND rendering of the
+	// same findings, and it earns its place because the layouts disagree on
+	// purpose: the aggregate leads with money and lists refusals under it,
+	// while pkg/rds leads with the refusals and puts the money second. In this
+	// domain the refusal IS the finding, and a reader who sees a dollar figure
+	// first reads the refusal as a caveat on a recommendation that does not
+	// exist.
+	var rdsReport *krds.Report
+	if df.rdsDetail && rt.rds != nil {
+		rdsReport = rt.rds.Report(rt.Now, rt.Ledger)
+		if rdsReport != nil {
+			if err := rdsReport.Validate(); err != nil {
+				return fmt.Errorf("rds report failed validation (this is a bug): %w", err)
+			}
+		}
+	}
+
 	if df.jsonOut {
-		return writeJSON(w, map[string]any{
-			"report": rep, "warnings": rt.Warnings,
-		})
+		out := map[string]any{"report": rep, "warnings": rt.Warnings}
+		if rdsReport != nil {
+			out["rds"] = rdsReport
+		}
+		return writeJSON(w, out)
 	}
 	if err := rep.WriteText(w); err != nil {
 		return err
+	}
+	if rdsReport != nil {
+		if _, err := io.WriteString(w, "\n"); err != nil {
+			return err
+		}
+		if err := rdsReport.WriteText(w); err != nil {
+			return err
+		}
 	}
 	var b strings.Builder
 	writeWarnings(&b, rt.Warnings)

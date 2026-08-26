@@ -23,7 +23,7 @@ func TestKindsAreClosedAndSorted(t *testing.T) {
 			t.Errorf("%q reported invalid but is listed", k)
 		}
 	}
-	if Kind("k8s-fargate ").Valid() || Kind("").Valid() || Kind("rds").Valid() {
+	if Kind("k8s-fargate ").Valid() || Kind("").Valid() || Kind("quantum-annealer").Valid() {
 		t.Error("unknown kinds must not validate")
 	}
 	// The returned slice is a copy: mutating it cannot corrupt the table.

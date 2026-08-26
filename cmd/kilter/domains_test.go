@@ -348,7 +348,7 @@ func TestNoDomainCanPlanAStepInThisBuild(t *testing.T) {
 		Plans []domain.Plan `json:"plans"`
 	}
 	runJSON(t, &env, baseArgs(t, "plan")...)
-	if len(env.Plans) != 4 {
+	if len(env.Plans) != 5 {
 		t.Fatalf("got %d plans, want one per wired domain", len(env.Plans))
 	}
 	for _, p := range env.Plans {
@@ -464,7 +464,7 @@ func TestBadInputIsRefusedRatherThanGuessed(t *testing.T) {
 	}{
 		{"unknown subcommand", []string{"frobnicate"}, "unknown subcommand"},
 		{"no subcommand", nil, "subcommand is required"},
-		{"unknown domain", []string{"report", "--domain", "rds"}, "unknown domain"},
+		{"unknown domain", []string{"report", "--domain", "quantum-annealer"}, "unknown domain"},
 		{"known but unwired domain", []string{"report", "--domain", "k8s-nodes"}, "not wired into this binary"},
 		{"missing snapshot file", []string{"report", "--snapshot", "testdata/nope.json"}, "no such file"},
 		{"bad --now", []string{"report", "--now", "yesterday"}, "--now"},

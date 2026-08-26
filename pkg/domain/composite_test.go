@@ -156,10 +156,10 @@ func TestEveryRegisteredDomainsKindIsInTheClosedSet(t *testing.T) {
 		}
 	}
 	// And the negative: an unknown kind is refused, so the set stays closed.
-	if err := r.Register(&partDomain{kind: "rds"}); err == nil {
+	if err := r.Register(&partDomain{kind: "quantum-annealer"}); err == nil {
 		t.Error("a domain with an unknown kind was registered")
 	}
-	if _, err := NewComposite("rds", Part{Name: "x", Domain: &partDomain{kind: "rds"},
+	if _, err := NewComposite("quantum-annealer", Part{Name: "x", Domain: &partDomain{kind: "quantum-annealer"},
 		Owns: func(Recommendation) bool { return true }}); err == nil {
 		t.Error("a composite for an unknown kind was built")
 	}
