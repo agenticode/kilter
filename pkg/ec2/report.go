@@ -45,8 +45,14 @@ type Report struct {
 	Config Config `json:"config"`
 	// Assessments is sorted by instance ID.
 	Assessments []Assessment `json:"assessments,omitempty"`
-	Warnings    []string     `json:"warnings,omitempty"`
-	Totals      Totals       `json:"totals"`
+	// Advisories are report-scope findings that describe something other than
+	// one instance — today, the AWS Batch compute-environment insights of
+	// batchenrich.go, which are about a configuration field no EC2 instance
+	// carries. They obey exactly the same contract as an assessment's
+	// advisories: always caveated, never actuatable, never a proposal.
+	Advisories []Advisory `json:"advisories,omitempty"`
+	Warnings   []string   `json:"warnings,omitempty"`
+	Totals     Totals     `json:"totals"`
 }
 
 // Proposals returns the assessments that carry a proposal, in report order.
@@ -71,6 +77,17 @@ func (r *Report) For(id string) (Assessment, bool) {
 
 func (r *Report) computeTotals() Totals {
 	t := Totals{SuppressedByCode: map[string]int{}}
+	// Report-scope advisories count as advisories and nothing else. None of
+	// them carries a net saving today (the Batch floor deliberately reports a
+	// gross list-price figure and a zero net), but the branch is written the
+	// same way as the per-assessment one so a future report advisory cannot
+	// leak into the savings total by accident.
+	t.Advisories += len(r.Advisories)
+	for _, ad := range r.Advisories {
+		if ad.NetSavingsMonthlyUSD > 0 {
+			t.AdvisoryNetSavingsMonthlyUSD += ad.NetSavingsMonthlyUSD
+		}
+	}
 	for _, a := range r.Assessments {
 		t.Instances++
 		if a.Excluded() {
@@ -113,6 +130,18 @@ func (r *Report) computeTotals() Totals {
 func (r *Report) Validate() error {
 	if r.Domain != Domain {
 		return fmt.Errorf("ec2: report domain %q, want %q", r.Domain, Domain)
+	}
+	for _, ad := range r.Advisories {
+		if ad.Code == "" {
+			return fmt.Errorf("ec2: a report-scope advisory has no code")
+		}
+		if ad.Caveat == "" {
+			return fmt.Errorf("ec2: report advisory %q has no caveat; an advisory without its caveat reads as "+
+				"an actionable saving", ad.Code)
+		}
+		if ad.Actuatable() {
+			return fmt.Errorf("ec2: report advisory %q claims to be actuatable", ad.Code)
+		}
 	}
 	var lastID string
 	for i, a := range r.Assessments {
@@ -221,6 +250,14 @@ func (r *Report) WriteText(w io.Writer) error {
 	fmt.Fprintf(tw, "%d of %d instances are memory-blind; %d are on 5-minute basic monitoring\n",
 		t.MemoryBlind, t.Instances, t.CoarseResolution)
 	fmt.Fprintln(tw)
+
+	for _, ad := range r.Advisories {
+		fmt.Fprintf(tw, "ADVISE [%s]\t%s\n", ad.Code, ad.Message)
+		fmt.Fprintf(tw, "       caveat\t%s\n", ad.Caveat)
+	}
+	if len(r.Advisories) > 0 {
+		fmt.Fprintln(tw)
+	}
 
 	for _, a := range r.Assessments {
 		fmt.Fprintf(tw, "%s\t%s\t%s/mo\n", a.Target.ID, a.Current.Attrs[AttrInstanceType],
