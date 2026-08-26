@@ -21,6 +21,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
+	"github.com/agenticode/kilter/pkg/evidence"
 	"github.com/agenticode/kilter/pkg/forecast"
 	"github.com/agenticode/kilter/pkg/model"
 	"github.com/agenticode/kilter/pkg/plan"
@@ -52,7 +53,10 @@ type BrainConfig struct {
 	ForecasterURL string
 	Recommend     recommend.Config
 	Plan          plan.Config
-	Logger        *slog.Logger
+	// Evidence bounds the L0 evidence substrate the explanation routes are
+	// served from. The zero value takes evidence.DefaultConfig().
+	Evidence evidence.Config
+	Logger   *slog.Logger
 }
 
 func (c BrainConfig) withDefaults() BrainConfig {
@@ -90,6 +94,12 @@ type Brain struct {
 	approvals map[string]*approvalState
 
 	forecaster *forecast.RemoteForecaster // nil = built-in models only
+
+	// mem is the evidence substrate every explanation is grounded in and
+	// every citation is re-resolved against. Never nil — see substrate.go.
+	mem *evidence.Memory
+	// subs holds per-cluster change detection for the substrate's events.
+	subs map[string]*substrateState
 
 	m brainMetrics
 }
@@ -140,7 +150,23 @@ func NewBrain(cfg BrainConfig, catalog *pricing.Catalog, st *store.Store) (*Brai
 		demand:    map[string]*demandTracker{},
 		ledgers:   map[string]*ledgerState{},
 		approvals: map[string]*approvalState{},
+		subs:      map[string]*substrateState{},
 		m:         newBrainMetrics(),
+	}
+	// The substrate comes first: everything below may write into it, and a
+	// brain that cannot build one cannot verify an answer it serves.
+	if st != nil {
+		mem, err := restoreEvidence(b.cfg.Evidence, st.EvidenceCheckpoints())
+		if err != nil {
+			return nil, err
+		}
+		b.mem = mem
+	} else {
+		mem, err := evidence.NewMemory(b.cfg.Evidence)
+		if err != nil {
+			return nil, fmt.Errorf("api: evidence config: %w", err)
+		}
+		b.mem = mem
 	}
 	if b.cfg.ForecasterURL != "" {
 		rf, err := forecast.NewRemoteForecaster(b.cfg.ForecasterURL)
@@ -166,7 +192,9 @@ func NewBrain(cfg BrainConfig, catalog *pricing.Catalog, st *store.Store) (*Brai
 				b.lastSnap[c] = snap
 			}
 		}
-		b.cfg.Logger.Info("brain restored", "clusters", len(clusters))
+		mstats := b.mem.Stats()
+		b.cfg.Logger.Info("brain restored", "clusters", len(clusters),
+			"evidenceEvents", mstats.Events, "evidenceSubjects", mstats.SeriesSubjects)
 	}
 	return b, nil
 }
@@ -221,19 +249,31 @@ func (b *Brain) Ingest(snap *model.ClusterSnapshot) error {
 		if err := b.st.SaveSnapshot(snap); err != nil {
 			b.cfg.Logger.Error("persist snapshot", "err", err)
 		}
-		if count%b.cfg.CheckpointEvery == 0 {
-			if err := b.st.SaveRecommenderState(snap.ClusterID, r.Checkpoint()); err != nil {
-				b.cfg.Logger.Error("persist recommender", "err", err)
-			}
+		// The time-keyed history `kilter backtest --cluster` replays. It is
+		// separate from SaveSnapshot because that one is keyed by cluster and
+		// keeps exactly one row; this one is keyed by cluster AND time, and
+		// thins itself to its retention cadence (pkg/store/history.go).
+		if err := b.st.SaveSnapshotAt(snap); err != nil {
+			b.cfg.Logger.Error("persist snapshot history", "err", err)
 		}
 	}
 
 	cost := b.catalog.SnapshotCost(snap)
+	b.observeIntoSubstrate(snap, cost.HourlyUSD)
 	b.ledgerFor(snap.ClusterID).addCost(snap.Timestamp, cost.HourlyUSD)
 	b.m.snapshots.WithLabelValues(snap.ClusterID).Inc()
 	b.m.containers.WithLabelValues(snap.ClusterID).Set(float64(r.StateCount()))
 	b.m.costHourly.WithLabelValues(snap.ClusterID).Set(cost.HourlyUSD)
 	b.m.ingestSec.Observe(time.Since(start).Seconds())
+
+	// Checkpointing is last: it is the most expensive thing in this function
+	// and the only part whose failure costs nothing already observed.
+	if b.st != nil && count%b.cfg.CheckpointEvery == 0 {
+		if err := b.st.SaveRecommenderState(snap.ClusterID, r.Checkpoint()); err != nil {
+			b.cfg.Logger.Error("persist recommender", "err", err)
+		}
+		b.saveEvidence()
+	}
 	return nil
 }
 
@@ -390,6 +430,7 @@ func (b *Brain) Handler() http.Handler {
 		writeJSON(w, http.StatusOK, map[string]any{"insights": ins})
 	}))
 	b.registerTrustRoutes(mux)
+	b.registerExplainRoutes(mux)
 	mux.HandleFunc("GET /api/v1/clusters/{id}/cost", b.auth(func(w http.ResponseWriter, r *http.Request) {
 		snap := b.snapshotFor(r.PathValue("id"))
 		if snap == nil {
@@ -518,6 +559,7 @@ func (b *Brain) Serve(ctx context.Context, addr string) error {
 				_ = b.st.SaveRecommenderState(cluster, r.Checkpoint())
 			}
 			b.mu.RUnlock()
+			b.saveEvidence()
 		}
 		return nil
 	case err := <-errCh:

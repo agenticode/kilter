@@ -25,6 +25,9 @@ var (
 	bucketPlans       = []byte("plans")       // cluster/timestamp → Plan
 )
 
+// Two more buckets live in their own files, next to the code that owns them:
+// bucketSnapHistory (history.go) and bucketEvidence (evidence.go).
+
 // PlanHistoryLimit bounds retained plans per cluster. Pruning keeps the newest
 // PlanHistoryLimit by Plan.CreatedAt, not by insertion order.
 const PlanHistoryLimit = 50
@@ -44,6 +47,8 @@ const planTimeFormat = "2006-01-02T15:04:05.000000000Z07:00"
 // Store is a bbolt-backed persistence layer. Safe for concurrent use.
 type Store struct {
 	db *bolt.DB
+	// snapRetention bounds the time-keyed snapshot history (history.go).
+	snapRetention retentionState
 }
 
 // Open creates/opens the store file, creating the buckets if needed. It fails
@@ -54,7 +59,7 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("store: open %s: %w", path, err)
 	}
 	err = db.Update(func(tx *bolt.Tx) error {
-		for _, b := range [][]byte{bucketRecommender, bucketSnapshots, bucketPlans} {
+		for _, b := range [][]byte{bucketRecommender, bucketSnapshots, bucketPlans, bucketSnapHistory, bucketEvidence} {
 			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
 				return err
 			}
@@ -65,7 +70,9 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("store: init buckets: %w", err)
 	}
-	return &Store{db: db}, nil
+	s := &Store{db: db}
+	s.snapRetention.r = DefaultSnapshotRetention()
+	return s, nil
 }
 
 // Close releases the file.
