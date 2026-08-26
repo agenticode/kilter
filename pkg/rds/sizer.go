@@ -97,6 +97,14 @@ type Config struct {
 
 	// Parity is the U13 seam. Nil in U11 — see [StorageParity].
 	Parity StorageParity `json:"-"`
+
+	// Growth is the evidence bar the allocated-storage growth finding must
+	// clear before it states anything. The zero value means
+	// [DefaultGrowthPolicy], and normalized() clamps a supplied policy to that
+	// floor rather than honouring one that is looser: a caller must be able to
+	// demand MORE evidence than this package requires and never less. See
+	// [AssessStorageGrowth].
+	Growth GrowthPolicy `json:"growth"`
 }
 
 // DefaultConfig returns the shipped policy.
@@ -107,6 +115,7 @@ func DefaultConfig() Config {
 		FullWindow:                    DefaultFullWindow,
 		StorageOverprovisionThreshold: DefaultStorageOverprovisionThreshold,
 		IdleCPUPercent:                DefaultIdleCPUPercent,
+		Growth:                        DefaultGrowthPolicy(),
 	}
 }
 
@@ -129,6 +138,7 @@ func (c Config) normalized() Config {
 	if c.IdleCPUPercent <= 0 {
 		c.IdleCPUPercent = DefaultIdleCPUPercent
 	}
+	c.Growth = c.Growth.normalized()
 	return c
 }
 
@@ -253,8 +263,13 @@ type Assessment struct {
 	CurrentMonthlyUSD float64        `json:"currentMonthlyUSD,omitempty"`
 	RateProvenance    RateProvenance `json:"rateProvenance,omitempty"`
 
-	Memory     MemoryVerdict     `json:"memory,omitzero"`
-	Storage    StorageVerdict    `json:"storage,omitzero"`
+	Memory  MemoryVerdict  `json:"memory,omitzero"`
+	Storage StorageVerdict `json:"storage,omitzero"`
+	// Growth is the allocated-storage RATCHET over time, from the history the
+	// caller persisted. Its zero value is [GrowthUnevaluated] — the question
+	// was never put — which is a third state distinct from both "not enough
+	// history" and "measured, and flat". See [GrowthVerdict].
+	Growth     GrowthVerdict     `json:"growth,omitzero"`
 	Idle       IdleVerdict       `json:"idle,omitzero"`
 	Commitment CommitmentVerdict `json:"commitment,omitzero"`
 
@@ -488,6 +503,16 @@ func (s *Sizer) assessTarget(now time.Time, snap *Snapshot, t Target, ledger dom
 
 	a.Storage = AssessStorage(inst, free, s.cfg.Rates)
 	s.storageFindings(&a, snap)
+
+	// Trap 8 over TIME. The floor moved on its own; this says how far, over
+	// how long, and refuses to say more than the history supports. Ordering:
+	// after storageFindings so the report reads floor-then-growth (the growth
+	// elaborates the ratchet the line above already refused), and before
+	// rateProvenanceFindings so the unverified-rate caveat lands after every
+	// dollar it is a caveat on. Its dollar comes from the same storage rate
+	// [Assessment.WorstRateProvenance] already weighs. See [AssessStorageGrowth].
+	s.growthFindings(&a, t, snap)
+
 	s.rateProvenanceFindings(&a)
 
 	// --- Idle, and the replica distinction (§2.5) -------------------------

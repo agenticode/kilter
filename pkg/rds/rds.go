@@ -709,6 +709,19 @@ type Target struct {
 	// never by the collector, because only the domain has a previous
 	// observation to remember.
 	PriorAllocatedStorageGiB int64 `json:"priorAllocatedStorageGiB,omitempty"`
+	// StorageHistory is every allocated-storage observation of this instance
+	// that survived the caller's retention, oldest first. It is the seam
+	// FINDINGS.md §7.4 named: PriorAllocatedStorageGiB answers "did it move
+	// since last time", and this answers "how far has it moved, over how long,
+	// and in how many steps" — which is the only version of the question a
+	// lumpy, thinned, one-way ratchet can be asked honestly.
+	//
+	// It is filled by the CALLER, from persisted checkpoints, and never by the
+	// collector: a collector sees one instant and a growth is a claim about
+	// several. Empty is the normal state of an unwired deployment and produces
+	// [GrowthNoHistory] rather than a fleet of identical refusals. See
+	// [StorageHistory.Append] and GROWTH-FINDINGS.md §6.
+	StorageHistory StorageHistory `json:"storageHistory,omitempty"`
 }
 
 // SeriesFor returns the named series, and false when it was not delivered.
