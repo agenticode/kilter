@@ -6,6 +6,7 @@
 //	kilter controller  executes brain plans under the safety envelope
 //	kilter plan        fetch & print the current plan from a brain
 //	kilter insights    predictive findings (OOM risk, saturation, capacity)
+//	kilter domains     compute domains: ec2/ebs, ecs-fargate, lambda, k8s-fargate
 //	kilter simulate    replay a recorded snapshot through the decision engine
 //	kilter version     build information
 package main
@@ -34,6 +35,7 @@ Commands:
   controller  Execute brain plans (dry-run by default)
   plan        Fetch and print the current plan from a brain
   insights    Predictive findings: OOM risk, saturation, capacity exhaustion
+  domains     Run every compute domain (ec2/ebs, ecs-fargate, lambda, k8s-fargate)
   pricing     Sync live cloud prices into a catalog (sync-aws)
   ledger      Audit trail: executed plans + measured cost curve (verifiable savings)
   approve     Approve a plan fingerprint for --require-approval controllers
@@ -65,6 +67,8 @@ func main() {
 		err = runPlanCmd(args)
 	case "insights":
 		err = runInsights(args)
+	case "domains":
+		err = runDomains(args)
 	case "pricing":
 		err = runPricing(args)
 	case "ledger":

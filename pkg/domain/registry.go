@@ -18,6 +18,9 @@ import (
 type Registry struct {
 	mu      sync.RWMutex
 	domains map[Kind]Domain
+	// actuators is the actuation-capability table. It is deliberately a
+	// SECOND map, written only by cmd/: see the note in actuation.go.
+	actuators map[Kind]Actuator
 }
 
 // NewRegistry returns an empty registry.
@@ -175,5 +178,40 @@ func (r *Registry) PlanSteps(k Kind, recs []Recommendation, g Guard) ([]Step, er
 		return nil, nil
 	}
 	SortRecommendations(applicable)
-	return d.PlanSteps(applicable, g)
+	steps, err := d.PlanSteps(applicable, g)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateSteps(k, steps); err != nil {
+		return nil, err
+	}
+	return steps, nil
+}
+
+// validateSteps checks what a domain handed back before the core will carry
+// it any further.
+//
+// Filtering the INPUT is not enough. A domain is ordinary Go code: it can
+// return a step for a target it was never given, in a domain it does not own.
+// Without this check, [Registry.Execute] would route that step by
+// Step.Target.Domain straight into ANOTHER domain's actuator — a domain
+// escaping its own boundary through the core that exists to hold it there. So
+// every step is required to name the domain that produced it, to carry a
+// valid action class (the executor's disruption accounting keys off it), and
+// to carry an idempotency key (without one, a resumed plan re-executes).
+func validateSteps(k Kind, steps []Step) error {
+	for i, s := range steps {
+		switch {
+		case s.Target.Domain != k:
+			return fmt.Errorf("domain: %s returned step %d for another domain (%q): %w",
+				k, i, s.Target.Domain, ErrWrongDomain)
+		case !s.Action.Valid():
+			return fmt.Errorf("domain: %s returned step %d (%s) with invalid action %q",
+				k, i, s.Target, s.Action)
+		case s.Key == "":
+			return fmt.Errorf("domain: %s returned step %d (%s) with no idempotency key",
+				k, i, s.Target)
+		}
+	}
+	return nil
 }

@@ -1,0 +1,1 @@
+{"reservedInstances":[{"id":"ri-fixture-m5","count":1,"instanceType":"m5.2xlarge","region":"us-east-1","platform":"Linux/UNIX","offeringClass":"standard","effectiveHourlyUSD":0.242,"expires":"2027-06-22T12:00:00Z"}],"fetchedAt":"2026-08-25T12:00:00Z"}

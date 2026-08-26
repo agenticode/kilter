@@ -2,6 +2,7 @@ package domain
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -52,6 +53,27 @@ type Snapshot struct {
 
 	// Cluster is the Kubernetes snapshot for Kubernetes-backed domains.
 	Cluster *model.ClusterSnapshot `json:"cluster,omitempty"`
+
+	// Payload is a domain-native snapshot the generic Targets/Samples shape
+	// cannot carry without loss. It is OPAQUE to the core: only the domain
+	// named by Domain may decode it, and nothing here inspects it.
+	//
+	// It exists because pkg/lambda/FINDINGS.md §8 proved the generic shape
+	// insufficient: a Lambda REPORT record is four numbers whose CORRELATION
+	// is the entire point — the memory setting an invocation ran at and the
+	// duration it took THERE — and splitting one record into three
+	// [Sample]s discards exactly that. Every cost claim in that domain rests
+	// on the correlation, so a domain forced through the lossy path can only
+	// refuse. pkg/ec2 and pkg/ecs have the same problem for a different
+	// reason: their evidence is per-target series with per-series status
+	// (truncated vs. empty), and "absence of an answer" must stay
+	// distinguishable from "absence of data".
+	//
+	// Payload does not weaken the seam: a domain still cannot see another
+	// domain's payload, [Registry.Learn] still routes by Kind, and a domain
+	// that cannot decode what it was handed must degrade to report-only
+	// rather than fail the brain.
+	Payload json.RawMessage `json:"payload,omitempty"`
 
 	// Commitments piggyback on EC2-domain snapshots; the brain owns one
 	// account-wide ledger regardless of which domain delivered it.

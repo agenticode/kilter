@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/agenticode/kilter/pkg/collect"
+	"github.com/agenticode/kilter/pkg/crossover"
 	"github.com/agenticode/kilter/pkg/model"
 	"github.com/agenticode/kilter/pkg/plan"
 	"github.com/agenticode/kilter/pkg/pricing"
@@ -25,6 +26,7 @@ func runAnalyze(args []string) error {
 	catalogPath := fs.String("catalog", "", "custom pricing catalog JSON (default: embedded baseline)")
 	dumpPath := fs.String("dump-snapshot", "", "also write the final snapshot to this file (for kilter simulate)")
 	jsonOut := fs.Bool("json", false, "emit machine-readable JSON instead of the report")
+	fargateCmp := fs.Bool("fargate", false, "also compare this cluster's pods against EKS Fargate pricing (advisory)")
 	topN := fs.Int("top", 10, "how many overprovisioned workloads to show")
 	fs.Parse(args)
 
@@ -98,18 +100,50 @@ func runAnalyze(args []string) error {
 		return err
 	}
 
+	// The Fargate ⇄ EC2 crossover (design §4.3, U3). Advisory: it compares two
+	// MODELLED bills for the same pods and knows nothing about the current
+	// invoice, so its number is never a claim and never reaches the ledger.
+	// crossover.FromSnapshot calls pricing.SplitFargate first, which is what
+	// keeps a Fargate VM's 96-vCPU shell out of the node math (§7 trap 7).
+	var crossoverRep *crossover.Report
+	if *fargateCmp {
+		crossoverRep = fargateCrossover(time.Now(), snap, catalog)
+	}
+
 	if *jsonOut {
 		out := map[string]any{
 			"cost":            catalog.SnapshotCost(snap),
 			"plan":            p,
 			"recommendations": recs,
 		}
+		if crossoverRep != nil {
+			out["fargateCrossover"] = crossoverRep
+		}
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
 		return enc.Encode(out)
 	}
 	printReport(snap, recs, p, catalog, *topN, *watch)
+	if crossoverRep != nil {
+		fmt.Print("\n" + crossoverRep.Summary())
+	} else if *fargateCmp {
+		fmt.Println("\nfargate crossover: no schedulable pods to compare")
+	}
 	return nil
+}
+
+// fargateCrossover computes the §4.3 Fargate ⇄ EC2 comparison, or nil when
+// there is nothing schedulable to compare.
+//
+// now is a parameter, not a clock read: pkg/crossover never reads one, and
+// this is the boundary where cmd/ supplies it.
+func fargateCrossover(now time.Time, snap *model.ClusterSnapshot, catalog *pricing.Catalog) *crossover.Report {
+	ps := crossover.FromSnapshot(snap)
+	if len(ps.Pods) == 0 {
+		return nil
+	}
+	rep := crossover.Analyze(now, ps, crossover.Options{Catalog: catalog})
+	return &rep
 }
 
 func loadCatalog(path string) (*pricing.Catalog, error) {

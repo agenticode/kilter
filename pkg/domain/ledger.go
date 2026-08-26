@@ -30,6 +30,34 @@ type Netter interface {
 	Net(before, after []commit.UsageLine) commit.Assessment
 }
 
+// Inventor is the optional half of [Netter] for domains that build the
+// account-wide before/after usage themselves and therefore need the commitment
+// inventory rather than a per-change assessment.
+//
+// pkg/ec2 is the case that forces it. That package predates this seam, takes a
+// *commit.Inventory directly, and constructs the account-wide usage from every
+// priced instance in its own snapshot — which is CORRECT (§4.4 ex.3: a partial
+// view overstates savings) and not something to undo. So rather than make it
+// wrong to fit the interface, the seam exposes the inventory the [Netter] is
+// netting against, and the adapter hands it over.
+//
+// A Netter that does not implement Inventor is not broken: it means "no
+// inventory to share", and a domain that needs one degrades to net == gross,
+// which under-claims and can never invent a saving.
+type Inventor interface {
+	// Inventory returns the commitment inventory, or nil when there is none.
+	Inventory() *commit.Inventory
+}
+
+// InventoryOf reads the commitment inventory out of a Netter, returning nil
+// when the Netter cannot supply one.
+func InventoryOf(n Netter) *commit.Inventory {
+	if inv, ok := n.(Inventor); ok && inv != nil {
+		return inv.Inventory()
+	}
+	return nil
+}
+
 // Ledger nets a domain's proposed change against an account-wide usage baseline
 // and a commitment inventory. It is pure: no clock, no I/O.
 //
@@ -66,6 +94,27 @@ func sortLines(l []commit.UsageLine) {
 		}
 		return l[i].InstanceType < l[j].InstanceType
 	})
+}
+
+// Inventory implements [Inventor]. A nil ledger, and a ledger built over a nil
+// inventory, both report nil — "no known commitments".
+func (l *Ledger) Inventory() *commit.Inventory {
+	if l == nil {
+		return nil
+	}
+	return l.inv
+}
+
+// Baseline returns a copy of the account-wide usage this ledger splices into.
+// Copied, never shared: a domain that mutated the baseline would change every
+// other domain's bill.
+func (l *Ledger) Baseline() []commit.UsageLine {
+	if l == nil || len(l.baseline) == 0 {
+		return nil
+	}
+	out := make([]commit.UsageLine, len(l.baseline))
+	copy(out, l.baseline)
+	return out
 }
 
 // Net implements [Netter].
