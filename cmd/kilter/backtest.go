@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/agenticode/kilter/pkg/api"
 	"github.com/agenticode/kilter/pkg/backtest"
 	"github.com/agenticode/kilter/pkg/decision"
 	"github.com/agenticode/kilter/pkg/plan"
@@ -23,31 +24,37 @@ import (
 // and on its first run it falsified the shipped engine. Until now nothing in
 // the binary could call it.
 //
-// # What is wired, and the one thing that is not
+// # Both sources of history are wired
 //
-// The TRACE path is wired: four synthetic archetypes whose oracles are known
-// in closed form, replayed through the same observe-then-ask sequence
-// pkg/api's Ingest/Plan runs. Policy files, the A/B comparison, Gate, the
-// JSON scorecard and the CI exit code all work over it.
+// The TRACE path (--demo) replays four synthetic archetypes whose oracles are
+// known in closed form, through the same observe-then-ask sequence pkg/api's
+// Ingest/Plan runs. Policy files, the A/B comparison, Gate, the JSON scorecard
+// and the CI exit code all work over it.
 //
-// The LIVE path is NOT wired, and refuses rather than pretending. §4.4's
-// headline feature is "replay this cluster's own history", and it needs a seam
-// that does not exist: pkg/store keeps only the LATEST snapshot per cluster
-// (SaveSnapshot/LoadSnapshot are keyed by cluster, not by time), and
-// recommend.ObserveSnapshot and plan.Build both take a *model.ClusterSnapshot,
-// so a replay through the production code path needs topology over time.
+// The LIVE path (--cluster --db) replays a cluster's OWN retained history and
+// was refused until pkg/store grew a time-keyed snapshot bucket. It is wired
+// to api.Brain.Backtest and nothing about the refusal was deleted: it MOVED.
+// Brain.Backtest still refuses, by type, in the two cases that matter —
+// api.ErrNoHistory and api.ErrHistoryTooShort — and this command returns those
+// errors unaltered, so they keep their non-zero exit and no scorecard is
+// printed. The second case is the one a count check misses: backtest.Run over
+// a history with no scoreable instant does not fail, it returns a Scorecard
+// with the same shape, the same field names and the same confident tone as a
+// real one, and `regret $0.00` over nothing reads as a perfect policy. That
+// check lives in pkg/api because it is expressed in terms of backtest's own
+// coverage report (Scorecard.Instants), not in terms of anything cmd can see.
 //
-// Running the harness against a single snapshot would produce a scorecard —
-// one instant, no horizon, every number a rounding artefact — that looks
-// exactly like a real one. That is the failure mode this command refuses to
-// have: --cluster names the missing seam and exits non-zero. See
-// backtestLiveRefusal.
+// --from and --to are REQUIRED with --cluster, for the reason backtestEpoch is
+// a constant for --demo and why-cost requires its window: a replay window that
+// drifts with wall-clock time makes two runs over the same configuration
+// disagree, and a scorecard whose whole value is comparability cannot be
+// computed over a moving window.
 
 const backtestUsage = `kilter backtest — replay a policy against history and score it
 
 Usage:
-  kilter backtest --demo <archetype> [flags]     score the shipped policy over a synthetic trace
-  kilter backtest --cluster <id>     [flags]     replay a cluster's own history (see below)
+  kilter backtest --demo <archetype> [flags]                 score the shipped policy over a synthetic trace
+  kilter backtest --cluster <id> --db PATH --from T --to T   replay a cluster's own retained history
 
 Archetypes (--demo), each with a closed-form oracle:
   steady          every sample at the base level
@@ -55,24 +62,33 @@ Archetypes (--demo), each with a closed-form oracle:
   bursty          12 spikes/day — narrower than the 5%% CPU tail, wide enough for the memory peak
   regime-change   a level shift at the midpoint, on a decision instant
 
+The two sources are different substrates for the same question and exactly one
+may be given. --cluster reads the snapshot history a running brain persisted;
+it is refused, by name and with a non-zero exit, when that history is absent or
+too short to yield a single scoreable decision instant.
+
 Flags:
   --demo KIND            synthetic archetype to score
-  --cluster ID           replay a live cluster's history (refused: see --help output)
-  --days N               trace length in days (default 7)
-  --workloads N          containers in the trace (default 2)
-  --noise PCT            deterministic jitter, e.g. 0.05 for +/-5%% (default 0)
+  --cluster ID           replay this cluster's own retained history (needs --db)
+  --db PATH              brain database written by "kilter brain --db PATH"
+  --from RFC3339         replay window start, inclusive (required with --cluster)
+  --to RFC3339           replay window end, EXCLUSIVE (required with --cluster)
+  --days N               trace length in days (default 7, --demo only)
+  --workloads N          containers in the trace (default 2, --demo only)
+  --noise PCT            deterministic jitter, e.g. 0.05 for +/-5%% (default 0, --demo only)
   --horizon DUR          how far ahead each decision is scored (default 24h)
   --interval DUR         spacing of decision instants (default 24h)
   --starvation F         CPU violation threshold: future p95 > request x F (default 1.0)
   --incident-usd N       price of one violated container-window (default 50)
-  --derive-costs         derive CPU/memory rates from the catalog and the trace's nodes
+  --derive-costs         derive CPU/memory rates from the catalog and the trace's nodes (--demo only)
   --catalog PATH         pricing catalog JSON (default: embedded)
-  --policy PATH          policy triple JSON; omitted means the shipped default
-  --compare PATH         score a second policy and print Gate's verdict
+  --policy PATH          policy triple JSON; omitted means the shipped default (--demo only)
+  --compare PATH         score a second policy and print Gate's verdict (--demo only)
   --enforce-refusals     run pkg/decision's refusal predicates (models the pending wiring);
                          a policy file's "enforceDecisionRefusals" overrides it per policy
+                         (--demo only)
   --json                 emit the scorecard verbatim (byte-stable, CI-diffable)
-  --fail-on-regression   exit non-zero when Gate rejects the candidate
+  --fail-on-regression   exit non-zero when Gate rejects the candidate (--demo only)
 `
 
 func runBacktest(args []string) error { return runBacktestTo(os.Stdout, args) }
@@ -81,6 +97,9 @@ func runBacktest(args []string) error { return runBacktestTo(os.Stdout, args) }
 type backtestFlags struct {
 	demo      string
 	cluster   string
+	db        string
+	from      string
+	to        string
 	days      int
 	workloads int
 	noise     float64
@@ -105,7 +124,10 @@ func runBacktestTo(w io.Writer, args []string) error {
 	fs.SetOutput(w)
 	var bf backtestFlags
 	fs.StringVar(&bf.demo, "demo", "", "synthetic archetype (steady|diurnal|bursty|regime-change)")
-	fs.StringVar(&bf.cluster, "cluster", "", "replay a live cluster's own history")
+	fs.StringVar(&bf.cluster, "cluster", "", "replay a live cluster's own retained history")
+	fs.StringVar(&bf.db, "db", "", "brain database holding the snapshot history")
+	fs.StringVar(&bf.from, "from", "", "replay window start (RFC3339, required with --cluster)")
+	fs.StringVar(&bf.to, "to", "", "replay window end (RFC3339, required with --cluster)")
 	fs.IntVar(&bf.days, "days", 7, "trace length in days")
 	fs.IntVar(&bf.workloads, "workloads", 2, "containers in the trace")
 	fs.Float64Var(&bf.noise, "noise", 0, "deterministic jitter fraction")
@@ -128,46 +150,124 @@ func runBacktestTo(w io.Writer, args []string) error {
 	case bf.cluster != "" && bf.demo != "":
 		return fmt.Errorf("backtest: --demo and --cluster are different sources of history; pass one")
 	case bf.cluster != "":
-		return backtestLiveRefusal(bf.cluster)
+		return runBacktestLive(w, &bf, setFlagNames(fs))
 	case bf.demo == "":
 		fmt.Fprint(w, backtestUsage)
 		return fmt.Errorf("backtest: --demo <archetype> or --cluster <id> is required")
 	}
-	return runBacktestDemo(w, &bf)
+	return runBacktestDemo(w, &bf, setFlagNames(fs))
 }
 
-// backtestLiveRefusal is the honest half of this command.
+// runBacktestLive replays a cluster's own retained history through the brain
+// that recorded it.
 //
-// It names the seam, says what it would take, and exits non-zero. It does NOT
-// fall back to the one snapshot pkg/store holds: a scorecard computed over a
-// single instant has the same shape, the same field names and the same
-// confident tone as a real one, and an operator reading "regret $0.00" has no
-// way to tell that it means "nothing was replayed".
-func backtestLiveRefusal(cluster string) error {
-	return fmt.Errorf(`backtest --cluster %s: refused — snapshot history is not persisted.
+// Every refusal below is a flag this source cannot honour, refused by name
+// rather than ignored — the same rule loadPolicy applies with
+// DisallowUnknownFields, and for the same reason: a knob that is silently
+// dropped produces a scorecard for a configuration nobody ran. What is NOT
+// here is a check on the history itself. api.Brain.Backtest owns that, it
+// refuses with typed errors, and this function returns them unaltered so the
+// message the operator sees is the one pkg/api wrote and the exit code is
+// non-zero.
+func runBacktestLive(w io.Writer, bf *backtestFlags, set map[string]bool) error {
+	// The trace-shaped flags describe a synthetic trace and mean nothing over
+	// a recorded history.
+	if err := refuseUnusable("backtest --cluster", "describe a synthetic trace, not a recorded history; "+
+		"the history is whatever the brain retained", set,
+		"days", "workloads", "noise"); err != nil {
+		return err
+	}
+	// The policy flags would answer a different question. api.Brain.Backtest
+	// scores THIS BRAIN'S policy — the recommender and planner the database's
+	// brain actually runs with — so "how good is what is running here" is the
+	// question a live replay answers. Scoring a policy that never ran against
+	// a history it never saw is an A/B, and it needs a policy argument
+	// pkg/api deliberately does not take; the seam if it is ever wanted is
+	// api.BrainConfig's Recommend and Plan fields.
+	if err := refuseUnusable("backtest --cluster", "belong to an A/B between two candidate policies; "+
+		"a live replay scores the policy this brain runs, and --demo is where a policy comparison "+
+		"belongs", set,
+		"policy", "compare", "enforce-refusals", "fail-on-regression"); err != nil {
+		return err
+	}
+	// --derive-costs reads the trace's own nodes. Over a live history the
+	// equivalent is the retained snapshots, which is a cost model this
+	// command does not build; refusing beats deriving a different one.
+	if err := refuseUnusable("backtest --cluster", "derives a cost model from a synthetic trace's "+
+		"nodes and has no defined meaning over a recorded history", set, "derive-costs"); err != nil {
+		return err
+	}
+	if bf.db == "" {
+		fmt.Fprint(w, backtestUsage)
+		return fmt.Errorf("backtest --cluster %s: --db is required — the snapshot history lives in the "+
+			"brain's database, and there is no history without one", bf.cluster)
+	}
+	if bf.from == "" || bf.to == "" {
+		fmt.Fprint(w, backtestUsage)
+		return fmt.Errorf("backtest --cluster %s: --from and --to are required; the replay window is an "+
+			"argument, and a window that drifts with wall-clock time makes two runs over the same "+
+			"configuration disagree", bf.cluster)
+	}
+	from, err := time.Parse(time.RFC3339, bf.from)
+	if err != nil {
+		return fmt.Errorf("--from: %w", err)
+	}
+	to, err := time.Parse(time.RFC3339, bf.to)
+	if err != nil {
+		return fmt.Errorf("--to: %w", err)
+	}
 
-pkg/store keeps only the LATEST snapshot per cluster (SaveSnapshot/LoadSnapshot
-are keyed by cluster, not by time), and pkg/evidence stores per-subject usage
-series and events rather than pod/node topology. A replay that goes through the
-production code path needs topology over time, because recommend.ObserveSnapshot
-and plan.Build both take a *model.ClusterSnapshot.
+	catalog, err := loadCatalog(bf.catalog)
+	if err != nil {
+		return err
+	}
+	src, err := openBrainSource("backtest", bf.db, catalog)
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+	brain, err := src.brain(api.BrainConfig{})
+	if err != nil {
+		return err
+	}
 
-Scoring the one snapshot that does exist would produce a scorecard that looks
-exactly like a real one, so this refuses instead.
+	scoring := backtest.DefaultConfig()
+	scoring.DecisionInterval = bf.interval
+	if bf.starvation > 0 {
+		scoring.StarvationFactor = bf.starvation
+	}
+	if bf.incidentUSD > 0 {
+		scoring.Cost.IncidentUSD = bf.incidentUSD
+	}
 
-What it needs (pkg/backtest/FINDINGS.md, "Seams this unit needed and did not
-find", item 1): a time-keyed snapshot bucket in pkg/store — SaveSnapshotAt(snap)
-and Snapshots(cluster, from, to) — bounded the way the rest of the substrate is,
-plus an adapter implementing backtest.SnapshotSource. At a 5-minute cadence a
-30-day window is 8,640 snapshots per cluster, so the realistic shape is a
-keyframe-plus-delta encoding or a reduced replay snapshot carrying only what
-recommend and plan read.
-
-Meanwhile: kilter backtest --demo regime-change`, cluster)
+	// THE REFUSAL, reached from the command line. api.ErrNoHistory and
+	// api.ErrHistoryTooShort come back verbatim: nothing is printed, the error
+	// becomes a non-zero exit in main, and the operator is told how many
+	// snapshots there were and how many instants they yielded rather than
+	// being handed a scorecard whose zeros read as a verdict.
+	sc, err := brain.Backtest(bf.cluster, from, to, bf.horizon, scoring)
+	if err != nil {
+		return err
+	}
+	header := fmt.Sprintf("kilter backtest — cluster %s, replayed from %s\n"+
+		"window %s .. %s  horizon %s  interval %s\n\n",
+		bf.cluster, bf.db,
+		from.UTC().Format(time.RFC3339), to.UTC().Format(time.RFC3339),
+		bf.horizon, scoring.DecisionInterval)
+	return writeBacktestReport(w, bf, header, sc, nil, false, nil)
 }
 
 // runBacktestDemo scores one or two policies over a synthetic trace.
-func runBacktestDemo(w io.Writer, bf *backtestFlags) error {
+func runBacktestDemo(w io.Writer, bf *backtestFlags, set map[string]bool) error {
+	// The live source's flags are refused here for the same reason the trace's
+	// flags are refused there: the trace's window is backtestEpoch plus --days
+	// by construction, so a --from that was quietly ignored would produce a
+	// scorecard over a window the operator did not ask for.
+	if err := refuseUnusable("backtest --demo", "belong to --cluster; a trace's window is "+
+		"backtestEpoch plus --days and its history is generated, not stored", set,
+		"db", "from", "to"); err != nil {
+		return err
+	}
 	kind, err := parseArchetype(bf.demo)
 	if err != nil {
 		return err
@@ -253,6 +353,23 @@ func runBacktestDemo(w io.Writer, bf *backtestFlags) error {
 		gateOK, gateReasons = backtest.Gate(current, candidate, backtest.DefaultTolerance())
 	}
 
+	header := fmt.Sprintf("kilter backtest — %s trace, %d days, %d workloads\n"+
+		"window %s .. %s  horizon %s  interval %s\n\n",
+		kind, bf.days, bf.workloads,
+		trace.Start.UTC().Format(time.RFC3339), trace.End.UTC().Format(time.RFC3339),
+		bf.horizon, scoring.DecisionInterval)
+	return writeBacktestReport(w, bf, header, current, candidate, gateOK, gateReasons)
+}
+
+// writeBacktestReport renders one or two scorecards, in whichever form --json
+// asked for, then applies --fail-on-regression.
+//
+// Shared by both sources so a scorecard over a live history and a scorecard
+// over a trace are the same bytes in the same layout — they are meant to be
+// compared, and a second renderer is a second layout waiting to drift. Only
+// the header line differs, and it names which source produced the numbers.
+func writeBacktestReport(w io.Writer, bf *backtestFlags, header string,
+	current, candidate *backtest.Scorecard, gateOK bool, gateReasons []string) error {
 	if bf.jsonOut {
 		if candidate == nil {
 			// Verbatim: Scorecard.Encode is the byte-stable, CI-diffable form.
@@ -274,11 +391,7 @@ func runBacktestDemo(w io.Writer, bf *backtestFlags) error {
 	}
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "kilter backtest — %s trace, %d days, %d workloads\n",
-		kind, bf.days, bf.workloads)
-	fmt.Fprintf(&b, "window %s .. %s  horizon %s  interval %s\n\n",
-		trace.Start.UTC().Format(time.RFC3339), trace.End.UTC().Format(time.RFC3339),
-		bf.horizon, scoring.DecisionInterval)
+	b.WriteString(header)
 	writeScorecard(&b, "policy", current)
 	if candidate != nil {
 		b.WriteString("\n")

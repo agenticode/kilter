@@ -23,12 +23,27 @@ import (
 // `kilter explain` and `kilter why-cost` — the explanation plane, made
 // runnable.
 //
-// Both commands read a SEQUENCE of recorded cluster snapshots, the format
-// `kilter analyze --dump-snapshot` already writes. That is the honest input:
-// pkg/explain has no clock and no network, its window is an argument, and both
-// entry points need history that pkg/store does not keep (see
-// cmd/WIRING-FINDINGS.md). Feeding them recorded snapshots is the same
-// discipline `kilter domains` and `kilter simulate` already use.
+// Both commands answer from one of TWO sources, and the choice is explicit:
+//
+//   - --kube-snapshot (repeatable), a recorded snapshot series, plus --ledger
+//     for the recorded audit trail. This is the original source and it is
+//     unchanged: no database, no brain, nothing to run first. It is the same
+//     discipline `kilter domains` and `kilter simulate` already use.
+//   - --db PATH --cluster ID, a brain's own database. api.Brain now holds the
+//     evidence substrate these payloads are built from and Brain.WhyCost /
+//     Brain.Explain are exported, so a brain that has been ingesting can be
+//     asked about itself instead of being re-fed its own snapshots by hand.
+//     Both entry points call Verify internally, so neither can hand back an
+//     unverified payload.
+//
+// The second source is a SIBLING of the first, not a replacement. Passing both
+// is refused rather than resolved by precedence — two substrates that disagree
+// should surface as a question, not as a silent winner — and the two are
+// proven to agree where both can answer, in cmd/kilter/brainsourcewire_test.go.
+//
+// See cmd/kilter/brainsource.go for what an operator must know about reading a
+// brain's database: it must exist, it cannot be read while the brain holds the
+// lock, and the substrate is only as fresh as the last checkpoint.
 //
 // # The publish gate is not optional
 //
@@ -45,16 +60,24 @@ const explainUsage = `kilter explain — why the engine would resize this contai
 Usage:
   kilter explain --kube-snapshot PATH [--kube-snapshot PATH ...] \
                  --workload Kind/namespace/name --container NAME [flags]
+  kilter explain --db PATH --cluster ID \
+                 --workload Kind/namespace/name --container NAME [flags]
 
 Snapshots are replayed in timestamp order through the real recommender, so at
 least two are needed before anything can be said. Nothing here calls a cluster.
+--db reads a brain's own evidence substrate instead; the two sources are
+siblings and exactly one may be given.
 
 Flags:
   --kube-snapshot PATH   cluster snapshot JSON (repeatable, any order)
+  --db PATH              brain database written by "kilter brain --db PATH"
+  --cluster ID           cluster inside --db (required with --db)
   --workload REF         Kind/namespace/name, e.g. Deployment/default/api
   --container NAME       container within the workload
-  --from RFC3339         evidence window start (default: the first snapshot)
-  --to RFC3339           evidence window end   (default: the last snapshot)
+  --from RFC3339         evidence window start (default: the first snapshot;
+                         with --db, 24h back from the latest ingested snapshot)
+  --to RFC3339           evidence window end   (default: the last snapshot;
+                         with --db, one second after the latest ingested snapshot)
   --catalog PATH         pricing catalog JSON (default: embedded)
   --json                 emit the payload instead of the prose
 `
@@ -64,6 +87,7 @@ const whyCostUsage = `kilter why-cost — an additive, individually-citable cost
 Usage:
   kilter why-cost --kube-snapshot PATH [--kube-snapshot PATH ...] \
                   --from RFC3339 --to RFC3339 [flags]
+  kilter why-cost --db PATH --cluster ID --from RFC3339 --to RFC3339 [flags]
 
 --from and --to are REQUIRED. There is no default window: the window is an
 argument, and a wall-clock default makes a stored answer unreplayable.
@@ -75,10 +99,13 @@ construction.
 
 Flags:
   --kube-snapshot PATH   cluster snapshot JSON (repeatable, any order)
+  --db PATH              brain database written by "kilter brain --db PATH"
+  --cluster ID           cluster inside --db (required with --db)
   --from RFC3339         window start, inclusive (required)
   --to RFC3339           window end, EXCLUSIVE (required) — [from, to), matching
                          pkg/evidence's window convention
   --ledger PATH          kilter ledger --json output, for the kilter-action term
+                         (--kube-snapshot only: with --db the brain reads its own)
   --catalog PATH         pricing catalog JSON (default: embedded)
   --json                 emit the attribution instead of the prose
 `
@@ -93,6 +120,8 @@ func runWhyCostTo(w io.Writer, args []string) error {
 	fs.SetOutput(w)
 	var snaps repeatedFlag
 	fs.Var(&snaps, "kube-snapshot", "cluster snapshot JSON (repeatable)")
+	dbPath := fs.String("db", "", "brain database holding the evidence substrate")
+	clusterID := fs.String("cluster", "", "cluster inside --db")
 	from := fs.String("from", "", "window start (RFC3339, required)")
 	to := fs.String("to", "", "window end (RFC3339, required)")
 	ledgerPath := fs.String("ledger", "", "kilter ledger --json output")
@@ -101,9 +130,19 @@ func runWhyCostTo(w io.Writer, args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if len(snaps) == 0 {
-		fmt.Fprint(w, whyCostUsage)
-		return fmt.Errorf("why-cost: at least one --kube-snapshot is required")
+	set := setFlagNames(fs)
+	if err := chooseSource(w, "why-cost", whyCostUsage, len(snaps) > 0, *dbPath, *clusterID); err != nil {
+		return err
+	}
+	// The brain reads its OWN ledger (api.Brain.ledgerActions, the same
+	// projection loadLedgerActions performs over the JSON form). Splicing a
+	// second, file-supplied one in would give the attribution two sources for
+	// "which actions moved money" and no rule for reconciling them.
+	if *dbPath != "" {
+		if err := refuseUnusable("why-cost --db", "read a recorded ledger file; a brain attributes "+
+			"actions from the audit ledger it kept itself", set, "ledger"); err != nil {
+			return err
+		}
 	}
 	if *from == "" || *to == "" {
 		fmt.Fprint(w, whyCostUsage)
@@ -124,6 +163,9 @@ func runWhyCostTo(w io.Writer, args []string) error {
 	catalog, err := loadCatalog(*catalogPath)
 	if err != nil {
 		return err
+	}
+	if *dbPath != "" {
+		return whyCostFromBrain(w, *dbPath, *clusterID, start, end, catalog, *jsonOut)
 	}
 	series, err := loadSnapshotSeries(snaps)
 	if err != nil {
@@ -198,11 +240,82 @@ func runWhyCostTo(w io.Writer, args []string) error {
 		return fmt.Errorf("why-cost: the answer has a citation that does not resolve, so it is not "+
 			"publishable: %w", err)
 	}
-	if *jsonOut {
+	return renderAttribution(w, att, *jsonOut)
+}
+
+// whyCostFromBrain answers from a brain's own substrate.
+//
+// Everything the file-backed path above does by hand — build a substrate,
+// observe a timeline point per snapshot, price both window edges, project the
+// ledger, call Verify — api.Brain.WhyCost already does over the substrate the
+// brain accumulated while it was running. This function therefore contains no
+// projection of its own: a second definition of any of those steps is a second
+// answer waiting to disagree with the first, which is precisely why pkg/api
+// lifted loadLedgerActions rather than re-deriving it.
+//
+// The one thing done here and not there is the unknown-cluster check, which is
+// the command-line form of the route's 404. Brain.WhyCost answers "not enough
+// evidence" for a cluster that was never ingested, and that is true but sends
+// the operator to look for the wrong problem.
+func whyCostFromBrain(w io.Writer, dbPath, cluster string, start, end time.Time,
+	catalog *pricing.Catalog, jsonOut bool) error {
+	src, err := openBrainSource("why-cost", dbPath, catalog)
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+	if _, err := src.requireCluster(cluster); err != nil {
+		return err
+	}
+	brain, err := src.brain(api.BrainConfig{})
+	if err != nil {
+		return err
+	}
+	// Verify is called inside WhyCost, so an unverifiable answer arrives here
+	// as an error and never as a payload.
+	att, err := brain.WhyCost(cluster, start, end)
+	if err != nil {
+		return fmt.Errorf("why-cost --cluster %s: %w", cluster, err)
+	}
+	return renderAttribution(w, att, jsonOut)
+}
+
+// renderAttribution is the single rendering of an attribution, so the two
+// sources print the same bytes for the same answer — which is what lets a test
+// compare them directly.
+func renderAttribution(w io.Writer, att *explain.Attribution, jsonOut bool) error {
+	if jsonOut {
 		return writeJSON(w, att)
 	}
-	_, err = io.WriteString(w, att.Prose()+"\n")
+	_, err := io.WriteString(w, att.Prose()+"\n")
 	return err
+}
+
+// chooseSource enforces "exactly one source of history", for both verbs.
+//
+// Refusing beats a precedence rule. A user who passes both has two substrates
+// in mind and no way to know which one answered; if they disagree — and a
+// thinned snapshot history and a hand-picked snapshot series can — the silent
+// winner is the wrong artefact. Naming the conflict costs one run and removes
+// the ambiguity permanently.
+func chooseSource(w io.Writer, verb, usage string, haveFiles bool, dbPath, cluster string) error {
+	switch {
+	case haveFiles && dbPath != "":
+		return fmt.Errorf("%s: --kube-snapshot and --db are two different substrates for the same "+
+			"question; pass one. A recorded snapshot series and a brain's retained history can "+
+			"legitimately disagree, so neither is preferred silently", verb)
+	case dbPath == "" && cluster != "":
+		return fmt.Errorf("%s: --cluster names a cluster inside a brain database; it needs --db PATH. "+
+			"With --kube-snapshot the cluster comes from the snapshots themselves", verb)
+	case dbPath != "" && cluster == "":
+		return fmt.Errorf("%s: --db needs --cluster ID; a database holds every cluster that ever "+
+			"reported to that brain", verb)
+	case !haveFiles && dbPath == "":
+		fmt.Fprint(w, usage)
+		return fmt.Errorf("%s: a source of history is required — either --kube-snapshot PATH "+
+			"(repeatable) or --db PATH --cluster ID", verb)
+	}
+	return nil
 }
 
 // basisFrom prices one snapshot's fleet composition.
@@ -323,6 +436,8 @@ func runExplainTo(w io.Writer, args []string) error {
 	fs.SetOutput(w)
 	var snaps repeatedFlag
 	fs.Var(&snaps, "kube-snapshot", "cluster snapshot JSON (repeatable)")
+	dbPath := fs.String("db", "", "brain database holding the evidence substrate")
+	clusterID := fs.String("cluster", "", "cluster inside --db")
 	workload := fs.String("workload", "", "Kind/namespace/name")
 	container := fs.String("container", "", "container name")
 	from := fs.String("from", "", "evidence window start (RFC3339)")
@@ -332,9 +447,12 @@ func runExplainTo(w io.Writer, args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if len(snaps) == 0 || *workload == "" || *container == "" {
+	if err := chooseSource(w, "explain", explainUsage, len(snaps) > 0, *dbPath, *clusterID); err != nil {
+		return err
+	}
+	if *workload == "" || *container == "" {
 		fmt.Fprint(w, explainUsage)
-		return fmt.Errorf("explain: --kube-snapshot, --workload and --container are required")
+		return fmt.Errorf("explain: --workload and --container are required")
 	}
 	ref, err := parseWorkloadRef(*workload)
 	if err != nil {
@@ -343,6 +461,11 @@ func runExplainTo(w io.Writer, args []string) error {
 	catalog, err := loadCatalog(*catalogPath)
 	if err != nil {
 		return err
+	}
+	if *dbPath != "" {
+		return explainFromBrain(w, *dbPath, *clusterID,
+			model.ContainerKey{Workload: ref, Container: *container},
+			*from, *to, catalog, *jsonOut)
 	}
 	series, err := loadSnapshotSeries(snaps)
 	if err != nil {
@@ -421,7 +544,69 @@ func runExplainTo(w io.Writer, args []string) error {
 		return fmt.Errorf("explain: the answer has a citation that does not resolve, so it is not "+
 			"publishable: %w", err)
 	}
-	if *jsonOut {
+	return renderExplanation(w, key, start, end, payload, *jsonOut)
+}
+
+// explainFromBrain answers from a brain's own substrate.
+//
+// The window is the only thing this function decides, and it decides it the
+// way the HTTP route does: 24 hours ending ONE SECOND AFTER the latest
+// ingested snapshot, resolved from the store rather than from a clock, so two
+// runs against an idle database produce the same window and therefore the same
+// bytes. pkg/api's defaultExplainWindow is unexported, so the constant is
+// mirrored here and pinned to the route by
+// TestExplainOverADatabaseMatchesTheHTTPRoute rather than by comment.
+//
+// The subject is the four-segment container form. The three-segment workload
+// subject api.Brain.Explain also accepts stays reachable over HTTP only —
+// `kilter explain` has taken --workload AND --container since it shipped, and
+// making --container optional would change what an existing command line
+// means.
+func explainFromBrain(w io.Writer, dbPath, cluster string, key model.ContainerKey,
+	fromRaw, toRaw string, catalog *pricing.Catalog, jsonOut bool) error {
+	src, err := openBrainSource("explain", dbPath, catalog)
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+	latest, err := src.requireCluster(cluster)
+	if err != nil {
+		return err
+	}
+	defTo := latest.Timestamp.Add(time.Second)
+	start, end := defTo.Add(-brainExplainWindow), defTo
+	if fromRaw != "" {
+		if start, err = time.Parse(time.RFC3339, fromRaw); err != nil {
+			return fmt.Errorf("--from: %w", err)
+		}
+	}
+	if toRaw != "" {
+		if end, err = time.Parse(time.RFC3339, toRaw); err != nil {
+			return fmt.Errorf("--to: %w", err)
+		}
+	}
+	brain, err := src.brain(api.BrainConfig{})
+	if err != nil {
+		return err
+	}
+	// Kind/namespace/name/container is api.Brain.Explain's container form.
+	subject := string(key.Workload.Kind) + "/" + key.Workload.Namespace + "/" +
+		key.Workload.Name + "/" + key.Container
+	// Verify is called inside Explain, so a payload with a dangling citation
+	// arrives here as an error.
+	payload, err := brain.Explain(cluster, subject, start, end)
+	if err != nil {
+		return fmt.Errorf("explain --cluster %s: %w", cluster, err)
+	}
+	return renderExplanation(w, key, start, end, payload, jsonOut)
+}
+
+// renderExplanation is the single rendering of an explanation, shared by both
+// sources so the same answer prints the same bytes whichever substrate it came
+// from.
+func renderExplanation(w io.Writer, key model.ContainerKey, start, end time.Time,
+	payload *explain.Explanation, jsonOut bool) error {
+	if jsonOut {
 		return writeJSON(w, payload)
 	}
 	var b strings.Builder
@@ -429,7 +614,7 @@ func runExplainTo(w io.Writer, args []string) error {
 		start.UTC().Format(time.RFC3339), end.UTC().Format(time.RFC3339))
 	b.WriteString(payload.Prose())
 	b.WriteString("\n")
-	_, err = io.WriteString(w, b.String())
+	_, err := io.WriteString(w, b.String())
 	return err
 }
 
