@@ -275,3 +275,238 @@ quantity but not their size, and the helper attributed the larger size's units
 to the smaller line. The helper now index-aligns against the canonical order and
 asserts that alignment; the failing input is kept in
 `testdata/fuzz/FuzzWaterfall/` as a regression seed.
+
+---
+---
+
+# U12 — Reserved DB Instances (`pkg/pricing/commit/rds.go`)
+
+`Usage.Validate()` used to reject an RDS line outright, so until this landed an
+RDS domain could not produce a single dollar figure — netted or not. U12 adds
+the fourth commitment product so U11/U13 have a ledger to bill against.
+
+`gofmt`, `go vet ./...`, `go build ./...`, `go test -race -short ./...` and
+`go test ./test/scale/` are green. `go.mod` and `go.sum` are untouched; `rds.go`
+imports `fmt`, `math`, `sort`, `strconv`, `strings`, `time` and nothing else. No
+existing test was modified, weakened or skipped.
+
+## Scope: what was touched outside `rds.go` / `rds_test.go`
+
+The unit brief allows one constant block in `commit.go`, one clause in
+`Usage.Validate()` and one branch in `waterfall.go`. Four edits go slightly
+past that letter. Each is listed here because a scope note that hides an edit
+is worse than the edit.
+
+| File | Edit | Why it was not avoidable |
+| --- | --- | --- |
+| `commit.go` | `KindRDS` in the `Kind` block | as specified |
+| `commit.go` | one clause in `Usage.Validate()`, plus `KindRDS` added to the existing closed-set check | as specified; the clause is **last** in the `switch` on purpose — a Go case does not fall through, so an earlier RDS case would have skipped the quantity/rate checks that apply to RDS too |
+| `waterfall.go` | one stage in `bill()` (+ two doc-comment corrections) | as specified |
+| `commit.go` | `UsageLine.Engine`, `UsageLine.Deployment` | size flexibility is **engine-gated** and topology is a **unit multiplier**. Neither fact can be represented without carrying them on the line, and Go cannot add a field to a struct from another file. Overloading `Platform` as the engine was considered and rejected: `NormalizePlatform("")` returns `Linux/UNIX`, so an engine-less line would have silently acquired a nonsense engine identity |
+| `commit.go` | `UsageLine.canonicalKey()` gains the two fields | the key's contract is "two lines with the same key are indistinguishable in every output field". Without this, two lines differing only in engine sort by input position and `Bill` stops being order-independent. Both fields are folded through `NormalizeRDSEngine` / `NormalizeRDSDeployment`, so spelling variants still collapse |
+| `commit.go` | `Inventory.ReservedDBs`, one line in `Active()`, one line in `Validate()` | there is nowhere else to hold the product. The two one-liners delegate to `rds.go`. `Active()` is load-bearing, not cosmetic: it is the entire mechanism by which an RDS suppression lapses without stored state |
+
+## What was verified
+
+All quotes are from
+`https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/USER_WorkingWithReservedDBInstances.html`
+via §2.5–2.6 of `docs/design/rds-batch-assessment.md`.
+
+| Claim | Encoded in | Pinned by |
+| --- | --- | --- |
+| Normalized-unit table, 14 sizes × 3 deployment columns (micro 0.5 … 32xlarge 256; Multi-AZ instance ×2; Multi-AZ cluster ×3) | `rdsSizeUnits`, `RDSDeployment.Multiplier` | `TestRDSNormalizationTableMatchesPublishedUnits` — **hand-transcribed a second time**, 14 rows × 3 columns, never reading `rdsSizeUnits`; also asserts the map's row count and that the table is *not* the EC2 one |
+| "can only scale in their instance class type… not to a `db.r6id.large` or `db.r7g.large`" | `RDSClassType` | `TestRDSClassTypeIsNotTheFamily`, `TestClassTypeChangeStrandsEntirely` |
+| "Size flexibility does not apply to RDS for SQL Server and RDS for Oracle License Included" | `RDSSizeFlexibleEngine` | `TestRDSEngineGateMatchesTheDocumentedExclusions`, `TestSizeFlexibilityIsEngineGated` |
+| "benefits apply to both Multi-AZ and Single-AZ… one large (4 units) ↔ two medium (2+2 = 4)" | `RDSNormalizationUnits` | `TestReservedDBInstanceCoversMultiAZAsTwoUnits` (both directions, plus the half-covered and ×3 cases) |
+| "tied to instance type and AWS Region"; "same AWS Region and database engine" | `applyReservedDB` eligibility | `FuzzRDSWaterfall`, `TestSizeFlexibilityIsEngineGated` |
+| "no discount for storage, backups, and I/O" | `UsageLine.validateRDS` requires a DB instance class | `TestRDSStorageIsNotExpressibleAsCoveredUsage` |
+| "You can't cancel a reserved DB instance" | stranding is permanent until `Expires`; that date is the `ValidFrom` | `TestClassTypeChangeStrandsEntirely` (incl. the post-expiry lapse) |
+| **Compute SPs do not cover RDS** — nor do EC2 Instance SPs or EC2 RIs | the `Kind` allowlists in `waterfall.go` already excluded it; `applyReservedDB` touches `KindRDS` only | `TestComputeSPNeverAbsorbsRDS` (a *fully exhausted* Compute SP + EC2 SP + an `r6i` EC2 RI, all unable to reach the DB line), `FuzzRDSWaterfall` |
+| Widening the closed set changes no EC2/Fargate/Lambda outcome | — | `TestExistingKindsAreUnaffectedByRDS` (`reflect.DeepEqual` per coverage row and per commitment, in three configurations, plus an EC2 `NetSavings` verdict), and the pre-existing suite unchanged |
+
+Both fuzz targets that existed before were re-run actively after the
+`canonicalKey` change (≈3.5M and ≈3.1M execs). `FuzzRDSWaterfall` was run
+actively for ≈1.6M+ execs. No failures, so no new seed was added to
+`testdata/fuzz/`.
+
+## `[unverified]`
+
+1. **Seven of the fourteen table rows.** §2.5 prints `micro, small, medium,
+   large, xlarge, 2xlarge, … , 32xlarge` — the ellipsis hides
+   `4xlarge, 6xlarge, 8xlarge, 10xlarge, 12xlarge, 16xlarge, 24xlarge`. Those
+   seven are reconstructed from the U12 acceptance criterion's "all 14 sizes"
+   plus the 8×N rule every printed row obeys. The reconstruction is exact if and
+   only if the elided set is that one; the row *count* is asserted, so a wrong
+   set fails loudly rather than silently. **Closing it:** read the AWS page and
+   confirm the seven names.
+2. **Non-flexible engines and the Multi-AZ ⇄ Single-AZ boundary.** AWS documents
+   that SQL Server / Oracle-LI have no *size* flexibility. It does not say
+   whether a Single-AZ SQL Server reservation may cover a Multi-AZ SQL Server
+   instance — a conversion AWS otherwise expresses through the same normalized
+   units. `applyReservedDB` requires an exact topology match on the
+   non-flexible path. That strands more, never less.
+3. **Engine vocabulary.** `NormalizeRDSEngine` folds only the licence marker
+   (`(license-included)` → `(li)`, `bring-your-own-license` → `byol`) and
+   `postgres` → `postgresql`. It deliberately preserves the edition, so
+   `sqlserver-se` ≠ `sqlserver-ee`. Whether `DescribeReservedDBInstances`'s
+   `ProductDescription` and `DescribeDBInstances`'s `Engine` agree on every
+   other spelling (Db2 editions in particular) is not verified; a mismatch
+   denies coverage, which over-states stranding.
+4. **Aurora.** Its billing model is a third thing wearing RDS's name and nothing
+   about it is verified here, so `aurora-*` is not a size-flexible engine and
+   `db.serverless` is not a recognizable class. Aurora usage therefore gets
+   exact-match coverage at best. U11 refuses Aurora by name anyway.
+5. **Consumption order within a pool.** As for EC2, AWS documents no order.
+   Soonest-expiring reservation first, smallest instance first within one
+   reservation. Neither choice can change a total — the units absorbed are
+   `min(capacity, demand)` either way — only per-line and per-reservation
+   attribution, and therefore which date a suppression carries.
+6. **`OfferingType`** (All/Partial/No Upfront) is recorded and does not affect
+   billing; the amortization is already in `EffectiveHourlyUSD`. Same treatment
+   as `ReservedInstance.OfferingClass`.
+
+## Design decisions worth arguing with
+
+**An unset `Deployment` is unknown, not Single-AZ** — the reverse of how
+`Platform` treats an empty string, and the asymmetry is deliberate. Guessing
+Linux for an unknown platform only ever grants coverage AWS would also have
+granted. Guessing Single-AZ for an unknown topology *halves* the units a line
+needs, so a reservation appears to cover twice the usage it really covers — an
+error in the exact direction this package exists to prevent. `Usage.Validate`
+rejects it loudly; `Bill`, which never fails, leaves the line uncovered.
+`TestRDSDeploymentIsNotGuessedWhenUnset`.
+
+**RDS committed dollars join `RICommittedUSD`, not a new `Cost` field.** They
+are reservation dollars, charged whether absorbed or not, so the documented
+partition `HourlyUSD == RICommittedUSD + SPCommittedUSD + OnDemandUSD` keeps
+holding verbatim and every existing `assertPartition` call stays valid. The
+price: a UI cannot yet say "of the reserved spend, this much is RDS". Adding
+`RDSCommittedUSD` later is a one-line change plus a revisit of
+`assertPartition`, which is a test this unit was not allowed to touch.
+
+**`SPIneligible` on an RDS line is an error, not a no-op.** No Savings Plan
+covers RDS at all, so the flag can only mean the caller believes one might.
+Saying so beats letting a wrong mental model through silently.
+
+**Net ≤ Gross is asserted only where it is true.** `FuzzRDSWaterfall` bounds
+`0 ≤ net ≤ gross` on a *single-line* shrink over arbitrary inventories, and
+`TestRDSNetCanExceedGrossWhenFreedUnitsAreAbsorbed` exhibits the multi-line
+counter-example: four `db.r6i.medium` instances hold all 8 units of a
+`db.r6i.xlarge` reservation (smallest-first), leaving a dear-per-unit
+`db.r6i.large` on demand; switching the mediums off frees units the large
+absorbs, so the invoice falls **$1.00/h against a $0.20/h list-price delta**.
+That is a real saving and clamping it would hide one. This matches the existing
+"'Net ≤ Gross always' is not enforced" section above — RDS just supplies a
+cleaner witness for it.
+
+**RDS can never be `Conservative`.** There is no account-wide RDS commitment
+(§4.4 ex.3 has no RDS analogue) and therefore no Savings-Plan rate to be
+missing. An RDS-only assessment is exact given the inventory, never a floor.
+Asserted in `FuzzRDSWaterfall`.
+
+## What RDS exposed in the existing waterfall
+
+### 1. A negative `Count` produces a negative bill *(defect, not fixed — out of scope)*
+
+`applyRI` clamps the reservation count when it computes capacity
+(`float64(max(ri.Count, 0)) * perRI`) but `bill()` does **not** clamp it when it
+computes money:
+
+```go
+committed := float64(ri.Count) * sane(ri.EffectiveHourlyUSD)   // waterfall.go
+```
+
+`sane()` guards the rate and not the count, so an unvalidated inventory holding
+`{Count: -5, EffectiveHourlyUSD: 0.10}` yields `RICommittedUSD = -0.50` and
+`HourlyUSD = -0.404` — a *negative* bill. That contradicts the package's stated
+contract ("garbage clamps rather than poisoning totals") and the "never below
+the committed floor" invariant becomes vacuous. `FuzzWaterfall` cannot reach it:
+`synth` generates `Count: 1 + s.mod(5)`.
+
+Reachable in production only through a hand-edited or third-party inventory
+file, since `Inventory.Validate` rejects `Count <= 0` and `LoadInventory` calls
+it — but `Bill` is documented as total, and here it is not.
+
+**Fix:** wrap the two `float64(ri.Count)` occurrences in `max(…, 0)`. The RDS
+stage already does exactly that, which is how the asymmetry surfaced. Left
+unmade because the brief allows one *new* branch in `waterfall.go`, not edits to
+the RI loop; a `synth` that can emit a negative count belongs with it, and
+`fuzz_test.go` is likewise off-limits.
+
+### 2. `CommitmentUse.Kind` is an unchecked free-form string
+
+`newlyStrandedExpiry` keys stranding deltas on `Kind + "/" + ID`. Adding a
+fourth product meant inventing `"reserved-db-instance"` with no compile-time
+check that it is distinct from `"reserved-instance"`. A typo would silently
+merge two products' stranding and mis-date every `ValidFrom` built from them.
+It wants to be a typed constant set the way `Kind` and `SavingsPlanType` are.
+
+### 3. The eligible-product set is written out three times
+
+`Usage.Validate`, the EC2-Instance-SP predicate and the Compute-SP predicate
+each open-code the closed set of `Kind`s. Forgetting `Validate` is safe (the
+line is rejected); forgetting a *predicate* is not — a new kind accidentally
+listed there silently gains Savings-Plan coverage it does not have. One
+`func (k Kind) computeSPEligible() bool` would make it a single source of truth.
+`TestComputeSPNeverAbsorbsRDS` and `FuzzRDSWaterfall` pin the RDS half of it, so
+the property is guarded even though the structure is not.
+
+### 4. `UsageLine.Family()` and `SizeOf()` answer confidently and wrongly for RDS
+
+`FamilyOf("db.r6i.large")` is `"db"` and `SizeOf` is `"r6i.large"` — plausible
+strings, not errors. Any future code that reaches for them on an RDS line gets a
+wrong answer silently, and `"db"` collapses *every* DB class into one family,
+which is exactly the merge AWS's `db.r6i` / `db.r6id` counter-example forbids.
+`TestRDSClassTypeIsNotTheFamily` asserts the collapse, so a change to `FamilyOf`
+that would make the trap look safe fails the test instead.
+
+### 5. Under-specified: reservation identity is per-product
+
+`Inventory.Validate` namespaces duplicate-ID detection as `ri/…` and `sp/…`;
+`validateReservedDBs` keeps its own set. A Reserved DB Instance may therefore
+share an ID with a Reserved Instance. That is harmless today — `CommitmentUse`
+carries the product in `Kind` and `newlyStrandedExpiry` keys on both — but it is
+an invariant nobody stated, and finding #2 is what makes it load-bearing.
+
+### 6. Under-specified: an empty engine matches an empty engine
+
+`Bill` never fails, so an engine-less reservation and an engine-less line both
+normalize to `""` and match each other on the exact-class path. `Usage.Validate`
+and `Inventory.Validate` both reject an empty engine, so this is only reachable
+by skipping validation — the same shape as finding #1, and worth the same
+scepticism about how total `Bill` really is.
+
+## Test inventory
+
+`rds_test.go`: `TestRDSNormalizationTableMatchesPublishedUnits` ·
+`TestRDSDeploymentMultiplierAndNormalization` ·
+`TestRDSNormalizationUnitsExtrapolatesAndRefuses` ·
+`TestRDSClassTypeIsNotTheFamily` ·
+`TestRDSEngineGateMatchesTheDocumentedExclusions` ·
+`TestComputeSPNeverAbsorbsRDS` · `TestReservedDBInstanceCoversMultiAZAsTwoUnits` ·
+`TestSizeFlexibilityIsEngineGated` · `TestClassTypeChangeStrandsEntirely` ·
+`TestRDSDeploymentIsNotGuessedWhenUnset` ·
+`TestRDSStorageIsNotExpressibleAsCoveredUsage` ·
+`TestRDSNetCanExceedGrossWhenFreedUnitsAreAbsorbed` ·
+`TestExistingKindsAreUnaffectedByRDS` ·
+`TestReservedDBInstanceJSONRoundTripAndValidation` ·
+`TestRDSUsageLineValidation` · `TestActiveDropsExpiredReservedDBInstances` ·
+`FuzzRDSWaterfall`.
+
+## What U11/U13 must do with this
+
+1. Emit **one `UsageLine` per DB instance** with `Kind: KindRDS`,
+   `InstanceType` = the DB instance class, `Engine` = the product description,
+   and `Deployment` set explicitly — never left empty, or the line silently
+   loses every reservation it was entitled to.
+2. Emit storage, backup and I/O as **separate lines that are not `KindRDS`**, or
+   keep them out of `Usage` entirely the way EBS is. A reserved DB instance
+   never discounts them, and `Usage.Validate` will reject them as RDS lines.
+3. Read replicas are **separate billable instances**, each its own line. Their
+   own reservations apply; their resizing does not (§2.5.2 — permanently
+   advisory).
+4. Populate `Inventory.ReservedDBs` from `rds:DescribeReservedDBInstances`,
+   paginated to exhaustion. A truncated inventory reads as "less commitment than
+   we have", understates stranding and re-opens the trap.
+5. Do **not** set `ComputeSPRate`, `EC2SPRate` or `SPIneligible` on an RDS line.
+   No plan covers RDS; the last of those three is now a validation error.

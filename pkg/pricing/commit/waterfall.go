@@ -28,7 +28,7 @@ type LineCoverage struct {
 // CommittedUSD is charged regardless; CommittedUSD − UsedUSD is stranded.
 type CommitmentUse struct {
 	ID           string    `json:"id,omitempty"`
-	Kind         string    `json:"kind"` // "reserved-instance" | "savings-plan"
+	Kind         string    `json:"kind"` // "reserved-instance" | "reserved-db-instance" | "savings-plan"
 	CommittedUSD float64   `json:"committedUSD"`
 	UsedUSD      float64   `json:"usedUSD"`
 	Expires      time.Time `json:"expires,omitempty"`
@@ -159,10 +159,17 @@ func (inv *Inventory) canonicalSPs(t SavingsPlanType) []SavingsPlan {
 //     normalization units, applied smallest instance first (a regional RI on a
 //     non-flexible platform, dedicated tenancy or an excluded family still
 //     applies, but only on an exact size match);
-//  3. EC2 Instance Savings Plans, pooled per (region, family);
-//  4. Compute Savings Plans, pooled, applied to the highest savings percentage
+//  3. Reserved DB Instances — RDS only; size-flexible within the instance
+//     class type when the engine allows it, with the deployment topology
+//     folded into the normalized units;
+//  4. EC2 Instance Savings Plans, pooled per (region, family);
+//  5. Compute Savings Plans, pooled, applied to the highest savings percentage
 //     first, ties broken by the lower Savings Plans rate;
-//  5. whatever is left, at on-demand rates.
+//  6. whatever is left, at on-demand rates.
+//
+// Stage 3 is placed with the other reservations for legibility only. Nothing
+// else in the waterfall can cover a KindRDS line and stage 3 covers nothing
+// else, so its position cannot change a total.
 //
 // # Conservative fallback when Savings Plans rates are unavailable
 //
@@ -208,6 +215,28 @@ func (inv *Inventory) bill(u Usage, force map[string]bool) Cost {
 				CommittedUSD: committed, UsedUSD: used, Expires: ri.Expires,
 			})
 		}
+	}
+
+	// (2b) Reserved DB Instances. An RDS line is absorbed by these and by
+	// nothing else — no Savings Plan of any type covers RDS, and applyRI only
+	// ever looks at KindEC2 — so this stage's position in the waterfall cannot
+	// change any total. It sits with the other reservations because that is
+	// what it is. Its committed and used dollars join the RI aggregates so
+	// that the documented partition (HourlyUSD == RICommittedUSD +
+	// SPCommittedUSD + OnDemandUSD) keeps holding unchanged.
+	for _, rdb := range inv.canonicalReservedDBs() {
+		capUnits, usedUnits := applyReservedDB(rdb, states)
+		committed := float64(max(rdb.Count, 0)) * sane(rdb.EffectiveHourlyUSD)
+		used := 0.0
+		if capUnits > Eps {
+			used = committed * (usedUnits / capUnits)
+		}
+		cost.RICommittedUSD += committed
+		cost.RIUsedUSD += used
+		cost.Commitments = append(cost.Commitments, CommitmentUse{
+			ID: rdb.ID, Kind: "reserved-db-instance",
+			CommittedUSD: committed, UsedUSD: used, Expires: rdb.Expires,
+		})
 	}
 
 	// (3) EC2 Instance SPs, pooled per (region, family) — AWS applies current

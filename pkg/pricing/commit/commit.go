@@ -1,5 +1,5 @@
-// Package commit models AWS compute commitments — Reserved Instances and
-// Savings Plans — and prices usage through them.
+// Package commit models AWS compute commitments — Reserved Instances,
+// Reserved DB Instances and Savings Plans — and prices usage through them.
 //
 // # Why this package exists
 //
@@ -19,10 +19,12 @@
 //     tenancy);
 //  2. regional Reserved Instances — AZ-flexible, and size-flexible within the
 //     family via normalization units, applied smallest instance first;
-//  3. EC2 Instance Savings Plans — before Compute SPs, being narrower;
-//  4. Compute Savings Plans — highest savings percentage first, ties broken by
+//  3. Reserved DB Instances — RDS only, size-flexible within the instance
+//     class type when the engine allows it (see rds.go);
+//  4. EC2 Instance Savings Plans — before Compute SPs, being narrower;
+//  5. Compute Savings Plans — highest savings percentage first, ties broken by
 //     the lower SP rate;
-//  5. the remainder at on-demand rates.
+//  6. the remainder at on-demand rates.
 //
 // Commitments are charged whether or not usage absorbs them. That is not an
 // approximation: it is the whole point. A bill is
@@ -79,14 +81,20 @@ const Eps = 1e-9
 const HoursPerMonth = 730
 
 // Kind classifies a usage line by product, because commitment eligibility
-// differs per product: Compute SPs cover all three, EC2 Instance SPs cover
-// only KindEC2, and Reserved Instances cover only KindEC2.
+// differs per product: Compute SPs cover KindEC2, KindFargate and KindLambda,
+// EC2 Instance SPs cover only KindEC2, and Reserved Instances cover only
+// KindEC2.
+//
+// KindRDS is outside all three. No Savings Plan of any type covers RDS and no
+// EC2 Reserved Instance can match it; a KindRDS line is absorbed by a
+// [ReservedDBInstance] and by nothing else. See rds.go.
 type Kind string
 
 const (
 	KindEC2     Kind = "ec2"
 	KindFargate Kind = "fargate"
 	KindLambda  Kind = "lambda"
+	KindRDS     Kind = "rds"
 )
 
 // Platform and tenancy values, normalized. Reserved Instance size flexibility
@@ -125,6 +133,14 @@ type UsageLine struct {
 	ComputeSPRate float64 `json:"computeSPRate,omitempty"` // ≤0 ⇒ unknown
 	EC2SPRate     float64 `json:"ec2SPRate,omitempty"`     // ≤0 ⇒ unknown
 	SPIneligible  bool    `json:"spIneligible,omitempty"`
+
+	// Engine and Deployment apply to KindRDS only, where InstanceType holds a
+	// DB instance class ("db.r6i.large"). Both change the arithmetic rather
+	// than labelling it: Reserved DB Instance size flexibility is gated on the
+	// engine, and the deployment topology multiplies the line's normalized
+	// units (Multi-AZ instance ×2, Multi-AZ cluster ×3). See rds.go.
+	Engine     string        `json:"engine,omitempty"`
+	Deployment RDSDeployment `json:"deployment,omitempty"`
 }
 
 // Family returns the instance family ("m5" for "m5.xlarge"), or "".
@@ -140,6 +156,7 @@ func (l UsageLine) canonicalKey() string {
 	return strings.Join([]string{
 		l.ID, string(l.Kind), l.Region, l.AZ, l.InstanceType,
 		NormalizePlatform(l.Platform), NormalizeTenancy(l.Tenancy), l.Unit,
+		NormalizeRDSEngine(l.Engine), string(NormalizeRDSDeployment(l.Deployment)),
 		f(l.Quantity), f(l.ODRate), f(l.ComputeSPRate), f(l.EC2SPRate),
 		strconv.FormatBool(l.SPIneligible),
 	}, "\x00")
@@ -173,7 +190,7 @@ func (u Usage) OnDemandHourlyUSD() float64 {
 func (u Usage) Validate() error {
 	for i, l := range u.Lines {
 		switch {
-		case l.Kind != KindEC2 && l.Kind != KindFargate && l.Kind != KindLambda:
+		case l.Kind != KindEC2 && l.Kind != KindFargate && l.Kind != KindLambda && l.Kind != KindRDS:
 			return fmt.Errorf("commit: usage line %d (%q): unknown kind %q", i, l.ID, l.Kind)
 		case l.Kind == KindEC2 && l.InstanceType == "":
 			return fmt.Errorf("commit: usage line %d (%q): ec2 line needs an instanceType", i, l.ID)
@@ -183,6 +200,12 @@ func (u Usage) Validate() error {
 			return fmt.Errorf("commit: usage line %d (%q): bad on-demand rate %v", i, l.ID, l.ODRate)
 		case !finite(l.ComputeSPRate) || !finite(l.EC2SPRate):
 			return fmt.Errorf("commit: usage line %d (%q): non-finite savings-plan rate", i, l.ID)
+		case l.Kind == KindRDS:
+			// Last clause on purpose: the checks above apply to RDS too, and a
+			// Go switch case does not fall through.
+			if err := l.validateRDS(); err != nil {
+				return fmt.Errorf("commit: usage line %d (%q): %w", i, l.ID, err)
+			}
 		}
 	}
 	return nil
@@ -263,7 +286,12 @@ type SavingsPlan struct {
 type Inventory struct {
 	RIs          []ReservedInstance `json:"reservedInstances,omitempty"`
 	SavingsPlans []SavingsPlan      `json:"savingsPlans,omitempty"`
-	FetchedAt    time.Time          `json:"fetchedAt,omitempty"`
+	// ReservedDBs are Reserved DB Instances — the RDS commitment product.
+	// They are a separate list rather than a flag on RIs because they match on
+	// different keys entirely (instance class type and engine, not family and
+	// platform) and cover a disjoint set of usage. See rds.go.
+	ReservedDBs []ReservedDBInstance `json:"reservedDBInstances,omitempty"`
+	FetchedAt   time.Time            `json:"fetchedAt,omitempty"`
 }
 
 // Active returns the subset of the inventory still in force at t. Commitments
@@ -285,6 +313,7 @@ func (inv *Inventory) Active(t time.Time) *Inventory {
 			out.SavingsPlans = append(out.SavingsPlans, s)
 		}
 	}
+	out.ReservedDBs = inv.activeReservedDBs(t)
 	return out
 }
 
@@ -340,7 +369,7 @@ func (inv *Inventory) Validate() error {
 			seen["sp/"+s.ID] = true
 		}
 	}
-	return nil
+	return inv.validateReservedDBs()
 }
 
 // LoadInventory parses a commitment inventory from JSON and validates it.
