@@ -1,0 +1,85 @@
+{
+  "inventoryPages": [
+    {
+      "reservations": [
+        {
+          "reservationId": "r-010",
+          "instances": [
+            {
+              "instanceId": "i-0f00000000000000f",
+              "instanceType": "m5.xlarge",
+              "architecture": "x86_64",
+              "tenancy": "default",
+              "availabilityZone": "us-east-1a",
+              "state": "running",
+              "launchTime": "2026-01-05T09:30:00Z",
+              "monitoringState": "disabled",
+              "tags": [
+                {
+                  "key": "Name",
+                  "value": "partial"
+                }
+              ]
+            },
+            {
+              "instanceId": "i-0900000000000009",
+              "instanceType": "m5.large",
+              "architecture": "x86_64",
+              "tenancy": "default",
+              "availabilityZone": "us-east-1a",
+              "state": "running",
+              "launchTime": "2026-01-05T09:30:00Z",
+              "monitoringState": "disabled",
+              "tags": [
+                {
+                  "key": "Name",
+                  "value": "dropped"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "metrics": [
+    {
+      "instanceId": "i-0f00000000000000f",
+      "metric": "CPUUtilization",
+      "status": "PartialData",
+      "points": [
+        {
+          "at": "2026-08-20T00:00:00Z",
+          "value": 7.0
+        },
+        {
+          "at": "2026-08-20T00:05:00Z",
+          "value": 9.0
+        },
+        {
+          "at": "2026-08-20T00:10:00Z",
+          "value": 6.5
+        }
+      ]
+    },
+    {
+      "instanceId": "i-0900000000000009",
+      "metric": "CPUUtilization",
+      "points": [
+        {
+          "at": "2026-08-20T00:00:00Z",
+          "value": 5.0
+        },
+        {
+          "at": "2026-08-20T00:05:00Z",
+          "value": 6.0
+        },
+        {
+          "at": "2026-08-20T00:10:00Z",
+          "value": 4.5
+        }
+      ]
+    }
+  ],
+  "truncateResultsAt": 1
+}
